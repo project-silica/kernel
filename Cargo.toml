@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["abi", "kernel-core", "kernel", "libsys", "boot-uefi", "roottest"]
+members = ["abi", "formats", "kernel-core", "kernel", "libsys", "boot-uefi", "roottest"]
 # Host-buildable crates; `kernel` and `boot-uefi` build only for their targets.
-default-members = ["abi", "kernel-core", "libsys"]
+default-members = ["abi", "formats", "kernel-core", "libsys"]
 
 [workspace.package]
 version = "0.0.0"

@@ -1,6 +1,7 @@
-//! A reader for the ELF64 images the system loads: the kernel (by the loader)
-//! and the root task (by the kernel). It trusts nothing in the file: every
-//! offset is checked before use and a malformed file is an error.
+//! A reader for the ELF64 images the system loads: the kernel (by the
+//! loader), the root task (by the kernel) and every other program (by the
+//! process spawner). It trusts nothing in the file: every offset is checked
+//! before use and a malformed file is an error.
 
 /// Why an image was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

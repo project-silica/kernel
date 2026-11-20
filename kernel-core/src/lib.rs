@@ -15,14 +15,14 @@ macro_rules! ctor {
 
 pub mod boot;
 pub mod cap;
-pub mod elf;
+/// The image format readers (their own crate, shared with the loader and userspace).
+pub use silica_formats::{elf, ramdisk};
 pub mod hal;
 pub mod ipc;
 pub mod kernel;
 pub mod lock;
 pub mod log;
 pub mod mem;
-pub mod ramdisk;
 pub mod root;
 pub mod smp;
 pub mod thread;

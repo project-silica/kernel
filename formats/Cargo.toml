@@ -1,0 +1,10 @@
+[package]
+name = "silica-formats"
+description = "Readers for the ELF64 images and the ramdisk archive Silica boots from. Trust nothing in the bytes they are given."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

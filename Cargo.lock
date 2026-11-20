@@ -68,6 +68,7 @@ version = "0.0.0"
 dependencies = [
  "loom",
  "silica-abi",
+ "silica-formats",
 ]
 
 [[package]]
@@ -215,6 +216,10 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "silica-abi"
+version = "0.0.0"
+
+[[package]]
+name = "silica-formats"
 version = "0.0.0"
 
 [[package]]

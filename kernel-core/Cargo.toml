@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 silica-abi = { path = "../abi" }
+silica-formats = { path = "../formats" }
 
 
 # The lock protocol is model-checked with loom (tests/loom_models.rs), built
