@@ -118,7 +118,7 @@ pub fn run(data: &[u8]) {
             }
             _ => {}
         }
-        let mut n = op as u64 % 18;
+        let mut n = op as u64 % 21;
         let mut a = [0u64; 6];
         for x in &mut a {
             let Some(v) = src.arg(ut) else { break };

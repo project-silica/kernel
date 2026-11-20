@@ -219,6 +219,34 @@ impl<H: Hal> Kernel<H> {
         Ok(Exit::Done)
     }
 
+    /// Interrupt line `line` fired on this processor (which holds its
+    /// lock): signal what the line is bound to. The architecture has
+    /// already held a level-triggered line off until it is acknowledged.
+    pub fn irq(&self, line: usize) {
+        let Some(irq) = self.irqs.get(line) else { return };
+        let n = irq.0.get();
+        if n == 0 {
+            // Nothing listens (it was unbound as the interrupt arrived).
+            self.hal.irq_mask(line, true);
+            return;
+        }
+        let q = self.queue(n);
+        let me = self.hal.cpu() as u64;
+        let local = self.ncpu.get() == 1 || (q.owner.get() == me + 1 && (q.head.get() == 0 || self.thread(q.head.get()).cpu.get() == me));
+        if local {
+            self.signal(n, irq.1.get());
+            return;
+        }
+        // The waiter is another processor's: take every lock, and look
+        // again at what the line is bound to now.
+        self.go_global();
+        let n = irq.0.get();
+        if n != 0 {
+            self.signal(n, irq.1.get());
+        }
+        self.go_local();
+    }
+
     /// OR `badge` into notification `n`, waking one waiter.
     pub fn signal(&self, n: Paddr, badge: u64) {
         let q = self.queue(n);

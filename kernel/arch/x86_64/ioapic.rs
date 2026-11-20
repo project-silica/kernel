@@ -1,0 +1,117 @@
+//! I/O APICs: routing device interrupt lines to processors (component C12).
+//!
+//! A line is a global system interrupt number as ACPI counts them. Line `n`
+//! arrives at vector `0x30 + n` on the processor it was routed to, edge- or
+//! level-triggered as its driver said when it bound it. A level-triggered
+//! line is masked in the interrupt handler and unmasked by `IrqAck`, so a
+//! device that keeps its line asserted cannot keep a processor in the kernel.
+
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use kernel_core::boot::BootInfo;
+use kernel_core::lock::Lock;
+use kernel_core::mem::Phys;
+use silica_abi::IRQ_LINES;
+
+/// First vector used for device lines.
+pub const FIRST_VECTOR: u64 = 0x30;
+
+#[derive(Clone, Copy)]
+struct IoApic {
+    base: u64,
+    first: u32,
+    count: u32,
+}
+
+struct Racy(UnsafeCell<[IoApic; 8]>);
+// SAFETY: filled by the boot processor before any interrupt is routed, then only read.
+unsafe impl Sync for Racy {}
+static IOAPICS: Racy = Racy(UnsafeCell::new([IoApic { base: 0, first: 0, count: 0 }; 8]));
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+/// The index and data registers of an I/O APIC are used as a pair.
+static REGS: Lock = Lock::new();
+static LEVEL: [AtomicBool; IRQ_LINES as usize] = [const { AtomicBool::new(false) }; IRQ_LINES as usize];
+
+fn read(phys: &Phys, base: u64, reg: u32) -> u32 {
+    // SAFETY: the I/O APIC's two registers, at the address the firmware
+    // gave, inside the physical map; callers hold `REGS`.
+    unsafe {
+        phys.ptr(base).cast::<u32>().write_volatile(reg);
+        phys.ptr(base + 0x10).cast::<u32>().read_volatile()
+    }
+}
+
+fn write(phys: &Phys, base: u64, reg: u32, v: u32) {
+    // SAFETY: as for `read`.
+    unsafe {
+        phys.ptr(base).cast::<u32>().write_volatile(reg);
+        phys.ptr(base + 0x10).cast::<u32>().write_volatile(v);
+    }
+}
+
+/// Find the I/O APICs in the ACPI MADT and mask every line. Boot processor, once.
+pub fn init(bi: &BootInfo, phys: &Phys) {
+    let Some(madt) = super::acpi_table(bi, phys, b"APIC") else { return };
+    let (mut n, mut o) = (0, 44);
+    // SAFETY: boot processor, before any interrupt is routed.
+    let list = unsafe { &mut *IOAPICS.0.get() };
+    while o + 2 <= madt.len() && n < list.len() {
+        let (ty, len) = (madt[o], madt[o + 1] as usize);
+        if len < 2 || o + len > madt.len() {
+            break;
+        }
+        if ty == 1 && len >= 12 {
+            let u32_at = |i: usize| u32::from_le_bytes([madt[o + i], madt[o + i + 1], madt[o + i + 2], madt[o + i + 3]]);
+            let (base, first) = (u32_at(4) as u64, u32_at(8));
+            if base != 0 && base + 0x20 <= bi.phys_map_len {
+                let count = (read(phys, base, 1) >> 16 & 0xFF) + 1;
+                for pin in 0..count {
+                    write(phys, base, 0x10 + 2 * pin, 1 << 16);
+                }
+                list[n] = IoApic { base, first, count };
+                n += 1;
+            }
+        }
+        o += len;
+    }
+    COUNT.store(n, Ordering::Release);
+}
+
+fn find(line: usize) -> Option<(u64, u32)> {
+    // SAFETY: read-only after `init`.
+    let list = unsafe { &*IOAPICS.0.get() };
+    list[..COUNT.load(Ordering::Acquire)]
+        .iter()
+        .find(|a| line as u32 >= a.first && (line as u32) < a.first + a.count)
+        .map(|a| (a.base, line as u32 - a.first))
+}
+
+/// Deliver `line` to the processor with APIC identifier `apic_id` and unmask it.
+pub fn route(phys: &Phys, line: usize, apic_id: u32, level: bool, active_low: bool) -> bool {
+    let Some((base, pin)) = find(line) else { return false };
+    if line >= IRQ_LINES as usize || apic_id > 0xFE {
+        return false;
+    }
+    LEVEL[line].store(level, Ordering::Release);
+    let low = (FIRST_VECTOR as u32 + line as u32) | (active_low as u32) << 13 | (level as u32) << 15;
+    REGS.lock();
+    write(phys, base, 0x10 + 2 * pin, 1 << 16);
+    write(phys, base, 0x11 + 2 * pin, apic_id << 24);
+    write(phys, base, 0x10 + 2 * pin, low);
+    REGS.unlock();
+    true
+}
+
+/// Hold `line` off, or let it interrupt again.
+pub fn mask(phys: &Phys, line: usize, masked: bool) {
+    let Some((base, pin)) = find(line) else { return };
+    REGS.lock();
+    let low = read(phys, base, 0x10 + 2 * pin);
+    write(phys, base, 0x10 + 2 * pin, if masked { low | 1 << 16 } else { low & !(1 << 16) });
+    REGS.unlock();
+}
+
+/// Whether `line` was routed as level-triggered.
+pub fn is_level(line: usize) -> bool {
+    LEVEL.get(line).is_some_and(|l| l.load(Ordering::Acquire))
+}

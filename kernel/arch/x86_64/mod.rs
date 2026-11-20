@@ -8,6 +8,7 @@
 //! APIC emulation) the local APIC's one-shot counter is used instead.
 
 mod cpu;
+mod ioapic;
 mod serial;
 mod smp;
 
@@ -393,6 +394,14 @@ impl Hal for X86 {
         }
     }
 
+    fn irq_route(&self, line: usize, cpu: usize, level: bool, active_low: bool) -> bool {
+        cpu::percpu_of(cpu).is_some_and(|c| ioapic::route(&kernel().phys, line, c.apic_id, level, active_low))
+    }
+
+    fn irq_mask(&self, line: usize, masked: bool) {
+        ioapic::mask(&kernel().phys, line, masked);
+    }
+
     fn port_io(&self, port: u16, width: u8, write: bool, value: u32) -> u32 {
         let mut v = value;
         // SAFETY: the caller holds a capability covering this port range;
@@ -503,6 +512,27 @@ pub fn irq(vector: u64, locked: bool) {
         TIMER_VECTOR if locked => k.on_timer(),
         TIMER_VECTOR | KICK_VECTOR => {}
         SPURIOUS_VECTOR => return,
+        v if (ioapic::FIRST_VECTOR..ioapic::FIRST_VECTOR + silica_abi::IRQ_LINES).contains(&v) => {
+            let line = (v - ioapic::FIRST_VECTOR) as usize;
+            // A level-triggered line stays asserted until its driver has
+            // dealt with the device: hold it off until the driver says so.
+            if ioapic::is_level(line) {
+                ioapic::mask(&k.phys, line, true);
+            }
+            // SAFETY: ends the interrupt in service at the local APIC.
+            unsafe { wrmsr(MSR_X2APIC_EOI, 0) };
+            if locked {
+                k.irq(line);
+            } else {
+                // Out of the idle wait, which does not hold the lock.
+                percpu().mode.enter_kernel();
+                k.enter();
+                k.irq(line);
+                percpu().mode.idle();
+                k.leave();
+            }
+            return;
+        }
         v => {
             // Device interrupts are bound to Notifications later in M2
             // (C12). Until then nothing is unmasked, so this is a stray.
@@ -979,6 +1009,7 @@ pub extern "C" fn kmain(info: u64) -> ! {
     }
     flush_all();
 
+    ioapic::init(&bi, &k.phys);
     let hz = tsc_frequency(&bi, &k.phys);
     k.hal.tsc_hz.set(hz);
     k.hal.tsc0.set(rdtsc());

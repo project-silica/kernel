@@ -16,7 +16,10 @@ mod buffer;
 
 pub use buffer::{IpcBuffer, Pass};
 pub use silica_abi::root;
-pub use silica_abi::{Error, FAULT_LABEL, FAULT_MAP, FAULT_RESUME, Fault, KEEP, MsgInfo, ObjectType, Rights};
+pub use silica_abi::{
+    Error, FAULT_LABEL, FAULT_MAP, FAULT_RESUME, Fault, IRQ_ACTIVE_LOW, IRQ_LEVEL, KEEP, MsgInfo, ObjectType, Rights, THREAD_INACTIVE,
+    THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
+};
 use silica_abi::{NONBLOCK, Syscall};
 
 /// Platform API level (`spec/CI_RELEASE.md` section 7).
@@ -258,6 +261,76 @@ pub fn port_in(ports: Cap, port: u16, width: u8) -> Result<u32> {
 /// Write `width` bytes (1, 2 or 4) to an I/O port covered by `ports`.
 pub fn port_out(ports: Cap, port: u16, width: u8, value: u32) -> Result<()> {
     sys(Syscall::PortIo, [ports.0, port as u64, width as u64 | 0x100, value as u64, 0, 0]).map(|_| ())
+}
+
+/// From now on an interrupt on line `line` (a global system interrupt
+/// number covered by `lines`) signals `notification` with that capability's
+/// badge, on the calling thread's processor. `flags`: [`IRQ_LEVEL`],
+/// [`IRQ_ACTIVE_LOW`]. After each interrupt of a level-triggered line the
+/// line is held off until [`irq_ack`].
+pub fn irq_bind(lines: Cap, line: u32, notification: Cap, flags: u64) -> Result<()> {
+    sys(Syscall::IrqBind, [lines.0, line as u64, notification.0, flags, 0, 0]).map(|_| ())
+}
+
+/// Stop delivering interrupt line `line`.
+pub fn irq_unbind(lines: Cap, line: u32) -> Result<()> {
+    sys(Syscall::IrqBind, [lines.0, line as u64, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// The device behind `line` has been dealt with: let it interrupt again.
+pub fn irq_ack(lines: Cap, line: u32) -> Result<()> {
+    sys(Syscall::IrqAck, [lines.0, line as u64, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// What a capability slot holds, as [`inspect_slot`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotInfo {
+    /// The type of object.
+    pub ty: ObjectType,
+    /// What the capability permits.
+    pub rights: Rights,
+    /// The object's size in bits (for a CapSpace, its slots).
+    pub bits: u8,
+    /// Equal for all capabilities to one object, and to nothing else.
+    pub object: u64,
+    /// The badge (endpoints and notifications).
+    pub badge: u64,
+    /// Generations between this capability and the one it descends from.
+    pub depth: u16,
+}
+
+/// What slot `index` of the CapSpace `space` holds (`None`: nothing).
+pub fn inspect_slot(space: Cap, index: u64) -> Result<Option<SlotInfo>> {
+    let r = sys(Syscall::Inspect, [space.0, index, 0, 0, 0, 0])?;
+    Ok(ObjectType::from_u64(r[0]).map(|ty| SlotInfo {
+        ty,
+        rights: Rights(r[1] as u8),
+        bits: r[2] as u8,
+        object: r[3],
+        badge: r[4],
+        depth: r[5] as u16,
+    }))
+}
+
+/// A thread, as [`inspect_thread`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadInfo {
+    /// One of the `THREAD_` values.
+    pub state: u64,
+    /// The processor it runs on.
+    pub cpu: usize,
+    /// Its instruction pointer and stack pointer when it last entered the kernel.
+    pub ip: u64,
+    /// See `ip`.
+    pub sp: u64,
+    /// The identity (as in [`SlotInfo::object`]) of what it waits on, or 0.
+    pub waits_on: u64,
+}
+
+/// The state of `thread`.
+pub fn inspect_thread(thread: Cap) -> Result<ThreadInfo> {
+    let r = sys(Syscall::Inspect, [thread.0, 0, 0, 0, 0, 0])?;
+    Ok(ThreadInfo { state: r[0], cpu: r[1] as usize, ip: r[2], sp: r[3], waits_on: r[4] })
 }
 
 /// The monotonic clock: converts the processor's timestamp counter with the

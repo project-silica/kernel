@@ -34,6 +34,9 @@ pub struct Kernel<H: Hal> {
     pub(crate) globals: Cell<u64>,
     /// Objects waiting to be emptied (only used holding every lock).
     pub(crate) reap: Cell<u64>,
+    /// The notification and badge each interrupt line signals (changed
+    /// only by a holder of every lock).
+    pub(crate) irqs: [(Cell<Paddr>, Cell<u64>); silica_abi::IRQ_LINES as usize],
 }
 
 impl<H: Hal> Kernel<H> {
@@ -49,6 +52,7 @@ impl<H: Hal> Kernel<H> {
             structure: crate::lock::Lock::new(),
             globals: Cell::new(0),
             reap: Cell::new(0),
+            irqs: [const { (Cell::new(0), Cell::new(0)) }; silica_abi::IRQ_LINES as usize],
         }
     }
 
@@ -366,6 +370,69 @@ impl<H: Hal> Kernel<H> {
                     }
                     _ => Err(Error::BadArg),
                 }
+            }
+            Syscall::IrqBind | Syscall::IrqAck => {
+                let (_, hw) = self.ccap(t, a[0], ObjectType::Hw, Rights::WRITE)?;
+                if hw.flags & crate::cap::FLAG_IRQS == 0 {
+                    return Err(Error::WrongType);
+                }
+                if a[1] < hw.obj || a[1] >= hw.badge || a[1] >= silica_abi::IRQ_LINES {
+                    return Err(Error::BadArg);
+                }
+                let line = a[1] as usize;
+                if s == Syscall::IrqAck {
+                    if self.irqs[line].0.get() != 0 {
+                        self.hal.irq_mask(line, false);
+                    }
+                    return Ok(Exit::Done);
+                }
+                let (to, badge) = if a[2] == 0 {
+                    (0, 0)
+                } else {
+                    let (_, n) = self.ccap(t, a[2], ObjectType::Notification, Rights::WRITE)?;
+                    (n.obj, n.badge.max(1))
+                };
+                // Whatever the line signalled before no longer hears from it.
+                let old = self.irqs[line].0.replace(0);
+                self.hal.irq_mask(line, true);
+                if old != 0 {
+                    let q = self.queue(old);
+                    q.bound.set(q.bound.get() - 1);
+                }
+                if to != 0 {
+                    if !self.hal.irq_route(line, self.hal.cpu(), a[3] & silica_abi::IRQ_LEVEL != 0, a[3] & silica_abi::IRQ_ACTIVE_LOW != 0)
+                    {
+                        return Err(Error::Unsupported);
+                    }
+                    self.irqs[line].0.set(to);
+                    self.irqs[line].1.set(badge);
+                    let q = self.queue(to);
+                    q.bound.set(q.bound.get() + 1);
+                }
+                Ok(Exit::Done)
+            }
+            Syscall::Inspect => {
+                let slot = self.cslot(t, a[0])?;
+                let cap = self.slot(slot).cap().ok_or(Error::BadCap)?;
+                let r = &self.thread(t).regs;
+                let out = match cap.ty {
+                    ObjectType::CapSpace => {
+                        let s = self.slot_in(&cap, a[1])?;
+                        match self.view(s) {
+                            Some(v) => [v.cap.ty as u64, v.cap.rights.0 as u64, v.cap.bits as u64, v.cap.obj, v.cap.badge, v.depth as u64],
+                            None => [0; 6],
+                        }
+                    }
+                    ObjectType::Thread => {
+                        let th = self.thread(cap.obj);
+                        [th.state.get(), th.cpu.get(), th.regs[H::IP].get(), th.regs[H::SP].get(), th.blocked_on.get(), 0]
+                    }
+                    _ => return Err(Error::WrongType),
+                };
+                for (i, v) in out.iter().enumerate() {
+                    r[H::ARG[i]].set(*v);
+                }
+                Ok(Exit::Done)
             }
             Syscall::PortIo => {
                 let (width, write) = (a[2] & 0xFF, a[2] & 0x100 != 0);

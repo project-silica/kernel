@@ -842,3 +842,60 @@ fn a_parked_call_is_answered_later_through_its_notification() {
     m.ok(S::Send, [FREE + 11, 0, 0, 0, 0, 0]);
     m.ok(S::Recv, [FREE + 11, 1, 0, 0, 0, 0]);
 }
+
+#[test]
+fn an_interrupt_line_signals_the_notification_it_is_bound_to() {
+    use silica_abi::IRQ_LEVEL;
+    let m = Machine::with_cpus(16, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 15, 0b100, 0]);
+    // Only lines the capability covers, and only lines the machine has.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2, SLOT_IRQS, 15, 4 | 6 << 32, 0]);
+    assert_eq!(m.err(S::IrqBind, [FREE + 2, 6, FREE + 1, 0, 0, 0]), Error::BadArg);
+    assert_eq!(m.err(S::IrqBind, [SLOT_PORTS, 4, FREE + 1, 0, 0, 0]), Error::WrongType);
+    assert_eq!(m.err(S::IrqBind, [SLOT_IRQS, 30, FREE + 1, 0, 0, 0]), Error::Unsupported);
+    assert_eq!(m.err(S::IrqBind, [SLOT_IRQS, 400, FREE + 1, 0, 0, 0]), Error::BadArg);
+    m.ok(S::IrqBind, [FREE + 2, 5, FREE + 1, IRQ_LEVEL, 0, 0]);
+    assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "route 5 cpu0 level=true low=false");
+    // The interrupt is delivered as the capability's badge, to a waiter or pending.
+    m.irq(5);
+    m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 0b100);
+    m.ok(S::IrqAck, [FREE + 2, 5, 0, 0, 0, 0]);
+    assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "unmask 5");
+    // A waiter on another processor is woken there.
+    let t = m.spawn(ut, FREE + 3);
+    m.ok(S::ThreadControl, [FREE + 3, 2, 1, 0, 0, 0]);
+    m.ok(S::ThreadControl, [FREE + 3, 1, 0, 0, 0, 0]);
+    m.settle(1);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(0);
+    m.irq(5);
+    assert_eq!((m.k.thread_view(t).state, m.arg(t, 0)), (RUNNABLE, 0b100));
+    // An unbound line is held off; a destroyed notification unbinds its lines.
+    m.irq(7);
+    assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "mask 7");
+    m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
+    assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "mask 5");
+    m.irq(5);
+    assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "mask 5");
+}
+
+#[test]
+fn inspect_shows_slots_and_threads_without_changing_them() {
+    let (m, t) = pair();
+    m.ok(S::Inspect, [SLOT_CAPSPACE, FREE + 1, 0, 0, 0, 0]);
+    let ep = m.cap(FREE).unwrap();
+    assert_eq!(
+        [m.arg(m.root, 0), m.arg(m.root, 1), m.arg(m.root, 3), m.arg(m.root, 4), m.arg(m.root, 5)],
+        [T::Endpoint as u64, 15, ep.obj, 77, 2]
+    );
+    m.ok(S::Inspect, [SLOT_CAPSPACE, FREE + 30, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 0, "an empty slot");
+    assert_eq!(m.err(S::Inspect, [SLOT_CAPSPACE, 5000, 0, 0, 0, 0]), Error::BadCap);
+    assert_eq!(m.err(S::Inspect, [FREE, 0, 0, 0, 0, 0]), Error::WrongType);
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.ok(S::Inspect, [FREE + 2, 0, 0, 0, 0, 0]);
+    assert_eq!([m.arg(m.root, 0), m.arg(m.root, 1), m.arg(m.root, 4)], [silica_abi::THREAD_RECEIVING, 0, ep.obj]);
+}

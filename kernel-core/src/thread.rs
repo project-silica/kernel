@@ -104,6 +104,8 @@ pub struct Queue {
     /// Endpoint: calls delivered through it and not yet answered.
     pub(crate) pend_head: Cell<Paddr>,
     pub(crate) pend_tail: Cell<Paddr>,
+    /// Notification: how many interrupt lines signal it.
+    pub(crate) bound: Cell<u64>,
 }
 impl KObj for Queue {}
 
@@ -332,6 +334,15 @@ impl<H: Hal> Kernel<H> {
             }
         }
         qu.kind.set(0);
+        // Interrupt lines that signalled this notification go quiet.
+        if qu.bound.replace(0) != 0 {
+            for (line, irq) in self.irqs.iter().enumerate() {
+                if irq.0.get() == q {
+                    irq.0.set(0);
+                    self.hal.irq_mask(line, true);
+                }
+            }
+        }
         // Calls delivered through this endpoint and not yet answered fail
         // too: the server's reply would find no caller.
         loop {

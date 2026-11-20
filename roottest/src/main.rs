@@ -730,6 +730,89 @@ fn t_ipc_parked() -> T {
     }
 }
 
+/// A device interrupt reaches userspace: the serial port's "transmitter
+/// empty" interrupt (ISA line 4), delivered as a notification.
+fn t_irq() -> T {
+    const LINES: Cap = Cap(SLOT_IRQS);
+    let n = new(ObjectType::Notification, 0);
+    let badged = slot();
+    cap_derive(SPACE, badged, n, Rights::ALL, 0x40).map_err(|_| "derive")?;
+    if irq_bind(PORTS, 4, Cap(badged), 0) != Err(Error::WrongType) {
+        return Err("a port capability was accepted as an interrupt capability");
+    }
+    irq_bind(LINES, 4, Cap(badged), 0).map_err(|_| "cannot bind interrupt line 4")?;
+    if recv(n, Wait::Until(CLOCK.now() + 20_000_000)) != Err(Error::Timeout) {
+        return Err("an interrupt arrived before the device was asked for one");
+    }
+    // OUT2 gates the UART's interrupt onto the line; then enable "transmitter empty".
+    let mcr = port_in(PORTS, 0x3FC, 1).unwrap_or(0);
+    port_out(PORTS, 0x3FC, 1, mcr | 0x08).map_err(|_| "port")?;
+    port_out(PORTS, 0x3F9, 1, 0x02).map_err(|_| "port")?;
+    let m = recv(n, Wait::Until(CLOCK.now() + 1_000_000_000));
+    port_out(PORTS, 0x3F9, 1, 0).map_err(|_| "port")?;
+    let _ = port_in(PORTS, 0x3FA, 1); // reading the cause clears it in the device
+    match m {
+        Ok(m) if m.badge == 0x40 => {}
+        Ok(_) => return Err("the interrupt was delivered with the wrong badge"),
+        Err(_) => return Err("the serial port's interrupt never arrived as a notification"),
+    }
+    irq_ack(LINES, 4).map_err(|_| "ack")?;
+    // Unbound, the line is quiet again even if the device asks.
+    irq_unbind(LINES, 4).map_err(|_| "unbind")?;
+    port_out(PORTS, 0x3F9, 1, 0x02).map_err(|_| "port")?;
+    let quiet = recv(n, Wait::Until(CLOCK.now() + 20_000_000)) == Err(Error::Timeout);
+    port_out(PORTS, 0x3F9, 1, 0).map_err(|_| "port")?;
+    quiet.then_some(()).ok_or("an unbound interrupt line still signalled")
+}
+
+extern "C" fn wait_for_ever(arg: u64) -> ! {
+    let _ = recv(Cap(SHARED[3].load(SeqCst)), Wait::Forever);
+    finish(arg)
+}
+
+/// The owner's view: every capability of a CapSpace and the state of every
+/// thread, read through `Inspect` and printed as a debug console would.
+fn t_inspect() -> T {
+    let ep = new(ObjectType::Endpoint, 0);
+    SHARED[3].store(ep.0, SeqCst);
+    let (t, _) = spawn(wait_for_ever, 0, Cap::NONE);
+    yield_now();
+    let me = inspect_thread(Cap(SLOT_THREAD)).map_err(|_| "cannot inspect the calling thread")?;
+    if me.state != THREAD_RUNNABLE {
+        return Err("the calling thread is not reported runnable");
+    }
+    let ep_info = inspect_slot(SPACE, ep.0).map_err(|_| "inspect")?.ok_or("the endpoint's slot is reported empty")?;
+    let waiter = inspect_thread(t).map_err(|_| "cannot inspect another thread")?;
+    if waiter.state != THREAD_RECEIVING || waiter.waits_on != ep_info.object {
+        return Err("a thread waiting on an endpoint is not reported as receiving on it");
+    }
+    // Walk the whole CapSpace, as the console's `caps` command would.
+    let slots = 4096;
+    let (mut caps, mut threads) = (0u64, 0u64);
+    let mut by_type = [0u64; 11];
+    for i in 1..slots {
+        let Some(info) = inspect_slot(SPACE, i).map_err(|_| "inspect failed on a valid slot")? else { continue };
+        caps += 1;
+        by_type[info.ty as usize] += 1;
+        if info.ty == ObjectType::Thread {
+            threads += 1;
+            let th = inspect_thread(Cap(i)).map_err(|_| "inspect thread")?;
+            println!("thread in slot {i}: state {} cpu {} ip {:#x} waits on {:#x}", th.state, th.cpu, th.ip, th.waits_on);
+        }
+    }
+    println!(
+        "capabilities: {caps} (untyped {}, capspace {}, thread {}, address space {}, frame {}, endpoint {}, notification {}, hw {})",
+        by_type[1], by_type[2], by_type[3], by_type[4], by_type[5], by_type[6], by_type[7], by_type[9]
+    );
+    if threads < 2 || by_type[1] == 0 || by_type[9] != 2 {
+        return Err("the walk of the CapSpace missed capabilities that are there");
+    }
+    if inspect_slot(SPACE, slots) != Err(Error::BadCap) || inspect_slot(ep, 1) != Err(Error::WrongType) {
+        return Err("inspecting outside a CapSpace, or through something that is not one, was accepted");
+    }
+    Ok(())
+}
+
 // ---- more than one processor ---------------------------------------------
 
 static CPUS: AtomicU64 = AtomicU64::new(1);
@@ -1273,6 +1356,8 @@ const TESTS: &[(&str, fn() -> T)] = &[
     ("fpu", t_fpu),
     ("untyped", t_untyped),
     ("caps", t_caps),
+    ("irq", t_irq),
+    ("inspect", t_inspect),
     ("ipc_caps", t_ipc_caps),
     ("ipc_parked", t_ipc_parked),
     ("smp_run", t_smp_run),

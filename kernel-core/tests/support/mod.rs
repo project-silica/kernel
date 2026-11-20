@@ -33,6 +33,8 @@ pub struct TestHal {
     pub kicks: RefCell<Vec<(usize, bool)>>,
     pub resets: Cell<u64>,
     pub forgets: Cell<u64>,
+    /// What the kernel asked of the interrupt controller, in order.
+    pub irq_log: RefCell<Vec<String>>,
 }
 
 const ADDR: u64 = 0x000F_FFFF_FFFF_F000;
@@ -122,6 +124,13 @@ impl Hal for TestHal {
         assert!(self.timer.get() != u64::MAX, "idle with no timer armed: every thread is blocked for ever");
         self.now.set(self.now.get().max(self.timer.get()));
     }
+    fn irq_route(&self, line: usize, cpu: usize, level: bool, active_low: bool) -> bool {
+        self.irq_log.borrow_mut().push(format!("route {line} cpu{cpu} level={level} low={active_low}"));
+        line < 24
+    }
+    fn irq_mask(&self, line: usize, masked: bool) {
+        self.irq_log.borrow_mut().push(format!("{} {line}", if masked { "mask" } else { "unmask" }));
+    }
     fn port_io(&self, port: u16, _width: u8, write: bool, value: u32) -> u32 {
         if write { 0 } else { port as u32 ^ value }
     }
@@ -206,6 +215,16 @@ impl Machine {
         self.k.leave();
     }
 
+    /// A device interrupt on line `line`, on the current processor.
+    pub fn irq(&self, line: usize) {
+        self.k.enter();
+        self.k.irq(line);
+        if self.k.can_run() {
+            self.k.schedule();
+        }
+        self.k.leave();
+    }
+
     /// A timer interrupt on the current processor.
     pub fn tick(&self) {
         self.k.enter();
@@ -254,6 +273,7 @@ impl Machine {
             kicks: RefCell::new(Vec::new()),
             resets: Cell::new(0),
             forgets: Cell::new(0),
+            irq_log: RefCell::new(Vec::new()),
         };
         let base = ram.ptr.wrapping_sub(RAM_BASE as usize);
         // SAFETY: every physical address the kernel is told about lies in

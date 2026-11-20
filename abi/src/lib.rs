@@ -82,11 +82,29 @@ pub enum Syscall {
     /// `a0` port capability, `a1` port, `a2` width in bytes (1, 2, 4) with
     /// bit 8 set for a write, `a3` value. Returns `a0` value read.
     PortIo = 15,
+    /// `a0` interrupt-line capability, `a1` line, `a2` notification (0:
+    /// unbind), `a3` flags ([`IRQ_LEVEL`], [`IRQ_ACTIVE_LOW`]). From now on
+    /// an interrupt on the line signals the notification with the
+    /// capability's badge, on the processor of the calling thread. A
+    /// level-triggered line is held off after each interrupt until `IrqAck`.
+    IrqBind = 16,
+    /// `a0` interrupt-line capability, `a1` line. The device has been dealt
+    /// with: let the line interrupt again.
+    IrqAck = 17,
+    /// Look at kernel state through a capability, changing nothing.
+    /// `a0` a CapSpace and `a1` a slot index: what that slot holds. Returns
+    /// `a0` object type (0: empty), `a1` rights, `a2` size in bits, `a3` the
+    /// object's identity (equal for capabilities to one object), `a4` badge,
+    /// `a5` depth in the derivation tree.
+    /// `a0` a Thread and `a1` 0: returns `a0` state (the `THREAD_` values),
+    /// `a1` processor, `a2` instruction pointer, `a3` stack pointer, `a4`
+    /// the identity of what it waits on.
+    Inspect = 18,
 }
 
 impl Syscall {
     /// One past the highest syscall number.
-    pub const COUNT: u64 = 16;
+    pub const COUNT: u64 = 19;
 
     /// Decode a syscall number.
     pub const fn from_u64(n: u64) -> Option<Syscall> {
@@ -107,10 +125,31 @@ impl Syscall {
             13 => Syscall::ThreadStart,
             14 => Syscall::ThreadControl,
             15 => Syscall::PortIo,
+            16 => Syscall::IrqBind,
+            17 => Syscall::IrqAck,
+            18 => Syscall::Inspect,
             _ => return None,
         })
     }
 }
+
+/// `IrqBind` flag: the line is level-triggered (default: edge).
+pub const IRQ_LEVEL: u64 = 1;
+/// `IrqBind` flag: the line is active low (default: active high).
+pub const IRQ_ACTIVE_LOW: u64 = 2;
+/// Number of interrupt lines the kernel can route.
+pub const IRQ_LINES: u64 = 192;
+
+/// `Inspect` thread state: not runnable (new, suspended, or faulted with nobody to tell).
+pub const THREAD_INACTIVE: u64 = 0;
+/// `Inspect` thread state: running or ready to run.
+pub const THREAD_RUNNABLE: u64 = 1;
+/// `Inspect` thread state: waiting to send.
+pub const THREAD_SENDING: u64 = 2;
+/// `Inspect` thread state: waiting to receive.
+pub const THREAD_RECEIVING: u64 = 3;
+/// `Inspect` thread state: waiting for the answer to a call (or to a fault).
+pub const THREAD_REPLY: u64 = 4;
 
 /// `ThreadConfigure`: leave this field as it is.
 pub const KEEP: u64 = u64::MAX;

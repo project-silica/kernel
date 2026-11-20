@@ -87,6 +87,12 @@ pub trait Hal {
     /// handler has run. Called without this processor's lock, so the
     /// handler must not touch kernel state.
     fn idle(&self);
+    /// Route interrupt line `line` to processor `cpu`, with the given
+    /// trigger and polarity, and let it interrupt. `false` when the machine
+    /// has no such line.
+    fn irq_route(&self, line: usize, cpu: usize, level: bool, active_low: bool) -> bool;
+    /// Hold interrupt line `line` off, or let it interrupt again.
+    fn irq_mask(&self, line: usize, masked: bool);
     /// Port I/O (x86_64). `width` is 1, 2 or 4.
     fn port_io(&self, port: u16, width: u8, write: bool, value: u32) -> u32;
     /// Write to the kernel's console.
