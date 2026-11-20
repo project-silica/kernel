@@ -98,10 +98,7 @@ impl Hal for TestHal {
         n > 0
     }
     fn idle(&self) {
-        assert!(
-            self.timer.get() != u64::MAX,
-            "idle with no timer armed: every thread is blocked for ever"
-        );
+        assert!(self.timer.get() != u64::MAX, "idle with no timer armed: every thread is blocked for ever");
         self.now.set(self.now.get().max(self.timer.get()));
     }
     fn port_io(&self, port: u16, _width: u8, write: bool, value: u32) -> u32 {
@@ -196,18 +193,8 @@ impl Machine {
         // lives as long as the kernel and is used by nothing else.
         let k = Kernel::new(hal, unsafe { Phys::new(base) });
         let regions = [
-            Region {
-                base: RAM_BASE,
-                len: (mib << 20) - 0x4000,
-                kind: RegionKind::Usable as u32,
-                reserved: 0,
-            },
-            Region {
-                base: RAM_BASE + (mib << 20) - 0x4000,
-                len: 0x4000,
-                kind: RegionKind::Ramdisk as u32,
-                reserved: 0,
-            },
+            Region { base: RAM_BASE, len: (mib << 20) - 0x4000, kind: RegionKind::Usable as u32, reserved: 0 },
+            Region { base: RAM_BASE + (mib << 20) - 0x4000, len: 0x4000, kind: RegionKind::Ramdisk as u32, reserved: 0 },
         ];
         let elf = tiny_elf(&[0x0F, 0x05, 0xEB, 0xFC], 0x3000);
         let spec = RootSpec {
@@ -228,22 +215,11 @@ impl Machine {
         let root = k.boot_root(&spec).expect("root task");
         let tv = k.thread_view(root);
         let cs = k.view(tv.slots[0]).expect("root cspace").cap;
-        let asp = k
-            .view(k.slot_addr(&cs, SLOT_ASPACE).unwrap())
-            .unwrap()
-            .cap
-            .obj;
+        let asp = k.view(k.slot_addr(&cs, SLOT_ASPACE).unwrap()).unwrap().cap.obj;
         let info = k.translate(asp, INFO_VADDR).expect("root info mapped");
         k.schedule();
         assert_eq!(k.current(), root);
-        Machine {
-            k,
-            _ram: ram,
-            root,
-            cs,
-            info,
-            mib,
-        }
+        Machine { k, _ram: ram, root, cs, info, mib }
     }
 
     pub fn info(&self) -> &RootInfo {
@@ -268,23 +244,12 @@ impl Machine {
 
     pub fn untyped(&self) -> Vec<(u64, UntypedDesc)> {
         let i = self.info();
-        (0..i.untyped_count)
-            .map(|n| {
-                (
-                    silica_abi::root::SLOT_FIRST_UNTYPED + n,
-                    i.untyped[n as usize],
-                )
-            })
-            .collect()
+        (0..i.untyped_count).map(|n| (silica_abi::root::SLOT_FIRST_UNTYPED + n, i.untyped[n as usize])).collect()
     }
 
     /// Slot and descriptor of the largest ordinary-memory Untyped.
     pub fn big_untyped(&self) -> (u64, UntypedDesc) {
-        self.untyped()
-            .into_iter()
-            .filter(|(_, d)| d.kind == 0)
-            .max_by_key(|(_, d)| d.bits)
-            .unwrap()
+        self.untyped().into_iter().filter(|(_, d)| d.kind == 0).max_by_key(|(_, d)| d.bits).unwrap()
     }
 
     /// Run until thread `t` is current, then make syscall `n` as it. Returns
@@ -321,11 +286,7 @@ impl Machine {
                 break;
             }
         }
-        let out = SysResult {
-            thread: t,
-            status: r[TestHal::SYS].get(),
-            blocked: self.k.thread_view(t).state != 1,
-        };
+        let out = SysResult { thread: t, status: r[TestHal::SYS].get(), blocked: self.k.thread_view(t).state != 1 };
         if self.k.can_run() {
             self.k.schedule();
         }
@@ -339,11 +300,7 @@ impl Machine {
     /// The syscall as the root thread; panics unless it succeeds.
     pub fn ok(&self, n: Syscall, a: [u64; 6]) {
         let r = self.sys(n, a);
-        assert!(
-            !r.blocked && r.status == 0,
-            "{n:?}{a:x?} failed: {:?}",
-            Error::result(r.status)
-        );
+        assert!(!r.blocked && r.status == 0, "{n:?}{a:x?} failed: {:?}", Error::result(r.status));
     }
 
     /// The error the syscall returns to the root thread.
@@ -362,33 +319,18 @@ impl Machine {
 
     /// The capability in root CapSpace slot `i`.
     pub fn cap(&self, i: u64) -> Option<Cap> {
-        self.k
-            .view(self.k.slot_addr(&self.cs, i).unwrap())
-            .map(|v| v.cap)
+        self.k.view(self.k.slot_addr(&self.cs, i).unwrap()).map(|v| v.cap)
     }
 
     pub fn retype(&self, ut: u64, ty: ObjectType, bits: u64, slot: u64, count: u64) {
-        self.ok(
-            Syscall::Retype,
-            [
-                ut,
-                ty as u64,
-                bits,
-                silica_abi::root::SLOT_CAPSPACE,
-                slot,
-                count,
-            ],
-        );
+        self.ok(Syscall::Retype, [ut, ty as u64, bits, silica_abi::root::SLOT_CAPSPACE, slot, count]);
     }
 
     /// A new thread sharing the root's CapSpace and address space, runnable.
     /// Uses slots `slot` (thread) and returns the thread object.
     pub fn spawn(&self, ut: u64, slot: u64) -> Paddr {
         self.retype(ut, ObjectType::Thread, 0, slot, 1);
-        self.ok(
-            Syscall::ThreadConfigure,
-            [slot, silica_abi::root::SLOT_CAPSPACE, SLOT_ASPACE, 0, 0, 0],
-        );
+        self.ok(Syscall::ThreadConfigure, [slot, silica_abi::root::SLOT_CAPSPACE, SLOT_ASPACE, 0, 0, 0]);
         self.ok(Syscall::ThreadStart, [slot, 0x40_0000, 0, 0, 1, 0]);
         self.cap(slot).unwrap().obj
     }

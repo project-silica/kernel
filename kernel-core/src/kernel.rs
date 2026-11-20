@@ -3,7 +3,7 @@
 use crate::cap::{Cap, FLAG_DEVICE, FLAG_PORTS};
 use crate::hal::Hal;
 use crate::mem::{Paddr, Phys};
-use crate::thread::{INACTIVE, IPC_CALL, Thread};
+use crate::thread::{INACTIVE, IPC_CALL, RUNNABLE, Thread};
 use core::cell::Cell;
 use silica_abi::{Error, KEEP, NONBLOCK, ObjectType, PAGE_BITS, Rights, Syscall};
 
@@ -33,6 +33,10 @@ pub struct Kernel<H: Hal> {
     pub(crate) timer_at: Cell<u64>,
     pub(crate) slice_end: Cell<u64>,
     pub(crate) resched: Cell<bool>,
+    /// The timer fired since the scheduler last looked at deadlines.
+    pub(crate) tick: Cell<bool>,
+    /// The thread to switch to directly at the end of this kernel entry.
+    pub(crate) direct: Cell<Paddr>,
     pub(crate) reap: Cell<u64>,
 }
 
@@ -51,6 +55,8 @@ impl<H: Hal> Kernel<H> {
             timer_at: Cell::new(u64::MAX),
             slice_end: Cell::new(0),
             resched: Cell::new(false),
+            tick: Cell::new(false),
+            direct: Cell::new(0),
             reap: Cell::new(0),
         }
     }
@@ -72,13 +78,7 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// The capability at `index`, which must be of type `ty` and carry `rights`.
-    fn ccap(
-        &self,
-        t: Paddr,
-        index: u64,
-        ty: ObjectType,
-        rights: Rights,
-    ) -> Result<(Paddr, Cap), Error> {
+    fn ccap(&self, t: Paddr, index: u64, ty: ObjectType, rights: Rights) -> Result<(Paddr, Cap), Error> {
         let s = self.cslot(t, index)?;
         let cap = self.slot(s).cap().ok_or(Error::BadCap)?;
         if cap.ty != ty {
@@ -120,9 +120,7 @@ impl<H: Hal> Kernel<H> {
                     return Err(Error::NoRights);
                 }
                 match cap.ty {
-                    ObjectType::Endpoint => {
-                        self.send(t, cap.obj, cap.badge, 0, a[0] & NONBLOCK == 0)
-                    }
+                    ObjectType::Endpoint => self.send(t, cap.obj, cap.badge, 0, a[0] & NONBLOCK == 0),
                     ObjectType::Notification => {
                         // A capability without a badge signals bit 0.
                         self.signal(cap.obj, cap.badge.max(1));
@@ -133,14 +131,18 @@ impl<H: Hal> Kernel<H> {
             }
             Syscall::Recv => self.recv_any(t, a[0], a[1]),
             Syscall::ReplyRecv => {
+                let caller = self.thread(t).caller.get();
                 let replied = self.reply(t);
-                if a[0] != 0 {
-                    self.recv_any(t, a[0], 0)
-                } else if replied {
-                    Ok(Exit::Done)
-                } else {
-                    Err(Error::NoCaller)
+                if a[0] == 0 {
+                    return if replied { Ok(Exit::Done) } else { Err(Error::NoCaller) };
                 }
+                let r = self.recv_any(t, a[0], 0);
+                // The server now waits: the caller it answered runs next.
+                if replied && r == Ok(Exit::Blocked) && caller != t && self.thread(caller).state.get() == RUNNABLE {
+                    self.q_remove(&self.rq_head, &self.rq_tail, caller);
+                    self.hand_off(caller);
+                }
+                r
             }
             Syscall::Yield => {
                 self.resched.set(true);
@@ -188,11 +190,7 @@ impl<H: Hal> Kernel<H> {
                 if self.slot(s).is_empty() {
                     return Err(Error::BadCap);
                 }
-                Ok(if self.revoke(s) {
-                    Exit::Done
-                } else {
-                    Exit::Preempted
-                })
+                Ok(if self.revoke(s) { Exit::Done } else { Exit::Preempted })
             }
             Syscall::Map => {
                 let (_, asp) = self.ccap(t, a[0], ObjectType::AddressSpace, Rights::WRITE)?;
@@ -207,12 +205,7 @@ impl<H: Hal> Kernel<H> {
             }
             Syscall::ThreadConfigure => {
                 let (_, th) = self.ccap(t, a[0], ObjectType::Thread, Rights::WRITE)?;
-                let want = [
-                    ObjectType::CapSpace,
-                    ObjectType::AddressSpace,
-                    ObjectType::Endpoint,
-                    ObjectType::Frame,
-                ];
+                let want = [ObjectType::CapSpace, ObjectType::AddressSpace, ObjectType::Endpoint, ObjectType::Frame];
                 // Validate everything before changing anything.
                 let mut src = [0; 4];
                 for i in 0..4 {
@@ -221,11 +214,7 @@ impl<H: Hal> Kernel<H> {
                         continue;
                     }
                     let (s, cap) = self.ccap(t, arg, want[i], Rights::NONE)?;
-                    if i == 3
-                        && (cap.bits != PAGE_BITS
-                            || cap.flags & FLAG_DEVICE != 0
-                            || !cap.rights.has(Rights(3)))
-                    {
+                    if i == 3 && (cap.bits != PAGE_BITS || cap.flags & FLAG_DEVICE != 0 || !cap.rights.has(Rights(3))) {
                         return Err(Error::BadArg);
                     }
                     src[i] = s;
@@ -266,11 +255,7 @@ impl<H: Hal> Kernel<H> {
                 if a[4] != 0 {
                     self.make_runnable(th.obj);
                 }
-                Ok(if th.obj == t {
-                    Exit::Blocked
-                } else {
-                    Exit::Done
-                })
+                Ok(if th.obj == t { Exit::Blocked } else { Exit::Done })
             }
             Syscall::ThreadControl => {
                 let (_, th) = self.ccap(t, a[0], ObjectType::Thread, Rights::WRITE)?;
@@ -281,11 +266,7 @@ impl<H: Hal> Kernel<H> {
                             self.thread(t).regs[H::SYS].set(0);
                         }
                         self.cancel(th.obj, true);
-                        Ok(if th.obj == t {
-                            Exit::Blocked
-                        } else {
-                            Exit::Done
-                        })
+                        Ok(if th.obj == t { Exit::Blocked } else { Exit::Done })
                     }
                     1 => {
                         if self.thread(th.obj).state.get() == INACTIVE {
@@ -303,15 +284,10 @@ impl<H: Hal> Kernel<H> {
                 if cap.flags & FLAG_PORTS == 0 {
                     return Err(Error::WrongType);
                 }
-                if !matches!(width, 1 | 2 | 4)
-                    || a[1] < cap.obj
-                    || a[1].checked_add(width).is_none_or(|e| e > cap.badge)
-                {
+                if !matches!(width, 1 | 2 | 4) || a[1] < cap.obj || a[1].checked_add(width).is_none_or(|e| e > cap.badge) {
                     return Err(Error::BadArg);
                 }
-                let v = self
-                    .hal
-                    .port_io(a[1] as u16, width as u8, write, a[3] as u32);
+                let v = self.hal.port_io(a[1] as u16, width as u8, write, a[3] as u32);
                 self.thread(t).regs[H::ARG[0]].set(v as u64);
                 Ok(Exit::Done)
             }
@@ -333,14 +309,7 @@ impl<H: Hal> Kernel<H> {
 
     /// Copy the capability in slot `s` into the empty slot `d`: as a child of
     /// `s`, or with `sibling` as an independent capability beside it.
-    pub(crate) fn copy(
-        &self,
-        s: Paddr,
-        d: Paddr,
-        mask: Rights,
-        badge: u64,
-        sibling: bool,
-    ) -> Result<(), Error> {
+    pub(crate) fn copy(&self, s: Paddr, d: Paddr, mask: Rights, badge: u64, sibling: bool) -> Result<(), Error> {
         let mut cap = self.slot(s).cap().ok_or(Error::BadCap)?;
         if !self.slot(d).is_empty() {
             return Err(Error::SlotFull);
@@ -417,32 +386,15 @@ impl<H: Hal> Kernel<H> {
     pub fn view(&self, s: Paddr) -> Option<SlotView> {
         let slot = self.slot(s);
         let cap = slot.cap()?;
-        let mapped = (cap.ty == ObjectType::Frame && slot.badge.get() & 1 != 0)
-            .then(|| (slot.aux.get(), slot.badge.get() & !0xFFF));
-        let watermark = if cap.ty == ObjectType::Untyped {
-            (slot.badge.get(), slot.aux.get())
-        } else {
-            (0, 0)
-        };
-        Some(SlotView {
-            cap,
-            depth: slot.depth(),
-            prev: slot.prev.get(),
-            next: slot.next.get(),
-            mapped,
-            watermark,
-        })
+        let mapped = (cap.ty == ObjectType::Frame && slot.badge.get() & 1 != 0).then(|| (slot.aux.get(), slot.badge.get() & !0xFFF));
+        let watermark = if cap.ty == ObjectType::Untyped { (slot.badge.get(), slot.aux.get()) } else { (0, 0) };
+        Some(SlotView { cap, depth: slot.depth(), prev: slot.prev.get(), next: slot.next.get(), mapped, watermark })
     }
 
     /// The state of the thread object at `t` (from a Thread capability).
     pub fn thread_view(&self, t: Paddr) -> ThreadView {
         let th = self.thread(t);
-        ThreadView {
-            state: th.state.get(),
-            slots: Thread::embedded_slots(t),
-            blocked_on: th.blocked_on.get(),
-            caller: th.caller.get(),
-        }
+        ThreadView { state: th.state.get(), slots: Thread::embedded_slots(t), blocked_on: th.blocked_on.get(), caller: th.caller.get() }
     }
 
     /// Whether any thread can run now or will be woken by a deadline.
@@ -450,6 +402,7 @@ impl<H: Hal> Kernel<H> {
         let c = self.cur.get();
         (c != 0 && self.thread(c).state.get() == crate::thread::RUNNABLE)
             || self.rq_head.get() != 0
+            || self.direct.get() != 0
             || self.timers.get() != 0
     }
 }

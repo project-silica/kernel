@@ -85,16 +85,7 @@ fn spawn(entry: extern "C" fn(u64) -> !, arg: u64, fault: Cap) -> (Cap, usize) {
     let (_, stack) = memory();
     thread_configure(t, SPACE, ASPACE, fault, Cap::NONE).expect("configure");
     // SAFETY: `entry` is a function of this program; the stack was just mapped.
-    unsafe {
-        thread_start(
-            t,
-            entry as usize,
-            stack + (1 << 16) - 8,
-            arg | t.0 << 32,
-            true,
-        )
-    }
-    .expect("start");
+    unsafe { thread_start(t, entry as usize, stack + (1 << 16) - 8, arg | t.0 << 32, true) }.expect("start");
     (t, stack)
 }
 
@@ -179,8 +170,7 @@ extern "C" fn do_fault(arg: u64) -> ! {
 fn fault_of(what: u64) -> core::result::Result<Message, &'static str> {
     let ep = new(ObjectType::Endpoint, 0);
     let (t, _) = spawn(do_fault, what, ep);
-    let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000))
-        .map_err(|_| "no fault message arrived")?;
+    let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000)).map_err(|_| "no fault message arrived")?;
     // SAFETY: the faulted thread is stopped and is not used again.
     unsafe { cap_delete(t) }.map_err(|_| "cannot delete a faulted thread")?;
     // The kernel is still running and still schedules.
@@ -208,18 +198,14 @@ fn t_fault_page() -> T {
 
 fn t_fault_instruction() -> T {
     let m = fault_of(2)?;
-    (kind(&m) == Fault::Instruction as u64)
-        .then_some(())
-        .ok_or("ud2 was not reported as an instruction fault")
+    (kind(&m) == Fault::Instruction as u64).then_some(()).ok_or("ud2 was not reported as an instruction fault")
 }
 
 fn t_fault_privileged() -> T {
     for what in [3, 6, 7, 8] {
         let m = fault_of(what)?;
         if kind(&m) != Fault::Exception as u64 || m.words[1] != 13 {
-            return Err(
-                "a privileged instruction (cli, hlt, mov from cr3, in) was not a general-protection fault",
-            );
+            return Err("a privileged instruction (cli, hlt, mov from cr3, in) was not a general-protection fault");
         }
     }
     Ok(())
@@ -258,8 +244,7 @@ extern "C" fn overflow(arg: u64) -> ! {
 fn t_fault_stack() -> T {
     let ep = new(ObjectType::Endpoint, 0);
     let (t, stack) = spawn(overflow, 0, ep);
-    let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000))
-        .map_err(|_| "no fault message arrived")?;
+    let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000)).map_err(|_| "no fault message arrived")?;
     // SAFETY: the faulted thread is stopped and is not used again.
     unsafe { cap_delete(t) }.map_err(|_| "cannot delete the thread")?;
     let addr = m.words[1] as usize;
@@ -288,8 +273,7 @@ fn t_fault_resume() -> T {
     DEMAND_AT.store(at as u64 + 8, SeqCst);
     let ep = new(ObjectType::Endpoint, 0);
     let (_t, _) = spawn(touch, 0, ep);
-    let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000))
-        .map_err(|_| "no fault message arrived")?;
+    let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000)).map_err(|_| "no fault message arrived")?;
     if kind(&m) != Fault::Page as u64 || m.words[1] != at as u64 + 8 {
         return Err("the fault address is not the address touched");
     }
@@ -315,8 +299,7 @@ fn t_w_xor_x() -> T {
     thread_configure(t, SPACE, ASPACE, ep, Cap::NONE).map_err(|_| "configure")?;
     // SAFETY: the thread is expected to fault on its first instruction.
     unsafe { thread_start(t, at, stack + 0xFFF8, 0, true) }.map_err(|_| "start")?;
-    let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000))
-        .map_err(|_| "executing a data page did not fault")?;
+    let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000)).map_err(|_| "executing a data page did not fault")?;
     if kind(&m) != Fault::Page as u64 || m.words[1] != at as u64 || m.words[2] & 0x10 == 0 {
         return Err("executing a data page was not an instruction-fetch page fault");
     }
@@ -328,29 +311,19 @@ fn t_w_xor_x() -> T {
     unsafe { core::mem::transmute::<usize, extern "C" fn()>(at)() };
     DEMAND_AT.store(at as u64, SeqCst);
     let (_t2, _) = spawn(touch, 0, ep);
-    let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000))
-        .map_err(|_| "writing a read-only page did not fault")?;
-    (kind(&m) == Fault::Page as u64 && m.words[2] & 0b11 == 0b11)
-        .then_some(())
-        .ok_or("writing a read-only page was not a protection fault")
+    let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000)).map_err(|_| "writing a read-only page did not fault")?;
+    (kind(&m) == Fault::Page as u64 && m.words[2] & 0b11 == 0b11).then_some(()).ok_or("writing a read-only page was not a protection fault")
 }
 
 extern "C" fn echo_server(arg: u64) -> ! {
     let ep = Cap(SHARED[3].load(SeqCst));
-    let Ok(mut m) = recv(ep, Wait::Forever) else {
-        finish(arg)
-    };
+    let Ok(mut m) = recv(ep, Wait::Forever) else { finish(arg) };
     loop {
         if m.info.label() == 99 {
             let _ = reply(MsgInfo(0), [0; 4]);
             finish(arg);
         }
-        let w = [
-            m.words[0] * 2,
-            m.words[1] + m.badge,
-            !m.words[2],
-            m.info.words() as u64,
-        ];
+        let w = [m.words[0] * 2, m.words[1] + m.badge, !m.words[2], m.info.words() as u64];
         m = match reply_recv(ep, MsgInfo::new(m.info.label() + 1, 4), w) {
             Ok(m) => m,
             Err(_) => finish(arg),
@@ -416,9 +389,7 @@ fn t_timer() -> T {
         return Err("a deadline in the past did not time out at once");
     }
     signal(n).map_err(|_| "signal")?;
-    recv(n, Wait::Poll)
-        .map(|_| ())
-        .map_err(|_| "a pending signal was not received")
+    recv(n, Wait::Poll).map(|_| ()).map_err(|_| "a pending signal was not received")
 }
 
 extern "C" fn spin(arg: u64) -> ! {
@@ -498,9 +469,7 @@ fn t_fpu() -> T {
     if !(x > 10_000.0 && x < 100_000.0) {
         return Err("floating-point state of the main thread was corrupted");
     }
-    wait_for(&SHARED[0], 1)
-        .and(wait_for(&SHARED[1], 1))
-        .map_err(|_| "SSE or AVX registers changed across a thread switch")
+    wait_for(&SHARED[0], 1).and(wait_for(&SHARED[1], 1)).map_err(|_| "SSE or AVX registers changed across a thread switch")
 }
 
 fn t_untyped() -> T {
@@ -508,8 +477,7 @@ fn t_untyped() -> T {
     let s = slot();
     let at = region(1 << 16);
     for round in 0..50u64 {
-        retype(pool, ObjectType::Frame, 16, SPACE, s, 1)
-            .map_err(|_| "retype from a revoked Untyped failed")?;
+        retype(pool, ObjectType::Frame, 16, SPACE, s, 1).map_err(|_| "retype from a revoked Untyped failed")?;
         map(ASPACE, Cap(s), at, RW).map_err(|_| "map")?;
         let p = at as *mut u64;
         // SAFETY: 64 KiB mapped read-write at `at` just above.
@@ -574,15 +542,227 @@ struct LazyClock;
 static CLOCK: LazyClock = LazyClock;
 impl LazyClock {
     fn get(&self) -> Clock {
-        Clock::new([
-            CLOCK_CELL[0].load(SeqCst),
-            CLOCK_CELL[1].load(SeqCst),
-            CLOCK_CELL[2].load(SeqCst),
-        ])
+        Clock::new([CLOCK_CELL[0].load(SeqCst), CLOCK_CELL[1].load(SeqCst), CLOCK_CELL[2].load(SeqCst)])
     }
     fn now(&self) -> u64 {
         self.get().now()
     }
+}
+
+// ---- benchmarks -----------------------------------------------------------
+//
+// `bench` on the command line runs these instead of a test and prints
+// `BENCH <metric> <value> <unit>` lines, the same metrics with the same
+// payloads and statistics as the Linux baseline program
+// (os/bench/linux/init.c).
+
+const SAMPLES: usize = 20_000;
+const WARMUP: usize = 2_000;
+static mut SAMPLE: [u64; SAMPLES] = [0; SAMPLES];
+
+fn rdtsc() -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: LFENCE and RDTSC read the timestamp counter after earlier
+    // instructions have finished.
+    unsafe { asm!("lfence", "rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)) }
+    (hi as u64) << 32 | lo as u64
+}
+
+fn samples() -> &'static mut [u64; SAMPLES] {
+    // SAFETY: only the benchmark's main thread uses the sample buffer.
+    unsafe { &mut *(&raw mut SAMPLE) }
+}
+
+fn report(name: &str, n: usize, div: u64) {
+    let s = &mut samples()[..n];
+    s.sort_unstable();
+    let ns = |ticks: u64| (ticks as u128 * 1_000_000_000 / CLOCK_CELL[0].load(SeqCst) as u128) as u64 / div;
+    println!("BENCH {name}_min {} ns", ns(s[0]));
+    println!("BENCH {name} {} ns", ns(s[n / 2]));
+    println!("BENCH {name}_p99 {} ns", ns(s[n - n / 100 - 1]));
+}
+
+// Code for threads in other address spaces: position-independent, no stack,
+// no data. The first argument register holds the thread's argument.
+core::arch::global_asm!(
+    ".section .text.stubs, \"ax\"",
+    ".global stub_echo, stub_echo_end, stub_yield, stub_yield_end",
+    // An echo server on the endpoint in rdi: ReplyRecv for ever. The reply
+    // is the request, because the message registers are left as received.
+    "stub_echo:",
+    "mov r15, rdi",
+    "2: mov eax, 3",
+    "mov rdi, r15",
+    "syscall",
+    "jmp 2b",
+    "stub_echo_end:",
+    // Yield for ever with live AVX state.
+    "stub_yield:",
+    "vmovq xmm0, rdi",
+    "vpbroadcastq ymm15, xmm0",
+    "3: mov eax, 4",
+    "syscall",
+    "jmp 3b",
+    "stub_yield_end:",
+);
+unsafe extern "C" {
+    static stub_echo: u8;
+    static stub_echo_end: u8;
+    static stub_yield: u8;
+    static stub_yield_end: u8;
+}
+
+fn stub(start: *const u8, end: *const u8) -> &'static [u8] {
+    // SAFETY: both symbols are labels around one stub in this program's text.
+    unsafe { core::slice::from_raw_parts(start, end as usize - start as usize) }
+}
+
+/// A thread in its own address space running `code` (position-independent
+/// machine code that needs no stack and no data).
+fn foreign_thread(code: &[u8], arg: u64) -> Cap {
+    let aspace = new(ObjectType::AddressSpace, 16);
+    let frame = new(ObjectType::Frame, 12);
+    let at = region(1 << 12);
+    map(ASPACE, frame, at, RW).expect("map code for writing");
+    // SAFETY: one page mapped read-write at `at`; `code` fits in it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, code.len());
+        unmap(frame).expect("unmap");
+    }
+    map(aspace, frame, 0x10_0000, Rights(5)).expect("map code in the new address space");
+    let t = new(ObjectType::Thread, 0);
+    thread_configure(t, SPACE, aspace, Cap::NONE, Cap::NONE).expect("configure");
+    // SAFETY: the code was written for exactly this: it runs at any address without a stack.
+    unsafe { thread_start(t, 0x10_0000, 0, arg, true) }.expect("start");
+    t
+}
+
+fn bench_null_syscall() {
+    for i in 0..SAMPLES + WARMUP {
+        let t = rdtsc();
+        raw_syscall(9999);
+        let t = rdtsc() - t;
+        if i >= WARMUP {
+            samples()[i - WARMUP] = t;
+        }
+    }
+    report("null_syscall", SAMPLES, 1);
+}
+
+/// A call and its reply between two address spaces on one processor, four
+/// message words (32 bytes) each way.
+fn bench_ipc() {
+    let ep = new(ObjectType::Endpoint, 0);
+    let server = foreign_thread(stub(&raw const stub_echo, &raw const stub_echo_end), ep.0);
+    for i in 0..SAMPLES + WARMUP {
+        let t = rdtsc();
+        let r = call(ep, MsgInfo::new(1, 4), [i as u64, 2, 3, 4]);
+        let t = rdtsc() - t;
+        if r.map(|m| m.words[0]) != Ok(i as u64) {
+            println!("ERROR: bench: the echo server answered wrongly");
+            exit(false);
+        }
+        if i >= WARMUP {
+            samples()[i - WARMUP] = t;
+        }
+    }
+    // SAFETY: the server thread is used by nothing else.
+    let _ = unsafe { cap_delete(server) };
+    report("ipc_roundtrip", SAMPLES, 1);
+}
+
+/// Two threads in different address spaces yielding to each other, each
+/// with live AVX state: one sample is two switches.
+fn bench_ctx_switch() {
+    let other = foreign_thread(stub(&raw const stub_yield, &raw const stub_yield_end), 7);
+    for i in 0..SAMPLES + WARMUP {
+        let t: u64;
+        // SAFETY: loads AVX registers, then times one Yield syscall.
+        unsafe {
+            asm!(
+                "vmovq xmm0, {v}",
+                "vpbroadcastq ymm15, xmm0",
+                "lfence", "rdtsc", "shl rdx, 32", "lea {t0}, [rax + rdx]",
+                "mov eax, 4",
+                "syscall",
+                "lfence", "rdtsc", "shl rdx, 32", "add rax, rdx", "sub rax, {t0}",
+                v = in(reg) i as u64, t0 = out(reg) _,
+                out("rax") t, out("rdx") _, out("rcx") _, out("r11") _, out("rdi") _, out("rsi") _, out("r10") _, out("r8") _, out("r9") _,
+                out("xmm0") _, out("xmm15") _,
+                options(nostack),
+            );
+        }
+        if i >= WARMUP {
+            samples()[i - WARMUP] = t;
+        }
+    }
+    // SAFETY: the other thread is used by nothing else.
+    let _ = unsafe { cap_delete(other) };
+    report("ctx_switch", SAMPLES, 2);
+}
+
+static FAULT_BASE: AtomicU64 = AtomicU64::new(0);
+const FAULT_PAGES: usize = 2048;
+
+extern "C" fn toucher(arg: u64) -> ! {
+    let base = FAULT_BASE.load(SeqCst) as *mut u8;
+    for i in 0..FAULT_PAGES {
+        let t = rdtsc();
+        // SAFETY: the page is absent; the pager maps it and the write restarts.
+        unsafe { core::ptr::write_volatile(base.add(i * 4096), 1) };
+        // SAFETY: the main thread reads the samples only after this thread signals.
+        unsafe { (*(&raw mut SAMPLE))[i] = rdtsc() - t };
+    }
+    SHARED[0].store(99, SeqCst);
+    finish(arg)
+}
+
+/// First touch of a page, resolved by a pager thread in userspace.
+fn bench_page_fault() {
+    let first = NEXT_SLOT.fetch_add(FAULT_PAGES as u64, SeqCst);
+    for i in 0..FAULT_PAGES as u64 / 256 {
+        retype(Cap(UNTYPED.load(SeqCst)), ObjectType::Frame, 12, SPACE, first + i * 256, 256).expect("frames");
+    }
+    let base = region((FAULT_PAGES as u64) << 12);
+    FAULT_BASE.store(base as u64, SeqCst);
+    SHARED[0].store(0, SeqCst);
+    let ep = new(ObjectType::Endpoint, 0);
+    let _ = spawn(toucher, 0, ep);
+    let mut m = recv(ep, Wait::Forever).expect("fault");
+    for i in 0..FAULT_PAGES as u64 {
+        map(ASPACE, Cap(first + i), m.words[1] as usize & !0xFFF, RW).expect("map");
+        if i + 1 == FAULT_PAGES as u64 {
+            reply(MsgInfo::new(0, 1), [FAULT_RESUME, 0, 0, 0]).expect("reply");
+        } else {
+            m = reply_recv(ep, MsgInfo::new(0, 1), [FAULT_RESUME, 0, 0, 0]).expect("next fault");
+        }
+    }
+    let _ = wait_for(&SHARED[0], 99);
+    report("page_fault", FAULT_PAGES, 1);
+}
+
+fn bench_timer() {
+    let n = new(ObjectType::Notification, 0);
+    let count = 500;
+    for i in 0..count {
+        let at = CLOCK.now() + 1_000_000;
+        let _ = recv(n, Wait::Until(at));
+        samples()[i] = CLOCK.now().saturating_sub(at);
+    }
+    let s = &mut samples()[..count];
+    s.sort_unstable();
+    println!("BENCH timer_overshoot {} ns", s[count / 2]);
+    println!("BENCH timer_overshoot_p99 {} ns", s[count - count / 100 - 1]);
+}
+
+fn bench() -> ! {
+    bench_null_syscall();
+    bench_ipc();
+    bench_ctx_switch();
+    bench_page_fault();
+    bench_timer();
+    println!("BENCH DONE");
+    exit(true)
 }
 
 const TESTS: &[(&str, fn() -> T)] = &[
@@ -613,9 +793,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         CLOCK_CELL[i].store(info.clock[i], SeqCst);
     }
     NEXT_SLOT.store(info.first_free_slot, SeqCst);
-    let big = (0..info.untyped_count as usize)
-        .filter(|&i| info.untyped[i].kind == KIND_RAM)
-        .max_by_key(|&i| info.untyped[i].bits);
+    let big = (0..info.untyped_count as usize).filter(|&i| info.untyped[i].kind == KIND_RAM).max_by_key(|&i| info.untyped[i].bits);
     let Some(big) = big else {
         println!("ERROR: roottest: the kernel handed over no ordinary memory");
         exit(false)
@@ -623,18 +801,14 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     UNTYPED.store(SLOT_FIRST_UNTYPED + big as u64, SeqCst);
 
     let cmdline = &info.cmdline[..info.cmdline_len as usize];
-    let test = cmdline
-        .split(|&b| b == b' ' || b == b'\n')
-        .find_map(|w| w.strip_prefix(b"test="));
-    let Some(name) = test
-        .and_then(|n| core::str::from_utf8(n).ok())
-        .map(str::trim_ascii)
-    else {
+    if cmdline.split(|&b| b == b' ' || b == b'\n').any(|w| w.trim_ascii() == b"bench") {
+        println!("BENCH MARK userspace");
+        bench()
+    }
+    let test = cmdline.split(|&b| b == b' ' || b == b'\n').find_map(|w| w.strip_prefix(b"test="));
+    let Some(name) = test.and_then(|n| core::str::from_utf8(n).ok()).map(str::trim_ascii) else {
         let since_loader = CLOCK.get().since(info.clock[1]);
-        println!(
-            "BENCH boot_userspace_from_loader_us {} us",
-            since_loader / 1000
-        );
+        println!("BENCH boot_userspace_from_loader_us {} us", since_loader / 1000);
         println!("{}", "BOOT OK");
         exit(true)
     };

@@ -8,18 +8,14 @@ const COM1: u16 = 0x3F8;
 pub fn outb(port: u16, v: u8) {
     // SAFETY: port output has no effect on memory the compiler knows about;
     // callers pass ports the kernel owns or a port range a capability covers.
-    unsafe {
-        asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack, preserves_flags))
-    }
+    unsafe { asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack, preserves_flags)) }
 }
 
 /// Read a byte from an I/O port.
 pub fn inb(port: u16) -> u8 {
     let v: u8;
     // SAFETY: as for `outb`.
-    unsafe {
-        asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack, preserves_flags))
-    }
+    unsafe { asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack, preserves_flags)) }
     v
 }
 

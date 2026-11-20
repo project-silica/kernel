@@ -277,14 +277,43 @@ impl<H: Hal> Kernel<H> {
         qu.kind.set(0);
     }
 
-    /// The timer interrupt: note that the slice ended. Expired deadlines are
-    /// handled by `schedule`.
+    /// The timer interrupt. Deadlines and the time slice are looked at by
+    /// `schedule`, on the way out.
     pub fn on_timer(&self) {
-        // The timer is one-shot: having fired, it is no longer armed, and
-        // it may have fired early (an architecture can only count so far).
+        // The timer is one-shot: having fired, it is no longer armed. It may
+        // have fired early: it is only ever reprogrammed to fire sooner.
         self.timer_at.set(u64::MAX);
-        if self.hal.now() >= self.slice_end.get() {
+        self.tick.set(true);
+    }
+
+    /// Wake every thread whose deadline has passed and note the end of the slice.
+    fn expire(&self) {
+        let now = self.hal.now();
+        loop {
+            let t = self.timers.get();
+            if t == 0 || self.thread(t).deadline.get() > now {
+                break;
+            }
+            self.cancel(t, false);
+            self.wake(t, Err(Error::Timeout));
+        }
+        if now >= self.slice_end.get() {
             self.resched.set(true);
+        }
+    }
+
+    /// Hand the processor to `t` on the way out of this kernel entry,
+    /// without a pass through the run queue: the receiver of a call, or the
+    /// caller a server has just answered.
+    pub(crate) fn hand_off(&self, t: Paddr) {
+        self.timer_remove(t);
+        let th = self.thread(t);
+        th.blocked_on.set(0);
+        th.state.set(RUNNABLE);
+        if self.direct.get() == 0 && t != self.cur.get() {
+            self.direct.set(t);
+        } else if t != self.cur.get() {
+            self.q_push(&self.rq_head, &self.rq_tail, t);
         }
     }
 
@@ -293,17 +322,20 @@ impl<H: Hal> Kernel<H> {
     /// runnable and loaded.
     pub fn schedule(&self) {
         loop {
-            let now = self.hal.now();
-            loop {
-                let t = self.timers.get();
-                if t == 0 || self.thread(t).deadline.get() > now {
-                    break;
-                }
-                self.cancel(t, false);
-                self.wake(t, Err(Error::Timeout));
+            if self.tick.replace(false) {
+                self.expire();
             }
             let cur = self.cur.get();
             let cur_ok = cur != 0 && self.thread(cur).state.get() == RUNNABLE;
+            let direct = self.direct.replace(0);
+            if direct != 0 {
+                // A hand-off continues the giver's time slice.
+                if cur_ok {
+                    self.q_push(&self.rq_head, &self.rq_tail, cur);
+                }
+                self.cur.set(direct);
+                break;
+            }
             if cur_ok && !(self.resched.get() && self.rq_head.get() != 0) {
                 break;
             }
@@ -313,37 +345,41 @@ impl<H: Hal> Kernel<H> {
                     self.q_push(&self.rq_head, &self.rq_tail, cur);
                 }
                 self.cur.set(next);
-                self.slice_end.set(now + SLICE_NS);
+                self.slice_end.set(self.hal.now() + SLICE_NS);
                 break;
             }
+            // Nothing to run. The timer is set exactly (or switched off) so
+            // an idle processor wakes only when there is something to do.
             self.cur.set(0);
-            self.arm_timer();
+            self.arm_timer(true);
             self.hal.idle();
+            self.tick.set(true);
         }
         self.resched.set(false);
-        self.arm_timer();
+        self.arm_timer(false);
         let cur = self.cur.get();
         let root = self.thread(cur).aspace.cap().map_or(0, |c| c.obj + 4096);
         if self.loaded.get() != cur || self.loaded_root.get() != root {
-            self.hal
-                .switch_thread(&self.phys, self.loaded.get(), cur, root);
+            self.hal.switch_thread(&self.phys, self.loaded.get(), cur, root);
             self.loaded.set(cur);
             self.loaded_root.set(root);
         }
     }
 
-    fn arm_timer(&self) {
+    /// Make sure the timer fires no later than the next deadline or the end
+    /// of the slice. Programming the timer is expensive (on a virtual
+    /// machine it leaves the guest), so unless `exact` it is only ever moved
+    /// earlier; a timer left too early fires once and is then set right.
+    fn arm_timer(&self, exact: bool) {
         let t = self.timers.get();
-        let mut at = if t != 0 {
-            self.thread(t).deadline.get()
-        } else {
-            u64::MAX
-        };
+        let mut want = if t != 0 { self.thread(t).deadline.get() } else { u64::MAX };
         if self.cur.get() != 0 && self.rq_head.get() != 0 {
-            at = at.min(self.slice_end.get());
+            want = want.min(self.slice_end.get());
         }
-        if self.timer_at.replace(at) != at {
-            self.hal.set_timer(at);
+        let armed = self.timer_at.get();
+        if want < armed || (exact && want != armed) {
+            self.timer_at.set(want);
+            self.hal.set_timer(want);
         }
     }
 }

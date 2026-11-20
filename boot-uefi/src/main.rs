@@ -17,9 +17,7 @@ mod efi;
 use core::arch::asm;
 use core::ffi::c_void;
 use core::ptr;
-use kernel_core::boot::{
-    BOOT_MAGIC, BOOT_VERSION, BootInfo, KERNEL_BASE, PHYS_MAP_BASE, Region, RegionKind,
-};
+use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, KERNEL_BASE, PHYS_MAP_BASE, Region, RegionKind};
 use kernel_core::elf::{EM_X86_64, Elf, PF_W, PF_X};
 
 const COM1: u16 = 0x3F8;
@@ -29,16 +27,12 @@ const HUGE: u64 = 2 << 20;
 fn outb(port: u16, v: u8) {
     // SAFETY: writing a byte to the first serial port or the emulator's exit
     // device has no memory effect.
-    unsafe {
-        asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack, preserves_flags))
-    }
+    unsafe { asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack, preserves_flags)) }
 }
 fn inb(port: u16) -> u8 {
     let v: u8;
     // SAFETY: reading the serial line status register has no memory effect.
-    unsafe {
-        asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack, preserves_flags))
-    }
+    unsafe { asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack, preserves_flags)) }
     v
 }
 fn rdtsc() -> u64 {
@@ -159,12 +153,7 @@ impl Tables<'_> {
         // nothing else uses these pages before the kernel starts.
         unsafe {
             if *e & P == 0 {
-                *e = self.boot.pages(
-                    efi::MEM_SILICA_KERNEL,
-                    PAGE,
-                    "out of memory for page tables",
-                ) | P
-                    | W;
+                *e = self.boot.pages(efi::MEM_SILICA_KERNEL, PAGE, "out of memory for page tables") | P | W;
             }
             *e & ADDR
         }
@@ -213,9 +202,7 @@ fn unix_seconds(t: &efi::Time) -> u64 {
 /// The region kind for a firmware memory type.
 fn kind_of(ty: u32) -> RegionKind {
     match ty {
-        efi::MEM_CONVENTIONAL | efi::MEM_BS_CODE | efi::MEM_BS_DATA | efi::MEM_LOADER_CODE => {
-            RegionKind::Usable
-        }
+        efi::MEM_CONVENTIONAL | efi::MEM_BS_CODE | efi::MEM_BS_DATA | efi::MEM_LOADER_CODE => RegionKind::Usable,
         efi::MEM_LOADER_DATA => RegionKind::Loader,
         efi::MEM_SILICA_KERNEL => RegionKind::Kernel,
         efi::MEM_SILICA_RAMDISK => RegionKind::Ramdisk,
@@ -234,36 +221,22 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     let loader_tsc = rdtsc();
     // SAFETY: the firmware passes a valid system table; boot services are
     // usable until ExitBootServices below.
-    let (bs, rt, cfg) = unsafe {
-        (
-            (*st).boot_services,
-            (*st).runtime_services,
-            core::slice::from_raw_parts((*st).config_table, (*st).config_count),
-        )
-    };
+    let (bs, rt, cfg) =
+        unsafe { ((*st).boot_services, (*st).runtime_services, core::slice::from_raw_parts((*st).config_table, (*st).config_count)) };
     let boot = Boot { bs };
 
-    let li: *mut efi::LoadedImage = boot
-        .protocol(image, &efi::LOADED_IMAGE)
-        .unwrap_or_else(|| fail("no loaded-image protocol"));
+    let li: *mut efi::LoadedImage = boot.protocol(image, &efi::LOADED_IMAGE).unwrap_or_else(|| fail("no loaded-image protocol"));
     // SAFETY: the protocol pointer is valid while boot services run.
-    let fs: *mut efi::SimpleFs = boot
-        .protocol(unsafe { (*li).device }, &efi::SIMPLE_FS)
-        .unwrap_or_else(|| fail("boot volume has no file system"));
+    let fs: *mut efi::SimpleFs =
+        boot.protocol(unsafe { (*li).device }, &efi::SIMPLE_FS).unwrap_or_else(|| fail("boot volume has no file system"));
     let mut root: *mut efi::File = ptr::null_mut();
     // SAFETY: `fs` is a valid protocol instance.
     if unsafe { ((*fs).open_volume)(fs, &mut root) } != efi::SUCCESS {
         fail("cannot open the boot volume");
     }
-    let (kfile, klen) = boot
-        .read(root, "SILICA\\KERNEL.ELF", efi::MEM_LOADER_DATA)
-        .unwrap_or_else(|| fail("SILICA\\KERNEL.ELF not found"));
-    let ramdisk = boot
-        .read(root, "SILICA\\RAMDISK.IMG", efi::MEM_SILICA_RAMDISK)
-        .unwrap_or((0, 0));
-    let cmdline = boot
-        .read(root, "SILICA\\CMDLINE.TXT", efi::MEM_LOADER_DATA)
-        .unwrap_or((0, 0));
+    let (kfile, klen) = boot.read(root, "SILICA\\KERNEL.ELF", efi::MEM_LOADER_DATA).unwrap_or_else(|| fail("SILICA\\KERNEL.ELF not found"));
+    let ramdisk = boot.read(root, "SILICA\\RAMDISK.IMG", efi::MEM_SILICA_RAMDISK).unwrap_or((0, 0));
+    let cmdline = boot.read(root, "SILICA\\CMDLINE.TXT", efi::MEM_LOADER_DATA).unwrap_or((0, 0));
 
     // Entropy and time, while the firmware can still be asked.
     let mut entropy = [0u8; 32];
@@ -275,54 +248,29 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     }
     let mut time = efi::Time::default();
     // SAFETY: runtime services are valid; `time` outlives the call.
-    let wall_secs = if unsafe { ((*rt).get_time)(&mut time, ptr::null_mut()) } == efi::SUCCESS {
-        unix_seconds(&time)
-    } else {
-        0
-    };
+    let wall_secs = if unsafe { ((*rt).get_time)(&mut time, ptr::null_mut()) } == efi::SUCCESS { unix_seconds(&time) } else { 0 };
     let wall_tsc = rdtsc();
 
     // The kernel image.
     // SAFETY: `kfile` holds `klen` bytes read above and is not modified again.
     let file = unsafe { core::slice::from_raw_parts(kfile as *const u8, klen as usize) };
-    let elf = Elf::parse(file, EM_X86_64)
-        .unwrap_or_else(|_| fail("SILICA\\KERNEL.ELF is not an x86_64 ELF image"));
-    let (lo, hi) = elf
-        .span()
-        .unwrap_or_else(|| fail("kernel image has no loadable segments"));
+    let elf = Elf::parse(file, EM_X86_64).unwrap_or_else(|_| fail("SILICA\\KERNEL.ELF is not an x86_64 ELF image"));
+    let (lo, hi) = elf.span().unwrap_or_else(|| fail("kernel image has no loadable segments"));
     if !elf.pie || lo != KERNEL_BASE || hi - lo > 64 << 20 {
         fail("kernel image is not position-independent at the kernel base, or is over 64 MiB");
     }
     // KASLR: a 2 MiB-aligned slide inside the top 2 GiB, leaving 128 MiB at the top.
     let slots = ((2u64 << 30) - (128 << 20) - (hi - lo)) / HUGE;
-    let rnd = u64::from_le_bytes([
-        entropy[0], entropy[1], entropy[2], entropy[3], entropy[4], entropy[5], entropy[6],
-        entropy[7],
-    ]);
-    let slide = if entropy == [0; 32] {
-        0
-    } else {
-        (rnd % slots) * HUGE
-    };
-    let kphys = boot.pages(
-        efi::MEM_SILICA_KERNEL,
-        hi - lo,
-        "out of memory for the kernel image",
-    );
+    let rnd = u64::from_le_bytes([entropy[0], entropy[1], entropy[2], entropy[3], entropy[4], entropy[5], entropy[6], entropy[7]]);
+    let slide = if entropy == [0; 32] { 0 } else { (rnd % slots) * HUGE };
+    let kphys = boot.pages(efi::MEM_SILICA_KERNEL, hi - lo, "out of memory for the kernel image");
     for s in elf.segments() {
         // SAFETY: the destination lies inside the pages just allocated
         // (`span` covers every segment) and the source inside the file.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                s.data.as_ptr(),
-                (kphys + (s.vaddr - lo)) as *mut u8,
-                s.data.len(),
-            )
-        };
+        unsafe { ptr::copy_nonoverlapping(s.data.as_ptr(), (kphys + (s.vaddr - lo)) as *mut u8, s.data.len()) };
     }
     for r in elf.relative_relocs() {
-        let (at, addend) =
-            r.unwrap_or_else(|_| fail("kernel image has a relocation the loader cannot apply"));
+        let (at, addend) = r.unwrap_or_else(|_| fail("kernel image has a relocation the loader cannot apply"));
         if at < lo || at.checked_add(8).is_none_or(|e| e > hi) {
             fail("kernel relocation outside the image");
         }
@@ -342,34 +290,17 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
             }
         }
     }
-    let rsdp = cfg
-        .iter()
-        .find(|c| c.guid == efi::ACPI2)
-        .map_or(0, |c| c.table as u64);
+    let rsdp = cfg.iter().find(|c| c.guid == efi::ACPI2).map_or(0, |c| c.table as u64);
 
     // Memory for the things that must exist before the final memory map.
-    let info_page = boot.pages(
-        efi::MEM_LOADER_DATA,
-        PAGE,
-        "out of memory for boot information",
-    );
-    let regions = boot.pages(
-        efi::MEM_LOADER_DATA,
-        (MAX_REGIONS * size_of::<Region>()) as u64,
-        "out of memory for the region table",
-    );
-    let map = boot.pages(
-        efi::MEM_LOADER_DATA,
-        MAP_BYTES,
-        "out of memory for the firmware memory map",
-    );
+    let info_page = boot.pages(efi::MEM_LOADER_DATA, PAGE, "out of memory for boot information");
+    let regions = boot.pages(efi::MEM_LOADER_DATA, (MAX_REGIONS * size_of::<Region>()) as u64, "out of memory for the region table");
+    let map = boot.pages(efi::MEM_LOADER_DATA, MAP_BYTES, "out of memory for the firmware memory map");
 
     // Page tables. Sized from a first look at the memory map.
     let (mut size, mut key, mut dsize, mut dver) = (MAP_BYTES as usize, 0usize, 0usize, 0u32);
     // SAFETY: `map` has MAP_BYTES bytes; the out-parameters outlive the call.
-    if unsafe { ((*bs).get_memory_map)(&mut size, map as *mut u8, &mut key, &mut dsize, &mut dver) }
-        != efi::SUCCESS
-    {
+    if unsafe { ((*bs).get_memory_map)(&mut size, map as *mut u8, &mut key, &mut dsize, &mut dver) } != efi::SUCCESS {
         fail("cannot read the firmware memory map");
     }
     let mut top = 4u64 << 30;
@@ -381,14 +312,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         }
     }
     let top = (top + (1 << 30) - 1) & !((1 << 30) - 1);
-    let tables = Tables {
-        boot: &boot,
-        root: boot.pages(
-            efi::MEM_SILICA_KERNEL,
-            PAGE,
-            "out of memory for page tables",
-        ),
-    };
+    let tables = Tables { boot: &boot, root: boot.pages(efi::MEM_SILICA_KERNEL, PAGE, "out of memory for page tables") };
     // All physical memory at PHYS_MAP_BASE; and the same
     // tables at address 0 so this loader keeps running after the switch.
     // The kernel removes the low alias and makes the rest non-executable.
@@ -396,8 +320,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     // SAFETY: both entries are in the root table allocated above.
     unsafe { *tables.entry(tables.root, 0) = *tables.entry(tables.root, 256) };
     for s in elf.segments() {
-        let flags =
-            G | if s.flags & PF_W != 0 { W } else { 0 } | if s.flags & PF_X != 0 { 0 } else { NX };
+        let flags = G | if s.flags & PF_W != 0 { W } else { 0 } | if s.flags & PF_X != 0 { 0 } else { NX };
         if s.flags & PF_W != 0 && s.flags & PF_X != 0 {
             fail("kernel image has a segment that is writable and executable");
         }
@@ -415,10 +338,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     loop {
         size = MAP_BYTES as usize;
         // SAFETY: as for the first call.
-        if unsafe {
-            ((*bs).get_memory_map)(&mut size, map as *mut u8, &mut key, &mut dsize, &mut dver)
-        } != efi::SUCCESS
-        {
+        if unsafe { ((*bs).get_memory_map)(&mut size, map as *mut u8, &mut key, &mut dsize, &mut dver) } != efi::SUCCESS {
             fail("cannot read the firmware memory map");
         }
         // SAFETY: `image` is this image's handle and `key` is current.
@@ -454,21 +374,13 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         let kind = kind_of(d.ty) as u32;
         // SAFETY: `out` has room for MAX_REGIONS entries; `n` is checked below.
         unsafe {
-            if n > 0
-                && (*out.add(n - 1)).kind == kind
-                && (*out.add(n - 1)).base + (*out.add(n - 1)).len == d.phys
-            {
+            if n > 0 && (*out.add(n - 1)).kind == kind && (*out.add(n - 1)).base + (*out.add(n - 1)).len == d.phys {
                 (*out.add(n - 1)).len += d.pages * PAGE;
             } else {
                 if n == MAX_REGIONS {
                     fail("the firmware memory map has too many regions");
                 }
-                *out.add(n) = Region {
-                    base: d.phys,
-                    len: d.pages * PAGE,
-                    kind,
-                    reserved: 0,
-                };
+                *out.add(n) = Region { base: d.phys, len: d.pages * PAGE, kind, reserved: 0 };
                 n += 1;
             }
         }

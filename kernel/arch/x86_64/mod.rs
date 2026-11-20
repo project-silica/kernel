@@ -74,6 +74,17 @@ pub struct X86 {
     apic_per_ns: Cell<u64>,
     slide: Cell<u64>,
     polls: Cell<u32>,
+    /// How extended state is saved: 0 XSAVE, 1 XSAVEOPT, 2 XSAVES (compacted).
+    xsave_kind: Cell<u8>,
+    xcr0: Cell<u64>,
+    fsgsbase: Cell<bool>,
+    /// Process-context identifiers: the generation and the next free one.
+    /// 0 in `pcid_gen` means the processor has none.
+    pcid_gen: Cell<u64>,
+    pcid_next: Cell<u64>,
+    /// Bits: 1 enhanced IBRS on, 2 BHI_DIS_S on, 4 VERW on exit, 8 no
+    /// enhanced IBRS (indirect branches unprotected), 16 Meltdown-affected.
+    mitigations: Cell<u8>,
     stray_irqs: Cell<u64>,
 }
 
@@ -94,6 +105,12 @@ static KERNEL: Global = Global(Kernel::new(
         apic_per_ns: Cell::new(0),
         slide: Cell::new(0),
         polls: Cell::new(0),
+        xsave_kind: Cell::new(0),
+        xcr0: Cell::new(0),
+        fsgsbase: Cell::new(false),
+        pcid_gen: Cell::new(0),
+        pcid_next: Cell::new(1),
+        mitigations: Cell::new(0),
         stray_irqs: Cell::new(0),
     },
     // SAFETY: the loader maps all physical memory at PHYS_MAP_BASE and the
@@ -151,48 +168,68 @@ impl Hal for X86 {
     fn init_root(&self, phys: &Phys, root: Paddr) {
         // SAFETY: both tables are whole pages of kernel-owned memory; the
         // new root is not in use yet.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                phys.ptr(self.kernel_root.get() + 2048),
-                phys.ptr(root + 2048),
-                2048,
-            )
-        }
+        unsafe { core::ptr::copy_nonoverlapping(phys.ptr(self.kernel_root.get() + 2048), phys.ptr(root + 2048), 2048) }
     }
 
     fn init_thread(&self, phys: &Phys, thread: Paddr) {
         // The legacy area of an XSAVE image: default x87 control word and
-        // MXCSR (all exceptions masked). XSTATE_BV stays 0, so XRSTOR puts
-        // every other component in its initial state.
-        phys.write_val(thread + FPU_OFFSET as u64, &0x037Fu16);
-        phys.write_val(thread + FPU_OFFSET as u64 + 24, &0x1F80u32);
+        // MXCSR (all exceptions masked). XSTATE_BV stays 0, so a restore puts
+        // every component in its initial state. XRSTORS wants the compacted
+        // format declared in XCOMP_BV.
+        let area = thread + FPU_OFFSET as u64;
+        phys.write_val(area, &0x037Fu16);
+        phys.write_val(area + 24, &0x1F80u32);
+        if self.xsave_kind.get() == 2 {
+            phys.write_val(area + 520, &(1u64 << 63 | self.xcr0.get()));
+        }
     }
 
     fn switch_thread(&self, phys: &Phys, from: Paddr, to: Paddr, root: Paddr) {
+        let kind = self.xsave_kind.get();
+        let to_regs = kernel().regs(to);
+        let (fs, gs) = (canonical(to_regs[REG_FS_BASE].get()), canonical(to_regs[REG_GS_BASE].get()));
         // SAFETY: `from` and `to` are live Thread objects (4 KiB, so the save
         // area at FPU_OFFSET is 64-byte aligned and large enough: checked
-        // against CPUID at boot). The MSRs exist on every x86_64 processor.
+        // against CPUID at boot, as were the instructions used here). While
+        // in the kernel the user's GS base is the inactive one, reached by
+        // SWAPGS; interrupts are off, so nothing runs between the two swaps.
         unsafe {
             if from != 0 {
                 let area = phys.ptr(from + FPU_OFFSET as u64);
-                asm!("xsave64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
-                let regs = kernel().regs(from);
-                regs[REG_FS_BASE].set(rdmsr(MSR_FS_BASE));
-                regs[REG_GS_BASE].set(rdmsr(MSR_KERNEL_GS_BASE));
+                match kind {
+                    2 => asm!("xsaves64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack)),
+                    1 => asm!("xsaveopt64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack)),
+                    _ => asm!("xsave64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack)),
+                }
             }
             let area = phys.ptr(to + FPU_OFFSET as u64);
-            asm!("xrstor64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
-            let regs = kernel().regs(to);
-            wrmsr(MSR_FS_BASE, canonical(regs[REG_FS_BASE].get()));
-            wrmsr(MSR_KERNEL_GS_BASE, canonical(regs[REG_GS_BASE].get()));
-            cpu::set_regs(regs.as_ptr() as u64);
-            let want = if root == 0 {
-                self.kernel_root.get()
+            if kind == 2 {
+                asm!("xrstors64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
             } else {
-                root
-            };
+                asm!("xrstor64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
+            }
+            let (old_fs, old_gs): (u64, u64);
+            if self.fsgsbase.get() {
+                asm!(
+                    "rdfsbase {of}", "wrfsbase {nf}", "swapgs", "rdgsbase {og}", "wrgsbase {ng}", "swapgs",
+                    of = out(reg) old_fs, nf = in(reg) fs, og = out(reg) old_gs, ng = in(reg) gs,
+                    options(nostack, nomem),
+                );
+            } else {
+                old_fs = rdmsr(MSR_FS_BASE);
+                old_gs = rdmsr(MSR_KERNEL_GS_BASE);
+                wrmsr(MSR_FS_BASE, fs);
+                wrmsr(MSR_KERNEL_GS_BASE, gs);
+            }
+            if from != 0 {
+                let regs = kernel().regs(from);
+                regs[REG_FS_BASE].set(old_fs);
+                regs[REG_GS_BASE].set(old_gs);
+            }
+            cpu::set_regs(to_regs.as_ptr() as u64);
+            let want = if root == 0 { self.kernel_root.get() } else { root };
             if cpu::read_cr3() & PTE_ADDR != want {
-                cpu::write_cr3(want);
+                cpu::write_cr3(self.cr3_for(phys, want));
             }
         }
     }
@@ -200,17 +237,25 @@ impl Hal for X86 {
     fn leave_aspace(&self, root: Paddr) {
         if cpu::read_cr3() & PTE_ADDR == root {
             // SAFETY: the kernel root maps the kernel exactly as `root` did.
-            unsafe { cpu::write_cr3(self.kernel_root.get()) }
+            unsafe { cpu::write_cr3(self.cr3_for(&kernel().phys, self.kernel_root.get())) }
         }
     }
 
     fn tlb_flush(&self, root: Paddr, vaddr: u64, len: u64) {
         if cpu::read_cr3() & PTE_ADDR != root {
-            return; // not loaded: nothing cached (no PCID yet)
+            // Not loaded. Without PCIDs nothing of it is cached; with them,
+            // forget its identifier so its next load starts clean.
+            if self.pcid_gen.get() != 0 {
+                // SAFETY: the word at offset 2048 of a live address space's
+                // header page belongs to this module (see `cr3_for`).
+                unsafe { *kernel().phys.ptr(root - 4096 + 2048).cast::<u64>() = 0 }
+            }
+            return;
         }
         if len > 32 * 4096 {
-            // SAFETY: reloading the current root only drops cached translations.
-            unsafe { cpu::write_cr3(root) }
+            // SAFETY: reloading the current root without the keep bit drops
+            // its cached translations.
+            unsafe { cpu::write_cr3(cpu::read_cr3() & !(1 << 63)) }
             return;
         }
         for page in (vaddr..vaddr + len).step_by(4096) {
@@ -308,6 +353,40 @@ impl Hal for X86 {
     }
 }
 
+impl X86 {
+    /// The CR3 value that loads `root`. With process-context identifiers a
+    /// switch keeps the translations cached for the address space: each has
+    /// an identifier for the current generation, kept in its header page (a
+    /// word owned by this module at offset 2048); when the 4095 identifiers
+    /// run out a new generation starts and every address space gets a fresh
+    /// one, flushed on first use. Identifier 0 is the kernel-only root.
+    fn cr3_for(&self, phys: &Phys, root: Paddr) -> u64 {
+        let generation = self.pcid_gen.get();
+        if generation == 0 {
+            return root;
+        }
+        if root == self.kernel_root.get() {
+            return root | 1 << 63;
+        }
+        // SAFETY: `root` is the root table of a live AddressSpace object,
+        // whose header page precedes it; kernel-core uses only the first
+        // bytes of that page.
+        let slot = unsafe { &mut *phys.ptr(root - 4096 + 2048).cast::<u64>() };
+        if *slot >> 12 == generation {
+            return root | (*slot & 0xFFF) | 1 << 63;
+        }
+        let id = self.pcid_next.get();
+        if id == 4095 {
+            self.pcid_next.set(1);
+            self.pcid_gen.set(generation + 1);
+        } else {
+            self.pcid_next.set(id + 1);
+        }
+        *slot = generation << 12 | id;
+        root | id
+    }
+}
+
 /// A user FS or GS base the processor accepts (it faults on a non-canonical one).
 fn canonical(v: u64) -> u64 {
     if v < 1 << 47 || v >= !0 << 47 { v } else { 0 }
@@ -352,12 +431,7 @@ fn die() -> ! {
 fn backtrace(first: u64, mut rbp: u64) {
     let slide = kernel().hal.slide.get();
     let _ = write!(Out, "#0 {:#018x}\r\n", first.wrapping_sub(slide));
-    let on_stack = |a: u64| {
-        a % 8 == 0
-            && [&cpu::KSTACK]
-                .iter()
-                .any(|s| a >= s.base() + 4096 && a + 16 <= s.top())
-    };
+    let on_stack = |a: u64| a % 8 == 0 && [&cpu::KSTACK].iter().any(|s| a >= s.base() + 4096 && a + 16 <= s.top());
     for n in 1..32 {
         if !on_stack(rbp) {
             break;
@@ -378,16 +452,10 @@ pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     if let Some(l) = info.location() {
         let _ = write!(Out, "  at {}:{}\r\n", l.file(), l.line());
     }
-    let _ = write!(
-        Out,
-        "  kernel slide {:#x}; backtrace (link addresses):\r\n",
-        kernel().hal.slide.get()
-    );
+    let _ = write!(Out, "  kernel slide {:#x}; backtrace (link addresses):\r\n", kernel().hal.slide.get());
     let (rip, rbp): (u64, u64);
     // SAFETY: reads the instruction and frame pointers.
-    unsafe {
-        asm!("lea {}, [rip]", "mov {}, rbp", out(reg) rip, out(reg) rbp, options(nomem, nostack))
-    }
+    unsafe { asm!("lea {}, [rip]", "mov {}, rbp", out(reg) rip, out(reg) rbp, options(nomem, nostack)) }
     backtrace(rip, rbp);
     die()
 }
@@ -419,6 +487,7 @@ fn require(ok: bool, what: &str) {
 
 /// Control registers, extended state, the local APIC.
 fn init_processor() {
+    let k = kernel();
     let f1 = cpuid(1, 0);
     let f7 = cpuid(7, 0);
     require(f1[2] & 1 << 21 != 0, "x2APIC");
@@ -435,6 +504,11 @@ fn init_processor() {
         cr4 |= 1 << 7 | 1 << 9 | 1 << 10 | 1 << 18; // PGE, OSFXSR, OSXMMEXCPT, OSXSAVE
         if f7[1] & 1 != 0 {
             cr4 |= 1 << 16; // FSGSBASE
+            k.hal.fsgsbase.set(true);
+        }
+        if f1[2] & 1 << 17 != 0 {
+            cr4 |= 1 << 17; // PCIDE (CR3 holds identifier 0 here, as required)
+            k.hal.pcid_gen.set(1);
         }
         if f7[1] & 1 << 7 != 0 {
             cr4 |= 1 << 20; // SMEP
@@ -458,26 +532,25 @@ fn init_processor() {
             if cpuid(0xD, 0)[1] as usize <= 4096 - FPU_OFFSET {
                 break;
             }
-            require(
-                xcr0 & 0xE0 != 0,
-                "an extended state small enough for a Thread object",
-            );
+            require(xcr0 & 0xE0 != 0, "an extended state small enough for a Thread object");
             xcr0 &= !0xE0;
         }
+        k.hal.xcr0.set(xcr0);
+        // The cheapest save the processor has: XSAVES skips components that
+        // are in their initial state or unchanged since they were restored.
+        let xs = cpuid(0xD, 1)[0];
+        if xs & 1 << 3 != 0 {
+            wrmsr(0xDA0, 0); // IA32_XSS: no supervisor components
+            k.hal.xsave_kind.set(2);
+        } else if xs & 1 != 0 {
+            k.hal.xsave_kind.set(1);
+        }
+        init_mitigations();
         // Legacy interrupt controllers off: remap out of the exception
         // vectors, then mask every line.
-        for (port, v) in [
-            (0x20, 0x11),
-            (0xA0, 0x11),
-            (0x21, 0xF0),
-            (0xA1, 0xF8),
-            (0x21, 4),
-            (0xA1, 2),
-            (0x21, 1),
-            (0xA1, 1),
-            (0x21, 0xFF),
-            (0xA1, 0xFF),
-        ] {
+        for (port, v) in
+            [(0x20, 0x11), (0xA0, 0x11), (0x21, 0xF0), (0xA1, 0xF8), (0x21, 4), (0xA1, 2), (0x21, 1), (0xA1, 1), (0x21, 0xFF), (0xA1, 0xFF)]
+        {
             serial::outb(port, v);
         }
         wrmsr(MSR_APIC_BASE, rdmsr(MSR_APIC_BASE) | 1 << 11 | 1 << 10);
@@ -494,6 +567,51 @@ fn init_processor() {
             wrmsr(MSR_X2APIC_LVT_TIMER, 1 << 16); // masked until calibrated
         }
     }
+}
+
+/// Speculative-execution mitigations, chosen from what this processor
+/// reports (component C18). What Silica's structure makes unnecessary: the
+/// kernel never reads through a user-supplied pointer, so there is nothing
+/// to sanitize for Spectre v1 beyond the `lfence` after `swapgs`.
+///
+/// # Safety
+/// Called once during processor setup.
+unsafe fn init_mitigations() {
+    let k = kernel();
+    let f7 = cpuid(7, 0);
+    let caps = if f7[3] & 1 << 29 != 0 { rdmsr(0x10A) } else { 0 };
+    let intel = cpuid(0, 0)[1] == 0x756E_6547;
+    let mut spec = 0u64;
+    let mut done = 0u8;
+    // Enhanced IBRS: indirect branches in the kernel are never steered by
+    // user-mode training. Set once and left on.
+    if f7[3] & 1 << 26 != 0 && caps & 1 << 1 != 0 {
+        spec |= 1;
+        done |= 1;
+    }
+    // Branch history injection: stop user-mode history from steering kernel branches.
+    if f7[0] >= 2 && cpuid(7, 2)[3] & 1 << 4 != 0 {
+        spec |= 1 << 10;
+        done |= 2;
+    }
+    if spec != 0 {
+        // SAFETY: IA32_SPEC_CTRL exists (CPUID.7:EDX[26]); the bits set are enumerated.
+        unsafe { wrmsr(0x48, spec) };
+    }
+    // Buffers that can leak across the user/kernel boundary (MDS, RFDS):
+    // overwrite them on the way back to user mode.
+    if caps & 1 << 28 != 0 || (intel && f7[3] & 1 << 10 != 0 && caps & 1 << 5 == 0) {
+        cpu::enable_verw();
+        done |= 4;
+    }
+    // What cannot be mitigated by this kernel as built is said out loud.
+    if done & 1 == 0 {
+        done |= 8;
+    }
+    if intel && caps & 1 == 0 {
+        done |= 16;
+    }
+    k.hal.mitigations.set(done);
 }
 
 /// Without a TSC-deadline timer: measure the local APIC timer against the
@@ -528,11 +646,7 @@ fn tsc_frequency(bi: &BootInfo, phys: &Phys) -> u64 {
     }
     // 2. The hypervisor says (KVM paravirtual clock: exact scale factors).
     let hv = cpuid(0x4000_0000, 0);
-    if cpuid(1, 0)[2] & 1 << 31 != 0
-        && hv[1] == 0x4B4D_564B
-        && hv[2] == 0x564B_4D56
-        && cpuid(0x4000_0001, 0)[0] & 1 << 3 != 0
-    {
+    if cpuid(1, 0)[2] & 1 << 31 != 0 && hv[1] == 0x4B4D_564B && hv[2] == 0x564B_4D56 && cpuid(0x4000_0001, 0)[0] & 1 << 3 != 0 {
         #[repr(C, align(64))]
         struct PvClock(core::cell::UnsafeCell<[u32; 16]>);
         // SAFETY: written by the hypervisor only between the two MSR writes below.
@@ -544,21 +658,14 @@ fn tsc_frequency(bi: &BootInfo, phys: &Phys) -> u64 {
         let (mul, shift) = unsafe {
             wrmsr(0x4B56_4D01, pa | 1);
             let p = PV.0.get().cast::<u8>();
-            let v = (
-                core::ptr::read_volatile(p.add(24).cast::<u32>()),
-                core::ptr::read_volatile(p.add(28).cast::<i8>()),
-            );
+            let v = (core::ptr::read_volatile(p.add(24).cast::<u32>()), core::ptr::read_volatile(p.add(28).cast::<i8>()));
             wrmsr(0x4B56_4D01, 0);
             v
         };
         if mul != 0 {
             // ns = ((ticks << shift) * mul) >> 32
             let hz = (1_000_000_000u128 << 32) / mul as u128;
-            return if shift >= 0 {
-                (hz >> shift) as u64
-            } else {
-                (hz << -shift) as u64
-            };
+            return if shift >= 0 { (hz >> shift) as u64 } else { (hz << -shift) as u64 };
         }
     }
     // 3. Measure against the ACPI power-management timer (3.579545 MHz).
@@ -574,9 +681,7 @@ fn tsc_frequency(bi: &BootInfo, phys: &Phys) -> u64 {
     if cpuid(0, 0)[0] >= 0x16 && cpuid(0x16, 0)[0] != 0 {
         return cpuid(0x16, 0)[0] as u64 * 1_000_000;
     }
-    panic!(
-        "no way to measure the timestamp counter: no CPUID leaf 0x15, no KVM clock, no ACPI PM timer"
-    )
+    panic!("no way to measure the timestamp counter: no CPUID leaf 0x15, no KVM clock, no ACPI PM timer")
 }
 
 /// The I/O port of the ACPI PM timer, from the FADT.
@@ -609,9 +714,7 @@ fn acpi_pm_timer(bi: &BootInfo, phys: &Phys) -> Option<u16> {
 fn kernel_pte(phys: &Phys, vaddr: u64) -> Option<*mut u64> {
     let mut table = cpu::read_cr3() & PTE_ADDR;
     for level in (0..4).rev() {
-        let e = phys
-            .ptr(table + (vaddr >> (12 + 9 * level) & 511) * 8)
-            .cast::<u64>();
+        let e = phys.ptr(table + (vaddr >> (12 + 9 * level) & 511) * 8).cast::<u64>();
         if level == 0 {
             return Some(e);
         }
@@ -639,9 +742,7 @@ pub extern "C" fn kmain(info: u64) -> ! {
     // loader memory, which nothing overwrites before the root task runs.
     let bi: BootInfo = unsafe { core::ptr::read(k.phys.ptr(info).cast::<BootInfo>()) };
     if bi.magic != BOOT_MAGIC || bi.version != BOOT_VERSION {
-        serial::write(
-            b"ERROR: kernel: the loader's boot information has the wrong magic or version\r\n",
-        );
+        serial::write(b"ERROR: kernel: the loader's boot information has the wrong magic or version\r\n");
         die();
     }
     k.hal.slide.set(bi.kernel_slide);
@@ -676,42 +777,39 @@ pub extern "C" fn kmain(info: u64) -> ! {
     let hz = tsc_frequency(&bi, &k.phys);
     k.hal.tsc_hz.set(hz);
     k.hal.tsc0.set(rdtsc());
-    k.hal
-        .ns_per_tick
-        .set(((1_000_000_000u128 << 32) / hz as u128) as u64);
-    k.hal
-        .ticks_per_ns
-        .set((((hz as u128) << 32) / 1_000_000_000) as u64);
+    k.hal.ns_per_tick.set(((1_000_000_000u128 << 32) / hz as u128) as u64);
+    k.hal.ticks_per_ns.set((((hz as u128) << 32) / 1_000_000_000) as u64);
     init_oneshot_timer(hz);
 
     // SAFETY: loader memory, read-only until the root task owns it.
     let (regions, cmdline, ramdisk) = unsafe {
         (
-            core::slice::from_raw_parts(
-                k.phys.ptr(bi.regions).cast::<Region>(),
-                bi.region_count as usize,
-            ),
+            core::slice::from_raw_parts(k.phys.ptr(bi.regions).cast::<Region>(), bi.region_count as usize),
             k.phys.bytes(bi.cmdline, bi.cmdline_len),
             k.phys.bytes(bi.ramdisk, bi.ramdisk_len),
         )
     };
     let usable: u64 = regions.iter().filter(|r| r.kind == 1).map(|r| r.len).sum();
-    klog!(
-        k,
-        "silica: {} MiB free, clock {} Hz, kernel slide {:#x}",
-        usable >> 20,
-        hz,
-        bi.kernel_slide
-    );
+    klog!(k, "silica: {} MiB free, clock {} Hz, kernel slide {:#x}", usable >> 20, hz, bi.kernel_slide);
+    let m = k.hal.mitigations.get();
+    if m & 8 != 0 {
+        klog!(
+            k,
+            "WARNING: kernel: this processor has no enhanced IBRS; kernel indirect branches are not protected from user-mode training"
+        );
+    }
+    if m & 16 != 0 {
+        klog!(
+            k,
+            "WARNING: kernel: this processor is affected by Meltdown and Silica does not isolate kernel page tables; do not run untrusted code on it"
+        );
+    }
     if Cmdline(cmdline).get("panic") == Some(b"test") {
         deliberate_panic();
     }
 
     let Some(image) = kernel_core::ramdisk::find(ramdisk, "root") else {
-        klog!(
-            k,
-            "ERROR: kernel: no root task: the ramdisk is missing, malformed, or has no entry named \"root\""
-        );
+        klog!(k, "ERROR: kernel: no root task: the ramdisk is missing, malformed, or has no entry named \"root\"");
         die();
     };
     let top = regions.last().map_or(0, |r| r.base + r.len).max(4 << 30);
@@ -725,19 +823,9 @@ pub extern "C" fn kmain(info: u64) -> ! {
         ports: true,
         ramdisk: [bi.ramdisk, bi.ramdisk_len],
         rsdp: bi.rsdp,
-        framebuffer: [
-            bi.fb_base,
-            bi.fb_width as u64,
-            bi.fb_height as u64,
-            bi.fb_stride as u64,
-            bi.fb_format as u64,
-        ],
+        framebuffer: [bi.fb_base, bi.fb_width as u64, bi.fb_height as u64, bi.fb_stride as u64, bi.fb_format as u64],
         clock: [hz, bi.loader_tsc, k.hal.tsc0.get()],
-        wall_clock: [
-            bi.wall_secs,
-            ((bi.wall_tsc.wrapping_sub(k.hal.tsc0.get()) as i64 as i128 * 1_000_000_000)
-                / hz as i128) as u64,
-        ],
+        wall_clock: [bi.wall_secs, ((bi.wall_tsc.wrapping_sub(k.hal.tsc0.get()) as i64 as i128 * 1_000_000_000) / hz as i128) as u64],
         entropy: bi.entropy,
         cmdline,
     };

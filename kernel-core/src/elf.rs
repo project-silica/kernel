@@ -53,19 +53,13 @@ pub struct Elf<'a> {
 }
 
 fn u16_at(b: &[u8], o: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(
-        b.get(o..o.checked_add(2)?)?.try_into().ok()?,
-    ))
+    Some(u16::from_le_bytes(b.get(o..o.checked_add(2)?)?.try_into().ok()?))
 }
 fn u32_at(b: &[u8], o: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        b.get(o..o.checked_add(4)?)?.try_into().ok()?,
-    ))
+    Some(u32::from_le_bytes(b.get(o..o.checked_add(4)?)?.try_into().ok()?))
 }
 fn u64_at(b: &[u8], o: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(
-        b.get(o..o.checked_add(8)?)?.try_into().ok()?,
-    ))
+    Some(u64::from_le_bytes(b.get(o..o.checked_add(8)?)?.try_into().ok()?))
 }
 
 const PT_LOAD: u32 = 1;
@@ -86,27 +80,17 @@ impl<'a> Elf<'a> {
             return Err(ElfError::WrongMachine);
         }
         let entry = u64_at(file, 24).ok_or(ElfError::Truncated)?;
-        let phoff = usize::try_from(u64_at(file, 32).ok_or(ElfError::Truncated)?)
-            .map_err(|_| ElfError::Truncated)?;
+        let phoff = usize::try_from(u64_at(file, 32).ok_or(ElfError::Truncated)?).map_err(|_| ElfError::Truncated)?;
         let phentsize = u16_at(file, 54).ok_or(ElfError::Truncated)? as usize;
         let phnum = u16_at(file, 56).ok_or(ElfError::Truncated)? as usize;
         if phentsize != PHENT {
             return Err(ElfError::NotElf);
         }
-        let end = phnum
-            .checked_mul(PHENT)
-            .and_then(|n| n.checked_add(phoff))
-            .ok_or(ElfError::Truncated)?;
+        let end = phnum.checked_mul(PHENT).and_then(|n| n.checked_add(phoff)).ok_or(ElfError::Truncated)?;
         if end > file.len() {
             return Err(ElfError::Truncated);
         }
-        let elf = Elf {
-            file,
-            entry,
-            phoff,
-            phnum,
-            pie: ty == 3,
-        };
+        let elf = Elf { file, entry, phoff, phnum, pie: ty == 3 };
         for s in elf.raw_segments() {
             s?;
         }
@@ -131,16 +115,8 @@ impl<'a> Elf<'a> {
                 }
                 let off = usize::try_from(off).map_err(|_| ElfError::Truncated)?;
                 let len = usize::try_from(filesz).map_err(|_| ElfError::Truncated)?;
-                let data = off
-                    .checked_add(len)
-                    .and_then(|e| f.get(off..e))
-                    .ok_or(ElfError::Truncated)?;
-                Ok(Segment {
-                    vaddr,
-                    memsz,
-                    flags,
-                    data,
-                })
+                let data = off.checked_add(len).and_then(|e| f.get(off..e)).ok_or(ElfError::Truncated)?;
+                Ok(Segment { vaddr, memsz, flags, data })
             })())
         })
     }
@@ -177,8 +153,7 @@ impl<'a> Elf<'a> {
             let off = u64_at(f, o + 8).unwrap_or(0) as usize;
             let n = u64_at(f, o + 32).unwrap_or(0) as usize / 16;
             for j in 0..n {
-                let (Some(tag), Some(val)) = (u64_at(f, off + j * 16), u64_at(f, off + j * 16 + 8))
-                else {
+                let (Some(tag), Some(val)) = (u64_at(f, off + j * 16), u64_at(f, off + j * 16 + 8)) else {
                     break;
                 };
                 match tag {

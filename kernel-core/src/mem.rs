@@ -70,9 +70,7 @@ impl Phys {
     pub fn write_val<T: Copy>(&self, p: Paddr, v: &T) {
         debug_assert!(p.is_multiple_of(core::mem::align_of::<T>() as u64));
         // SAFETY: as for `write_bytes`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(core::ptr::from_ref(v), self.ptr(p).cast::<T>(), 1)
-        }
+        unsafe { core::ptr::copy_nonoverlapping(core::ptr::from_ref(v), self.ptr(p).cast::<T>(), 1) }
     }
 
     /// The bytes `[p, p + len)` of memory the boot loader filled and nothing

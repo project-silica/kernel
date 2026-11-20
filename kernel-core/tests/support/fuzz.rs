@@ -19,14 +19,7 @@ use silica_abi::{Fault, KEEP, NONBLOCK, ObjectType as T, Syscall as S};
 const WINDOW: u64 = 2000;
 const NWIN: u64 = 16;
 const THREADS: u64 = 1990;
-const VADDRS: [u64; 6] = [
-    0x10000,
-    0x11000,
-    0x20_0000,
-    0x4000_0000,
-    0x7FFF_FFE0_0000,
-    0xFFFF_8000_0000_0000,
-];
+const VADDRS: [u64; 6] = [0x10000, 0x11000, 0x20_0000, 0x4000_0000, 0x7FFF_FFE0_0000, 0xFFFF_8000_0000_0000];
 
 struct Src<'a>(&'a [u8]);
 impl Src<'_> {
@@ -78,17 +71,11 @@ pub fn run(data: &[u8]) {
         match op {
             // The architecture's other ways into the kernel.
             240..=243 => {
-                m.k.fault(
-                    [Fault::Page, Fault::Instruction, Fault::Exception][op as usize % 3],
-                    0xdead_0000,
-                    op as u64,
-                );
+                m.k.fault([Fault::Page, Fault::Instruction, Fault::Exception][op as usize % 3], 0xdead_0000, op as u64);
                 continue;
             }
             244..=247 => {
-                m.k.hal
-                    .now
-                    .set(m.k.hal.now.get() + 3_000_000 * (op as u64 - 243));
+                m.k.hal.now.set(m.k.hal.now.get() + 3_000_000 * (op as u64 - 243));
                 m.k.on_timer();
                 continue;
             }
@@ -125,15 +112,10 @@ pub fn run(data: &[u8]) {
     // do so); then there is nobody left to ask and the run ends here.
     let rv = m.k.thread_view(m.root);
     let root_ok = m.cap(SLOT_THREAD).is_some_and(|c| c.obj == m.root)
-        && m.k
-            .view(rv.slots[0])
-            .is_some_and(|v| v.cap.obj == m.cs.obj && v.cap.bits == 12)
-        && m.k
-            .view(ut_addr)
-            .is_some_and(|v| v.cap.ty == T::Untyped && v.cap.obj == d.base)
+        && m.k.view(rv.slots[0]).is_some_and(|v| v.cap.obj == m.cs.obj && v.cap.bits == 12)
+        && m.k.view(ut_addr).is_some_and(|v| v.cap.ty == T::Untyped && v.cap.obj == d.base)
         && m.cap(SLOT_BOOT_UNTYPED).is_some()
-        && m.cap(SLOT_CAPSPACE)
-            .is_some_and(|c| c.obj == m.cs.obj && c.rights.0 & 2 != 0)
+        && m.cap(SLOT_CAPSPACE).is_some_and(|c| c.obj == m.cs.obj && c.rights.0 & 2 != 0)
         && rv.state == 1;
     if !root_ok {
         return;
@@ -145,24 +127,12 @@ pub fn run(data: &[u8]) {
         if v.next != 0 {
             let n = m.k.view(v.next).expect("next link points at an empty slot");
             assert_eq!(n.prev, s, "slot {i}: next.prev");
-            assert!(
-                n.depth <= v.depth + 1,
-                "slot {i}: a child more than one level deeper"
-            );
+            assert!(n.depth <= v.depth + 1, "slot {i}: a child more than one level deeper");
         }
         if v.prev != 0 {
-            assert_eq!(
-                m.k.view(v.prev)
-                    .expect("prev link points at an empty slot")
-                    .next,
-                s,
-                "slot {i}: prev.next"
-            );
+            assert_eq!(m.k.view(v.prev).expect("prev link points at an empty slot").next, s, "slot {i}: prev.next");
         } else {
-            assert_eq!(
-                v.depth, 0,
-                "slot {i}: a derived capability with no predecessor"
-            );
+            assert_eq!(v.depth, 0, "slot {i}: a derived capability with no predecessor");
         }
     }
     // Nothing leaks, and the Untyped balances.
@@ -174,33 +144,17 @@ pub fn run(data: &[u8]) {
             continue;
         }
         if let Some(c) = m.cap(i) {
-            assert!(
-                c.ty == T::Hw || c.obj < lo || c.obj >= hi,
-                "slot {i} still holds {c:?} after its Untyped was revoked"
-            );
+            assert!(c.ty == T::Hw || c.obj < lo || c.obj >= hi, "slot {i} still holds {c:?} after its Untyped was revoked");
         }
     }
     for s in rv.slots {
         if let Some(v) = m.k.view(s) {
-            assert!(
-                v.cap.obj < lo || v.cap.obj >= hi,
-                "the root thread still uses {:?} from the revoked Untyped",
-                v.cap
-            );
+            assert!(v.cap.obj < lo || v.cap.obj >= hi, "the root thread still uses {:?} from the revoked Untyped", v.cap);
         }
     }
     let v = m.k.view(ut_addr).unwrap();
-    assert_eq!(
-        (
-            v.watermark.0,
-            v.next == 0 || m.k.view(v.next).unwrap().depth == 0
-        ),
-        (0, true),
-        "the revoked Untyped is not empty"
-    );
-    let free = (1..4096)
-        .find(|&i| m.cap(i).is_none())
-        .expect("a free slot");
+    assert_eq!((v.watermark.0, v.next == 0 || m.k.view(v.next).unwrap().depth == 0), (0, true), "the revoked Untyped is not empty");
+    let free = (1..4096).find(|&i| m.cap(i).is_none()).expect("a free slot");
     m.retype(ut, T::Frame, d.bits as u64, free, 1);
     assert!(m.k.can_run());
 }

@@ -16,40 +16,15 @@ pub type Handle = *mut c_void;
 pub struct Guid(pub u32, pub u16, pub u16, pub [u8; 8]);
 
 /// EFI_LOADED_IMAGE_PROTOCOL_GUID.
-pub const LOADED_IMAGE: Guid = Guid(
-    0x5B1B_31A1,
-    0x9562,
-    0x11D2,
-    [0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
-);
+pub const LOADED_IMAGE: Guid = Guid(0x5B1B_31A1, 0x9562, 0x11D2, [0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]);
 /// EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID.
-pub const SIMPLE_FS: Guid = Guid(
-    0x964E_5B22,
-    0x6459,
-    0x11D2,
-    [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
-);
+pub const SIMPLE_FS: Guid = Guid(0x964E_5B22, 0x6459, 0x11D2, [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]);
 /// EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID.
-pub const GOP: Guid = Guid(
-    0x9042_A9DE,
-    0x23DC,
-    0x4A38,
-    [0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A],
-);
+pub const GOP: Guid = Guid(0x9042_A9DE, 0x23DC, 0x4A38, [0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A]);
 /// EFI_RNG_PROTOCOL_GUID.
-pub const RNG: Guid = Guid(
-    0x3152_BCA5,
-    0xEADE,
-    0x433D,
-    [0x86, 0x2E, 0xC0, 0x1C, 0xDC, 0x29, 0x1F, 0x44],
-);
+pub const RNG: Guid = Guid(0x3152_BCA5, 0xEADE, 0x433D, [0x86, 0x2E, 0xC0, 0x1C, 0xDC, 0x29, 0x1F, 0x44]);
 /// EFI_ACPI_20_TABLE_GUID.
-pub const ACPI2: Guid = Guid(
-    0x8868_E871,
-    0xE4F1,
-    0x11D3,
-    [0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81],
-);
+pub const ACPI2: Guid = Guid(0x8868_E871, 0xE4F1, 0x11D3, [0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81]);
 
 /// EFI_SYSTEM_TABLE.
 #[repr(C)]
@@ -124,8 +99,7 @@ pub struct BootServices {
     pub allocate_pages: unsafe extern "efiapi" fn(u32, u32, usize, *mut u64) -> Status,
     free_pages: usize,
     /// GetMemoryMap(MapSize, Map, MapKey, DescriptorSize, DescriptorVersion).
-    pub get_memory_map:
-        unsafe extern "efiapi" fn(*mut usize, *mut u8, *mut usize, *mut usize, *mut u32) -> Status,
+    pub get_memory_map: unsafe extern "efiapi" fn(*mut usize, *mut u8, *mut usize, *mut usize, *mut u32) -> Status,
     unused1: [usize; 11],
     /// HandleProtocol(Handle, Protocol, Interface).
     pub handle_protocol: unsafe extern "efiapi" fn(Handle, *const Guid, *mut *mut c_void) -> Status,
@@ -134,8 +108,7 @@ pub struct BootServices {
     pub exit_boot_services: unsafe extern "efiapi" fn(Handle, usize) -> Status,
     unused3: [usize; 10],
     /// LocateProtocol(Protocol, Registration, Interface).
-    pub locate_protocol:
-        unsafe extern "efiapi" fn(*const Guid, *mut c_void, *mut *mut c_void) -> Status,
+    pub locate_protocol: unsafe extern "efiapi" fn(*const Guid, *mut c_void, *mut *mut c_void) -> Status,
 }
 
 /// EFI_MEMORY_DESCRIPTOR.

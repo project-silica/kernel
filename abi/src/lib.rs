@@ -280,11 +280,7 @@ impl MsgInfo {
     /// The number of message words, clamped to the maximum.
     pub const fn words(self) -> usize {
         let n = (self.0 & 0x7f) as usize;
-        if n > Self::MAX_WORDS {
-            Self::MAX_WORDS
-        } else {
-            n
-        }
+        if n > Self::MAX_WORDS { Self::MAX_WORDS } else { n }
     }
 }
 

@@ -54,14 +54,7 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// Send the current thread's message to endpoint `ep`.
-    pub(crate) fn send(
-        &self,
-        t: Paddr,
-        ep: Paddr,
-        badge: u64,
-        flags: u64,
-        blocking: bool,
-    ) -> Result<Exit, Error> {
+    pub(crate) fn send(&self, t: Paddr, ep: Paddr, badge: u64, flags: u64, blocking: bool) -> Result<Exit, Error> {
         let q = self.queue(ep);
         let th = self.thread(t);
         th.ipc_flags.set(flags);
@@ -71,11 +64,14 @@ impl<H: Hal> Kernel<H> {
                 q.kind.set(0);
             }
             self.transfer(t, r, badge);
-            self.wake(r, Ok(()));
             if flags & IPC_CALL != 0 {
+                // The caller waits for the receiver, so the receiver runs now.
+                self.thread(r).regs[H::SYS].set(0);
+                self.hand_off(r);
                 self.await_reply(t, r);
                 return Ok(Exit::Blocked);
             }
+            self.wake(r, Ok(()));
             th.ipc_flags.set(0);
             return Ok(Exit::Done);
         }

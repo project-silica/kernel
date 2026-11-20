@@ -64,11 +64,7 @@ fn sys(n: Syscall, a: [u64; 6]) -> Result<[u64; 6]> {
 }
 
 fn message(r: [u64; 6]) -> Message {
-    Message {
-        badge: r[0],
-        info: MsgInfo(r[1]),
-        words: [r[2], r[3], r[4], r[5]],
-    }
+    Message { badge: r[0], info: MsgInfo(r[1]), words: [r[2], r[3], r[4], r[5]] }
 }
 
 /// Send a message to an endpoint and wait for the reply.
@@ -83,11 +79,7 @@ pub fn send(to: Cap, info: MsgInfo, w: [u64; 4]) -> Result<()> {
 
 /// Like [`send`], but fails with `WouldBlock` when no receiver is waiting.
 pub fn try_send(to: Cap, info: MsgInfo, w: [u64; 4]) -> Result<()> {
-    sys(
-        Syscall::Send,
-        [to.0 | NONBLOCK, info.0, w[0], w[1], w[2], w[3]],
-    )
-    .map(|_| ())
+    sys(Syscall::Send, [to.0 | NONBLOCK, info.0, w[0], w[1], w[2], w[3]]).map(|_| ())
 }
 
 /// Signal a notification: OR the capability's badge into its pending word
@@ -126,19 +118,8 @@ pub fn yield_now() {
 /// `first..first + count` of the CapSpace `space`. `bits` is the size for
 /// Untyped, Frame and AddressSpace, the number of slots (in bits) for a
 /// CapSpace, and ignored otherwise.
-pub fn retype(
-    untyped: Cap,
-    ty: ObjectType,
-    bits: u8,
-    space: Cap,
-    first: u64,
-    count: u64,
-) -> Result<()> {
-    sys(
-        Syscall::Retype,
-        [untyped.0, ty as u64, bits as u64, space.0, first, count],
-    )
-    .map(|_| ())
+pub fn retype(untyped: Cap, ty: ObjectType, bits: u8, space: Cap, first: u64, count: u64) -> Result<()> {
+    sys(Syscall::Retype, [untyped.0, ty as u64, bits as u64, space.0, first, count]).map(|_| ())
 }
 
 /// Derive a capability from `src` into slot `dst` of `space`, keeping only
@@ -147,22 +128,14 @@ pub fn retype(
 /// bits, end in the high 32). The new capability depends on `src`: revoking
 /// or deleting `src` deletes it. This is how to lend authority.
 pub fn cap_derive(space: Cap, dst: u64, src: Cap, rights: Rights, badge: u64) -> Result<()> {
-    sys(
-        Syscall::CapCopy,
-        [space.0, dst, src.0, rights.0 as u64, badge, 0],
-    )
-    .map(|_| ())
+    sys(Syscall::CapCopy, [space.0, dst, src.0, rights.0 as u64, badge, 0]).map(|_| ())
 }
 
 /// Like [`cap_derive`], but the new capability is independent of `src`: it
 /// lives until it is deleted itself or whatever `src` was derived from is
 /// revoked. This is how to hand authority on for good.
 pub fn cap_duplicate(space: Cap, dst: u64, src: Cap, rights: Rights, badge: u64) -> Result<()> {
-    sys(
-        Syscall::CapCopy,
-        [space.0, dst, src.0, rights.0 as u64, badge, 1],
-    )
-    .map(|_| ())
+    sys(Syscall::CapCopy, [space.0, dst, src.0, rights.0 as u64, badge, 1]).map(|_| ())
 }
 
 /// Move `src` into slot `dst` of `space`.
@@ -194,11 +167,7 @@ pub unsafe fn cap_revoke(cap: Cap) -> Result<()> {
 /// Map `frame` at `vaddr` in `aspace`. Never replaces an existing mapping
 /// (`Overlap`), and never maps writable and executable at once (`BadArg`).
 pub fn map(aspace: Cap, frame: Cap, vaddr: usize, rights: Rights) -> Result<()> {
-    sys(
-        Syscall::Map,
-        [aspace.0, frame.0, vaddr as u64, rights.0 as u64, 0, 0],
-    )
-    .map(|_| ())
+    sys(Syscall::Map, [aspace.0, frame.0, vaddr as u64, rights.0 as u64, 0, 0]).map(|_| ())
 }
 
 /// Remove the mapping made through `frame`.
@@ -212,18 +181,8 @@ pub unsafe fn unmap(frame: Cap) -> Result<()> {
 
 /// Give a thread its CapSpace, address space, fault endpoint and IPC buffer
 /// frame. [`Cap::KEEP`] leaves a field unchanged; [`Cap::NONE`] clears it.
-pub fn thread_configure(
-    thread: Cap,
-    space: Cap,
-    aspace: Cap,
-    fault: Cap,
-    ipc_buffer: Cap,
-) -> Result<()> {
-    sys(
-        Syscall::ThreadConfigure,
-        [thread.0, space.0, aspace.0, fault.0, ipc_buffer.0, 0],
-    )
-    .map(|_| ())
+pub fn thread_configure(thread: Cap, space: Cap, aspace: Cap, fault: Cap, ipc_buffer: Cap) -> Result<()> {
+    sys(Syscall::ThreadConfigure, [thread.0, space.0, aspace.0, fault.0, ipc_buffer.0, 0]).map(|_| ())
 }
 
 /// Set a thread's instruction pointer, stack pointer and first argument,
@@ -234,11 +193,7 @@ pub fn thread_configure(
 /// address space.
 #[allow(unsafe_code)]
 pub unsafe fn thread_start(thread: Cap, ip: usize, sp: usize, arg: u64, run: bool) -> Result<()> {
-    sys(
-        Syscall::ThreadStart,
-        [thread.0, ip as u64, sp as u64, arg, run as u64, 0],
-    )
-    .map(|_| ())
+    sys(Syscall::ThreadStart, [thread.0, ip as u64, sp as u64, arg, run as u64, 0]).map(|_| ())
 }
 
 /// Stop a thread where it is. A call it was blocked in starts again when
@@ -254,27 +209,12 @@ pub fn thread_resume(thread: Cap) -> Result<()> {
 
 /// Read `width` bytes (1, 2 or 4) from an I/O port covered by `ports`.
 pub fn port_in(ports: Cap, port: u16, width: u8) -> Result<u32> {
-    sys(
-        Syscall::PortIo,
-        [ports.0, port as u64, width as u64, 0, 0, 0],
-    )
-    .map(|r| r[0] as u32)
+    sys(Syscall::PortIo, [ports.0, port as u64, width as u64, 0, 0, 0]).map(|r| r[0] as u32)
 }
 
 /// Write `width` bytes (1, 2 or 4) to an I/O port covered by `ports`.
 pub fn port_out(ports: Cap, port: u16, width: u8, value: u32) -> Result<()> {
-    sys(
-        Syscall::PortIo,
-        [
-            ports.0,
-            port as u64,
-            width as u64 | 0x100,
-            value as u64,
-            0,
-            0,
-        ],
-    )
-    .map(|_| ())
+    sys(Syscall::PortIo, [ports.0, port as u64, width as u64 | 0x100, value as u64, 0, 0]).map(|_| ())
 }
 
 /// The monotonic clock: converts the processor's timestamp counter with the
@@ -288,10 +228,7 @@ pub struct Clock {
 impl Clock {
     /// A clock from `[ticks per second, _, counter at time 0]`.
     pub const fn new(clock: [u64; 3]) -> Clock {
-        Clock {
-            hz: clock[0],
-            zero: clock[2],
-        }
+        Clock { hz: clock[0], zero: clock[2] }
     }
     /// Nanoseconds between counter value `from` and now.
     pub fn since(&self, from: u64) -> u64 {

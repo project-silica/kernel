@@ -12,8 +12,7 @@ use crate::kernel::{Exit, Kernel};
 use crate::mem::Paddr;
 use crate::vm::AsHeader;
 use silica_abi::{
-    ASPACE_MIN_BITS, ENDPOINT_BITS, Error, ObjectType, PAGE_BITS, RETYPE_MAX, Rights, SLOT_BITS,
-    THREAD_BITS, UNTYPED_MAX_BITS,
+    ASPACE_MIN_BITS, ENDPOINT_BITS, Error, ObjectType, PAGE_BITS, RETYPE_MAX, Rights, SLOT_BITS, THREAD_BITS, UNTYPED_MAX_BITS,
 };
 
 /// Bytes zeroed between checks for a pending interrupt.
@@ -22,15 +21,7 @@ const ZERO_CHUNK: u64 = 1 << 18;
 impl<H: Hal> Kernel<H> {
     /// Create `count` objects of type `ty` from the Untyped in slot `us`,
     /// placing their capabilities in `dst` slots `index..index + count`.
-    pub(crate) fn retype(
-        &self,
-        us: Paddr,
-        ty: ObjectType,
-        bits: u64,
-        dst: &Cap,
-        index: u64,
-        count: u64,
-    ) -> Result<Exit, Error> {
+    pub(crate) fn retype(&self, us: Paddr, ty: ObjectType, bits: u64, dst: &Cap, index: u64, count: u64) -> Result<Exit, Error> {
         let uslot = self.slot(us);
         let ut = uslot.cap().ok_or(Error::BadCap)?;
         if ut.ty != ObjectType::Untyped {
@@ -39,20 +30,12 @@ impl<H: Hal> Kernel<H> {
         let device = ut.flags & FLAG_DEVICE != 0;
         // (object size in bits, the `bits` field of the new capability)
         let (obits, cbits) = match ty {
-            ObjectType::Untyped if (SLOT_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => {
-                (bits, bits)
-            }
-            ObjectType::Frame if (PAGE_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => {
-                (bits, bits)
-            }
+            ObjectType::Untyped if (SLOT_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => (bits, bits),
+            ObjectType::Frame if (PAGE_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => (bits, bits),
             ObjectType::CapSpace if (1..=32).contains(&bits) => (bits + SLOT_BITS as u64, bits),
-            ObjectType::AddressSpace if (ASPACE_MIN_BITS as u64..=30).contains(&bits) => {
-                (bits, bits)
-            }
+            ObjectType::AddressSpace if (ASPACE_MIN_BITS as u64..=30).contains(&bits) => (bits, bits),
             ObjectType::Thread => (THREAD_BITS as u64, THREAD_BITS as u64),
-            ObjectType::Endpoint | ObjectType::Notification => {
-                (ENDPOINT_BITS as u64, ENDPOINT_BITS as u64)
-            }
+            ObjectType::Endpoint | ObjectType::Notification => (ENDPOINT_BITS as u64, ENDPOINT_BITS as u64),
             ObjectType::SchedContext | ObjectType::Vcpu => return Err(Error::Unsupported),
             _ => return Err(Error::BadArg),
         };
@@ -100,14 +83,7 @@ impl<H: Hal> Kernel<H> {
         let cleared = uslot.aux.get();
         for i in 0..count {
             let obj = ut.obj + start + (i << obits);
-            let mut cap = Cap {
-                ty,
-                rights: Rights::ALL,
-                bits: cbits as u8,
-                flags: ut.flags,
-                obj,
-                badge: 0,
-            };
+            let mut cap = Cap { ty, rights: Rights::ALL, bits: cbits as u8, flags: ut.flags, obj, badge: 0 };
             match ty {
                 ObjectType::Thread => self.hal.init_thread(&self.phys, obj),
                 ObjectType::AddressSpace => {

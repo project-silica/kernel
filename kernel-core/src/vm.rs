@@ -33,19 +33,11 @@ impl<H: Hal> Kernel<H> {
 
     /// The entry for `vaddr` at `level` (0: 4 KiB pages, 1: 2 MiB pages).
     /// With `alloc`, missing tables are created.
-    fn pte(
-        &self,
-        a: Paddr,
-        vaddr: u64,
-        level: u8,
-        alloc: bool,
-    ) -> Result<Option<&Cell<u64>>, Error> {
+    fn pte(&self, a: Paddr, vaddr: u64, level: u8, alloc: bool) -> Result<Option<&Cell<u64>>, Error> {
         let h = self.aspace(a);
         let mut table = a + PAGE;
         for l in (level + 1..4).rev() {
-            let e = self
-                .phys
-                .word(table + ((vaddr >> (12 + 9 * l as u64)) & 511) * 8);
+            let e = self.phys.word(table + ((vaddr >> (12 + 9 * l as u64)) & 511) * 8);
             if H::pte_present(e.get()) {
                 if H::pte_is_leaf(e.get(), l) {
                     return Err(Error::Overlap);
@@ -65,9 +57,7 @@ impl<H: Hal> Kernel<H> {
                 return Ok(None);
             }
         }
-        Ok(Some(self.phys.word(
-            table + ((vaddr >> (12 + 9 * level as u64)) & 511) * 8,
-        )))
+        Ok(Some(self.phys.word(table + ((vaddr >> (12 + 9 * level as u64)) & 511) * 8)))
     }
 
     /// Map the frame in slot `fs` at `vaddr` in address space `a`.
@@ -77,31 +67,18 @@ impl<H: Hal> Kernel<H> {
         if slot.badge.get() & MAPPED != 0 {
             return Err(Error::Mapped);
         }
-        if !cap.rights.has(rights)
-            || !rights.has(Rights::READ)
-            || rights.has(Rights(Rights::WRITE.0 | Rights::EXEC.0))
-        {
+        if !cap.rights.has(rights) || !rights.has(Rights::READ) || rights.has(Rights(Rights::WRITE.0 | Rights::EXEC.0)) {
             // W^X: no mapping is both writable and executable.
-            return Err(if cap.rights.has(rights) {
-                Error::BadArg
-            } else {
-                Error::NoRights
-            });
+            return Err(if cap.rights.has(rights) { Error::BadArg } else { Error::NoRights });
         }
-        let (level, step) = if cap.bits >= LARGE_BITS {
-            (1u8, 1u64 << LARGE_BITS)
-        } else {
-            (0u8, PAGE)
-        };
+        let (level, step) = if cap.bits >= LARGE_BITS { (1u8, 1u64 << LARGE_BITS) } else { (0u8, PAGE) };
         let size = 1u64 << cap.bits;
         if !vaddr.is_multiple_of(step) || vaddr >= H::USER_TOP || size > H::USER_TOP - vaddr {
             return Err(Error::BadArg);
         }
         let count = size / step;
         for i in 0..count {
-            let e = self
-                .pte(a, vaddr + i * step, level, true)?
-                .ok_or(Error::NoMemory)?;
+            let e = self.pte(a, vaddr + i * step, level, true)?.ok_or(Error::NoMemory)?;
             if H::pte_present(e.get()) {
                 return Err(Error::Overlap);
             }
@@ -132,11 +109,7 @@ impl<H: Hal> Kernel<H> {
             return;
         }
         let (a, vaddr) = (slot.aux.get(), slot.badge.get() & !(PAGE - 1));
-        let (level, step) = if cap.bits >= LARGE_BITS {
-            (1u8, 1u64 << LARGE_BITS)
-        } else {
-            (0u8, PAGE)
-        };
+        let (level, step) = if cap.bits >= LARGE_BITS { (1u8, 1u64 << LARGE_BITS) } else { (0u8, PAGE) };
         let size = 1u64 << cap.bits;
         for i in 0..size / step {
             if let Ok(Some(e)) = self.pte(a, vaddr + i * step, level, false) {

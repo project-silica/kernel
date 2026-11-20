@@ -24,6 +24,9 @@ pub struct PerCpu {
     pub regs: u64,
     /// 16: scratch for the syscall entry.
     pub scratch: u64,
+    /// 24: not 0 when the processor needs its buffers cleared (VERW) on
+    /// the way back to user mode.
+    pub verw: u64,
 }
 
 #[repr(C, packed)]
@@ -65,22 +68,8 @@ static TABLES: Racy<Tables> = Racy(UnsafeCell::new(Tables {
         0,                     // 0x28 TSS (two entries)
         0,
     ],
-    tss: Tss {
-        reserved0: 0,
-        rsp0: 0,
-        rsp1: 0,
-        rsp2: 0,
-        reserved1: 0,
-        ist: [0; 7],
-        reserved2: 0,
-        reserved3: 0,
-        iomap: 104,
-    },
-    percpu: PerCpu {
-        kstack: 0,
-        regs: 0,
-        scratch: 0,
-    },
+    tss: Tss { reserved0: 0, rsp0: 0, rsp1: 0, rsp2: 0, reserved1: 0, ist: [0; 7], reserved2: 0, reserved3: 0, iomap: 104 },
+    percpu: PerCpu { kstack: 0, regs: 0, scratch: 0, verw: 0 },
     idt: [[0; 2]; 256],
 }));
 
@@ -106,9 +95,7 @@ pub fn rdmsr(msr: u32) -> u64 {
     let (lo, hi): (u32, u32);
     // SAFETY: callers read MSRs that exist on the processor (checked by
     // CPUID where optional); reading has no memory effect.
-    unsafe {
-        asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags))
-    }
+    unsafe { asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags)) }
     (hi as u64) << 32 | lo as u64
 }
 
@@ -117,9 +104,7 @@ pub fn rdmsr(msr: u32) -> u64 {
 /// environment valid.
 pub unsafe fn wrmsr(msr: u32, v: u64) {
     // SAFETY: guaranteed by the caller.
-    unsafe {
-        asm!("wrmsr", in("ecx") msr, in("eax") v as u32, in("edx") (v >> 32) as u32, options(nomem, nostack, preserves_flags))
-    }
+    unsafe { asm!("wrmsr", in("ecx") msr, in("eax") v as u32, in("edx") (v >> 32) as u32, options(nomem, nostack, preserves_flags)) }
 }
 
 pub fn cpuid(leaf: u32, sub: u32) -> [u32; 4] {
@@ -153,6 +138,16 @@ pub unsafe fn write_cr3(root: u64) {
     unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) }
 }
 
+/// Clear processor buffers on every return to user mode from now on.
+pub fn enable_verw() {
+    // SAFETY: as for `set_regs`.
+    unsafe { (*TABLES.0.get()).percpu.verw = 1 }
+}
+
+/// A data segment selector for VERW to verify; the instruction's side
+/// effect of overwriting the processor's internal buffers is the point.
+static VERW_SELECTOR: u16 = 0x10;
+
 /// Point the entry stubs at the register frame of the thread to run.
 pub fn set_regs(frame: u64) {
     // SAFETY: one processor, interrupts off; the assembly reads this field
@@ -180,10 +175,7 @@ pub unsafe fn init() {
             let h = stubs + v * 16;
             // NMI, double fault and machine check run on their own stack.
             let ist = if matches!(v, 2 | 8 | 18) { 1 } else { 0 };
-            (*t).idt[v as usize] = [
-                (h & 0xFFFF) | 0x08 << 16 | ist << 32 | 0x8E << 40 | (h >> 16 & 0xFFFF) << 48,
-                h >> 32,
-            ];
+            (*t).idt[v as usize] = [(h & 0xFFFF) | 0x08 << 16 | ist << 32 | 0x8E << 40 | (h >> 16 & 0xFFFF) << 48, h >> 32];
         }
         let gdtr: [u16; 5] = pseudo(&raw const (*t).gdt as u64, 7 * 8 - 1);
         let idtr: [u16; 5] = pseudo(&raw const (*t).idt as u64, 256 * 16 - 1);
@@ -219,13 +211,7 @@ pub unsafe fn init() {
 }
 
 fn pseudo(base: u64, limit: u16) -> [u16; 5] {
-    [
-        limit,
-        base as u16,
-        (base >> 16) as u16,
-        (base >> 32) as u16,
-        (base >> 48) as u16,
-    ]
+    [limit, base as u16, (base >> 16) as u16, (base >> 32) as u16, (base >> 48) as u16]
 }
 
 unsafe extern "C" {
@@ -281,7 +267,10 @@ extern "C" fn trap_kernel(f: &KernelFrame) {
 }
 
 // Register frame offsets (index * 8) match `REG_*` in mod.rs: rax rbx rcx
-// rdx rsi rdi rbp r8..r15 at 0..14, rip 15, rflags 16, rsp 17.
+// rdx rsi rdi rbp r8..r15 at 0..14, rip 15, rflags 16, rsp 17; 20 is not 0
+// when the frame was saved by `syscall` (rcx and r11 hold nothing to keep).
+// `lfence` after each conditional `swapgs` keeps the processor from running
+// ahead with the wrong GS base (Spectre v1, swapgs variant).
 global_asm!(
     r#"
 .section .text.boot, "ax"
@@ -319,6 +308,7 @@ syscall_entry:
     mov [rsp + 128], r11
     mov rax, gs:[16]
     mov [rsp + 136], rax
+    mov qword ptr [rsp + 160], 1
     mov rsp, gs:[0]
     xor ebp, ebp
     call {syscall}
@@ -328,6 +318,34 @@ exit_to_user:
     mov rsp, gs:[0]
     call {schedule}
     mov rax, gs:[8]
+    cmp byte ptr gs:[24], 0
+    je 5f
+    verw word ptr [rip + {verw}]
+5:
+    cmp qword ptr [rax + 160], 0
+    je 6f
+    // The thread entered by `syscall`: rcx and r11 are dead, so `sysret`
+    // can use them. Its rip is canonical: it was saved by `syscall` below
+    // USER_TOP or checked by ThreadStart.
+    mov rbx, [rax + 8]
+    mov rdx, [rax + 24]
+    mov rsi, [rax + 32]
+    mov rdi, [rax + 40]
+    mov rbp, [rax + 48]
+    mov r8, [rax + 56]
+    mov r9, [rax + 64]
+    mov r10, [rax + 72]
+    mov r12, [rax + 88]
+    mov r13, [rax + 96]
+    mov r14, [rax + 104]
+    mov r15, [rax + 112]
+    mov rcx, [rax + 120]
+    mov r11, [rax + 128]
+    mov rsp, [rax + 136]
+    mov rax, [rax]
+    swapgs
+    sysretq
+6:
     push 0x1B
     push qword ptr [rax + 136]
     push qword ptr [rax + 128]
@@ -356,8 +374,10 @@ trap_common:
     test byte ptr [rsp + 24], 3
     jz 2f
     swapgs
+    lfence
     push rax
     mov rax, gs:[8]
+    mov qword ptr [rax + 160], 0
     mov [rax + 8], rbx
     mov [rax + 16], rcx
     mov [rax + 24], rdx
@@ -387,6 +407,7 @@ trap_common:
     call {trap_user}
     jmp exit_to_user
 2:
+    lfence
     push r15
     push r14
     push r13
@@ -449,6 +470,7 @@ trap_stubs:
     kmain = sym super::kmain,
     syscall = sym syscall_rust,
     schedule = sym schedule_rust,
+    verw = sym VERW_SELECTOR,
     trap_user = sym trap_user,
     trap_kernel = sym trap_kernel,
 );

@@ -90,27 +90,13 @@ impl Slot {
     }
     pub(crate) fn set(&self, cap: &Cap, depth: u16) {
         self.obj.set(cap.obj);
-        self.meta.set(
-            cap.ty as u64
-                | (cap.rights.0 as u64) << 8
-                | (cap.bits as u64) << 16
-                | (cap.flags as u64) << 24
-                | (depth as u64) << 32,
-        );
+        self.meta
+            .set(cap.ty as u64 | (cap.rights.0 as u64) << 8 | (cap.bits as u64) << 16 | (cap.flags as u64) << 24 | (depth as u64) << 32);
         self.badge.set(cap.badge);
         self.aux.set(0);
     }
     fn wipe(&self) {
-        for c in [
-            &self.obj,
-            &self.meta,
-            &self.badge,
-            &self.aux,
-            &self.prev,
-            &self.next,
-            &self.mprev,
-            &self.mnext,
-        ] {
+        for c in [&self.obj, &self.meta, &self.badge, &self.aux, &self.prev, &self.next, &self.mprev, &self.mnext] {
             c.set(0);
         }
     }
@@ -171,11 +157,7 @@ impl<H: Hal> Kernel<H> {
     }
 
     fn same_obj(&self, s: Paddr, cap: &Cap) -> bool {
-        s != 0
-            && self
-                .slot(s)
-                .cap()
-                .is_some_and(|c| c.ty == cap.ty && c.obj == cap.obj && c.ty != ObjectType::Hw)
+        s != 0 && self.slot(s).cap().is_some_and(|c| c.ty == cap.ty && c.obj == cap.obj && c.ty != ObjectType::Hw)
     }
 
     /// Empty slot `s`. Destroys the object when this was its last
@@ -279,12 +261,7 @@ impl<H: Hal> Kernel<H> {
     /// place in the derivation tree and its mapping.
     pub(crate) fn move_slot(&self, src: Paddr, dst: Paddr) {
         let (s, d) = (self.slot(src), self.slot(dst));
-        for (a, b) in [
-            (&s.obj, &d.obj),
-            (&s.meta, &d.meta),
-            (&s.badge, &d.badge),
-            (&s.aux, &d.aux),
-        ] {
+        for (a, b) in [(&s.obj, &d.obj), (&s.meta, &d.meta), (&s.badge, &d.badge), (&s.aux, &d.aux)] {
             b.set(a.get());
         }
         let (p, n, mp, mn) = (s.prev.get(), s.next.get(), s.mprev.get(), s.mnext.get());

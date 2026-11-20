@@ -78,15 +78,7 @@ impl From<Error> for BootError {
 }
 
 impl<H: Hal> Kernel<H> {
-    fn boot_retype(
-        &self,
-        us: Paddr,
-        ty: ObjectType,
-        bits: u8,
-        cs: &Cap,
-        index: u64,
-        count: u64,
-    ) -> Result<(), Error> {
+    fn boot_retype(&self, us: Paddr, ty: ObjectType, bits: u8, cs: &Cap, index: u64, count: u64) -> Result<(), Error> {
         while self.retype(us, ty, bits as u64, cs, index, count)? != Exit::Done {}
         Ok(())
     }
@@ -99,17 +91,8 @@ impl<H: Hal> Kernel<H> {
             return Err(BootError::Segment);
         }
         // An Untyped twice the size of what the task needs to start, at least 4 MiB.
-        let image: u64 = elf
-            .segments()
-            .map(|s| (s.vaddr + s.memsz).div_ceil(4096) - s.vaddr / 4096)
-            .sum::<u64>()
-            << PAGE_BITS;
-        let need = (1u64 << (CS_BITS + SLOT_BITS))
-            + (1 << AS_BITS)
-            + image
-            + (1 << STACK_BITS)
-            + (1 << INFO_BITS)
-            + (4 << PAGE_BITS);
+        let image: u64 = elf.segments().map(|s| (s.vaddr + s.memsz).div_ceil(4096) - s.vaddr / 4096).sum::<u64>() << PAGE_BITS;
+        let need = (1u64 << (CS_BITS + SLOT_BITS)) + (1 << AS_BITS) + image + (1 << STACK_BITS) + (1 << INFO_BITS) + (4 << PAGE_BITS);
         let bits = (64 - (2 * need - 1).leading_zeros()).max(22) as u8;
         let size = 1u64 << bits;
         let base = spec
@@ -127,41 +110,17 @@ impl<H: Hal> Kernel<H> {
         // to hold the Untyped it is made from.
         let cs_size = 1u64 << (CS_BITS + SLOT_BITS);
         self.phys.zero(base, cs_size);
-        let cs = Cap {
-            ty: ObjectType::CapSpace,
-            rights: Rights::ALL,
-            bits: CS_BITS,
-            flags: 0,
-            obj: base,
-            badge: 0,
-        };
+        let cs = Cap { ty: ObjectType::CapSpace, rights: Rights::ALL, bits: CS_BITS, flags: 0, obj: base, badge: 0 };
         let slot = |i: u64| base + (i << SLOT_BITS);
         let us = slot(SLOT_BOOT_UNTYPED);
-        self.insert_root(
-            us,
-            &Cap {
-                ty: ObjectType::Untyped,
-                rights: Rights::ALL,
-                bits,
-                flags: 0,
-                obj: base,
-                badge: cs_size,
-            },
-        );
+        self.insert_root(us, &Cap { ty: ObjectType::Untyped, rights: Rights::ALL, bits, flags: 0, obj: base, badge: cs_size });
         self.slot(us).aux.set(cs_size);
         self.insert_child(us, slot(SLOT_CAPSPACE), &cs)?;
 
         self.boot_retype(us, ObjectType::Thread, 0, &cs, SLOT_THREAD, 1)?;
         self.boot_retype(us, ObjectType::AddressSpace, AS_BITS, &cs, SLOT_ASPACE, 1)?;
         self.boot_retype(us, ObjectType::Frame, PAGE_BITS, &cs, SLOT_IPCBUF, 1)?;
-        let hw = |flags, end| Cap {
-            ty: ObjectType::Hw,
-            rights: Rights::ALL,
-            bits: 0,
-            flags,
-            obj: 0,
-            badge: end,
-        };
+        let hw = |flags, end| Cap { ty: ObjectType::Hw, rights: Rights::ALL, bits: 0, flags, obj: 0, badge: end };
         if spec.ports {
             self.insert_root(slot(SLOT_PORTS), &hw(FLAG_PORTS, 1 << 16));
         }
@@ -175,30 +134,12 @@ impl<H: Hal> Kernel<H> {
         let mut count = 0u64;
         let mut emit = |mut a: u64, b: u64, kind: u8| {
             while a < b && count < MAX_UNTYPED as u64 {
-                let bits = (a.trailing_zeros().min(63 - (b - a).leading_zeros()) as u8)
-                    .min(silica_abi::UNTYPED_MAX_BITS);
+                let bits = (a.trailing_zeros().min(63 - (b - a).leading_zeros()) as u8).min(silica_abi::UNTYPED_MAX_BITS);
                 let flags = if kind == KIND_RAM { 0 } else { FLAG_DEVICE };
-                let cap = Cap {
-                    ty: ObjectType::Untyped,
-                    rights: Rights::ALL,
-                    bits,
-                    flags,
-                    obj: a,
-                    badge: 0,
-                };
+                let cap = Cap { ty: ObjectType::Untyped, rights: Rights::ALL, bits, flags, obj: a, badge: 0 };
                 self.insert_root(slot(SLOT_FIRST_UNTYPED + count), &cap);
-                let d = UntypedDesc {
-                    base: a,
-                    bits,
-                    kind,
-                    reserved: [0; 6],
-                };
-                self.phys.write_val(
-                    info + (offset_of!(RootInfo, untyped)
-                        + count as usize * size_of::<UntypedDesc>())
-                        as u64,
-                    &d,
-                );
+                let d = UntypedDesc { base: a, bits, kind, reserved: [0; 6] };
+                self.phys.write_val(info + (offset_of!(RootInfo, untyped) + count as usize * size_of::<UntypedDesc>()) as u64, &d);
                 count += 1;
                 a += 1u64 << bits;
             }
@@ -240,11 +181,7 @@ impl<H: Hal> Kernel<H> {
             device(cursor, spec.device_top, &mut emit);
         }
         if count == MAX_UNTYPED as u64 {
-            crate::klog!(
-                self,
-                "boot: more than {} memory ranges; the rest are not handed to the root task",
-                MAX_UNTYPED
-            );
+            crate::klog!(self, "boot: more than {} memory ranges; the rest are not handed to the root task", MAX_UNTYPED);
         }
 
         // The image, one frame per page.
@@ -253,11 +190,7 @@ impl<H: Hal> Kernel<H> {
             if seg.flags & PF_W != 0 && seg.flags & PF_X != 0 {
                 return Err(BootError::Segment);
             }
-            let rights = Rights(
-                Rights::READ.0
-                    | if seg.flags & PF_W != 0 { 2 } else { 0 }
-                    | if seg.flags & PF_X != 0 { 4 } else { 0 },
-            );
+            let rights = Rights(Rights::READ.0 | if seg.flags & PF_W != 0 { 2 } else { 0 } | if seg.flags & PF_X != 0 { 4 } else { 0 });
             let first = seg.vaddr & !0xFFF;
             let pages = (seg.vaddr + seg.memsz - first).div_ceil(4096);
             for p in 0..pages {
@@ -271,11 +204,9 @@ impl<H: Hal> Kernel<H> {
                 let off = (from - seg.vaddr) as usize;
                 if off < seg.data.len() {
                     let n = (seg.data.len() - off).min((page + 4096 - from) as usize);
-                    self.phys
-                        .write_bytes(frame + (from - page), &seg.data[off..off + n]);
+                    self.phys.write_bytes(frame + (from - page), &seg.data[off..off + n]);
                 }
-                self.map(asp, s, page, rights)
-                    .map_err(|_| BootError::Segment)?;
+                self.map(asp, s, page, rights).map_err(|_| BootError::Segment)?;
             }
         }
         let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
@@ -291,30 +222,21 @@ impl<H: Hal> Kernel<H> {
                 self.phys.write_val(info + (off + i * 8) as u64, w);
             }
         };
-        put(
-            offset_of!(RootInfo, magic),
-            &[ROOT_MAGIC, 1 << CS_BITS, next, count, IPCBUF_VADDR],
-        );
+        put(offset_of!(RootInfo, magic), &[ROOT_MAGIC, 1 << CS_BITS, next, count, IPCBUF_VADDR]);
         put(offset_of!(RootInfo, ramdisk), &spec.ramdisk);
         put(offset_of!(RootInfo, rsdp), &[spec.rsdp]);
         put(offset_of!(RootInfo, framebuffer), &spec.framebuffer);
         put(offset_of!(RootInfo, clock), &spec.clock);
         put(offset_of!(RootInfo, wall_clock), &spec.wall_clock);
-        self.phys
-            .write_bytes(info + offset_of!(RootInfo, entropy) as u64, &spec.entropy);
+        self.phys.write_bytes(info + offset_of!(RootInfo, entropy) as u64, &spec.entropy);
         let cmd = &spec.cmdline[..spec.cmdline.len().min(256)];
         put(offset_of!(RootInfo, cmdline_len), &[cmd.len() as u64]);
-        self.phys
-            .write_bytes(info + offset_of!(RootInfo, cmdline) as u64, cmd);
+        self.phys.write_bytes(info + offset_of!(RootInfo, cmdline) as u64, cmd);
 
         // The thread: its CapSpace, address space and IPC buffer, then go.
         let t = self.slot(slot(SLOT_THREAD)).obj.get();
         let emb = Thread::embedded_slots(t);
-        for (src, dst) in [
-            (SLOT_CAPSPACE, emb[0]),
-            (SLOT_ASPACE, emb[1]),
-            (SLOT_IPCBUF, emb[3]),
-        ] {
+        for (src, dst) in [(SLOT_CAPSPACE, emb[0]), (SLOT_ASPACE, emb[1]), (SLOT_IPCBUF, emb[3])] {
             let mut cap = self.slot(slot(src)).cap().ok_or(Error::BadCap)?;
             if cap.ty == ObjectType::Frame {
                 cap.badge = 0;

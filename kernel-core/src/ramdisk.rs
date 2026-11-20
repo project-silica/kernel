@@ -10,10 +10,7 @@ const ENTRY: usize = 48;
 /// malformed or has no such entry.
 pub fn find<'a>(archive: &'a [u8], name: &str) -> Option<&'a [u8]> {
     let u64_at = |o: usize| Some(u64::from_le_bytes(archive.get(o..o + 8)?.try_into().ok()?));
-    if archive.get(..8)? != b"SILRAMDK"
-        || u64_at(8)? & 0xFFFF_FFFF != 1
-        || u64_at(16)? != archive.len() as u64
-    {
+    if archive.get(..8)? != b"SILRAMDK" || u64_at(8)? & 0xFFFF_FFFF != 1 || u64_at(16)? != archive.len() as u64 {
         return None;
     }
     let count = (u64_at(8)? >> 32) as usize;

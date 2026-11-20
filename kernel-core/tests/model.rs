@@ -57,11 +57,7 @@ const USER_TOP: u64 = 0x7FFF_FFFF_F000;
 
 impl Model {
     fn root(&self, i: u64) -> Result<Sid, Error> {
-        if i == 0 || i >= 4096 {
-            Err(Error::BadCap)
-        } else {
-            Ok(Sid::Cs(self.root_cs, i))
-        }
+        if i == 0 || i >= 4096 { Err(Error::BadCap) } else { Ok(Sid::Cs(self.root_cs, i)) }
     }
     fn typed(&self, i: u64, ty: T, rights: u8) -> Result<(Sid, MCap), Error> {
         let s = self.root(i)?;
@@ -76,18 +72,10 @@ impl Model {
     }
     /// Slot `index` of the CapSpace capability `cs`.
     fn slot_in(&self, cs: &MCap, index: u64) -> Result<Sid, Error> {
-        if index == 0 || index >= 1 << cs.bits {
-            Err(Error::BadCap)
-        } else {
-            Ok(Sid::Cs(cs.obj, index))
-        }
+        if index == 0 || index >= 1 << cs.bits { Err(Error::BadCap) } else { Ok(Sid::Cs(cs.obj, index)) }
     }
     fn children(&self, s: Sid) -> Vec<Sid> {
-        self.slots
-            .iter()
-            .filter(|(_, c)| c.parent == Some(s))
-            .map(|(k, _)| *k)
-            .collect()
+        self.slots.iter().filter(|(_, c)| c.parent == Some(s)).map(|(k, _)| *k).collect()
     }
     fn depth(&self, s: Sid) -> u16 {
         self.slots[&s].parent.map_or(0, |p| 1 + self.depth(p))
@@ -95,11 +83,7 @@ impl Model {
     fn unmap(&mut self, s: Sid) {
         let c = self.slots.get_mut(&s).unwrap();
         if let Some((a, v)) = c.mapped.take() {
-            let (level, step) = if c.bits >= 21 {
-                (1, 1u64 << 21)
-            } else {
-                (0, 4096)
-            };
+            let (level, step) = if c.bits >= 21 { (1, 1u64 << 21) } else { (0, 4096) };
             let sp = self.spaces.get_mut(&a).unwrap();
             for i in 0..(1u64 << c.bits) / step {
                 sp.leaves.remove(&(level, v + i * step));
@@ -122,11 +106,7 @@ impl Model {
         }
         self.unmap(s);
         let cap = self.slots.remove(&s).unwrap();
-        if self
-            .slots
-            .values()
-            .any(|c| c.ty == cap.ty && c.obj == cap.obj)
-        {
+        if self.slots.values().any(|c| c.ty == cap.ty && c.obj == cap.obj) {
             return;
         }
         match cap.ty {
@@ -200,11 +180,7 @@ impl Model {
                         return Err(Error::SlotFull);
                     }
                 }
-                let mut free = if self.children(us).is_empty() {
-                    0
-                } else {
-                    ut.free
-                };
+                let mut free = if self.children(us).is_empty() { 0 } else { ut.free };
                 self.slots.get_mut(&us).unwrap().free = free;
                 let size = 1u64 << obits;
                 let start = (free + size - 1) & !(size - 1);
@@ -215,27 +191,12 @@ impl Model {
                 for i in 0..a[5] {
                     let obj = ut.obj + start + (i << obits);
                     let rights = if ty == T::Frame { 7 } else { 15 };
-                    let cap = MCap {
-                        ty,
-                        rights,
-                        bits: cbits as u8,
-                        obj,
-                        badge: 0,
-                        parent: Some(us),
-                        mapped: None,
-                        free: 0,
-                    };
+                    let cap = MCap { ty, rights, bits: cbits as u8, obj, badge: 0, parent: Some(us), mapped: None, free: 0 };
                     self.slots.insert(self.slot_in(&dst, a[4] + i)?, cap);
                     match ty {
                         T::CapSpace => drop(self.capspaces.insert(obj, cbits as u8)),
                         T::Thread => drop(self.threads.insert(obj)),
-                        T::AddressSpace => drop(self.spaces.insert(
-                            obj,
-                            MAs {
-                                pages: size / 4096,
-                                ..MAs::default()
-                            },
-                        )),
+                        T::AddressSpace => drop(self.spaces.insert(obj, MAs { pages: size / 4096, ..MAs::default() })),
                         _ => {}
                     }
                 }
@@ -318,11 +279,7 @@ impl Model {
                 if rights & 1 == 0 || rights & 6 == 6 {
                     return Err(Error::BadArg);
                 }
-                let (level, step) = if f.bits >= 21 {
-                    (1u8, 1u64 << 21)
-                } else {
-                    (0u8, 4096)
-                };
+                let (level, step) = if f.bits >= 21 { (1u8, 1u64 << 21) } else { (0u8, 4096) };
                 let size = 1u64 << f.bits;
                 if vaddr % step != 0 || vaddr >= USER_TOP || size > USER_TOP - vaddr {
                     return Err(Error::BadArg);
@@ -343,15 +300,12 @@ impl Model {
                             sp.tables.insert(key);
                         }
                     }
-                    if sp.leaves.contains_key(&(level, v))
-                        || (level == 1 && sp.tables.contains(&(1, v >> 21)))
-                    {
+                    if sp.leaves.contains_key(&(level, v)) || (level == 1 && sp.tables.contains(&(1, v >> 21))) {
                         return Err(Error::Overlap);
                     }
                 }
                 for i in 0..size / step {
-                    sp.leaves
-                        .insert((level, vaddr + i * step), f.obj + i * step);
+                    sp.leaves.insert((level, vaddr + i * step), f.obj + i * step);
                 }
                 self.slots.get_mut(&fs).unwrap().mapped = Some((asp.obj, vaddr));
                 Ok(())
@@ -402,9 +356,7 @@ fn compare(m: &Machine, model: &Model, what: &str) {
         Sid::Cs(obj, i) => obj + i * 64,
         Sid::Th(t, i) => m.k.thread_view(t).slots[i as usize],
     };
-    let mut expected: Vec<Sid> = (WINDOW..WINDOW + NWIN)
-        .map(|i| Sid::Cs(model.root_cs, i))
-        .collect();
+    let mut expected: Vec<Sid> = (WINDOW..WINDOW + NWIN).map(|i| Sid::Cs(model.root_cs, i)).collect();
     for (&obj, &bits) in &model.capspaces {
         expected.extend((1..1u64 << bits).map(|i| Sid::Cs(obj, i)));
     }
@@ -425,18 +377,11 @@ fn compare(m: &Machine, model: &Model, what: &str) {
                 assert_eq!(v.depth, model.depth(s), "{what}: depth of {s:?}");
                 if c.ty == T::Untyped {
                     assert_eq!(v.watermark.0, c.free, "{what}: watermark of {s:?}");
-                    assert!(
-                        v.watermark.1 <= 1 << c.bits,
-                        "{what}: cleared mark of {s:?}"
-                    );
+                    assert!(v.watermark.1 <= 1 << c.bits, "{what}: cleared mark of {s:?}");
                 }
                 // The derivation list is consistent around this slot.
                 if v.next != 0 {
-                    assert_eq!(
-                        m.k.view(v.next).expect("next is a capability").prev,
-                        addr(s),
-                        "{what}: links after {s:?}"
-                    );
+                    assert_eq!(m.k.view(v.next).expect("next is a capability").prev, addr(s), "{what}: links after {s:?}");
                 }
                 if let Some(p) = c.parent {
                     // The parent is the nearest earlier slot with a smaller depth.
@@ -453,64 +398,27 @@ fn compare(m: &Machine, model: &Model, what: &str) {
     for (&a, sp) in &model.spaces {
         for (&(level, v), &p) in &sp.leaves {
             let probe = v + if level == 1 { 0x12_3456 } else { 0x456 };
-            assert_eq!(
-                m.k.translate(a, probe),
-                Some(p + (probe - v)),
-                "{what}: translation of {probe:#x}"
-            );
+            assert_eq!(m.k.translate(a, probe), Some(p + (probe - v)), "{what}: translation of {probe:#x}");
         }
         for v in VADDRS {
-            let covered = sp.leaves.contains_key(&(0, v))
-                || sp.leaves.contains_key(&(1, v & !((1 << 21) - 1)));
-            assert_eq!(
-                m.k.translate(a, v).is_some(),
-                covered,
-                "{what}: {v:#x} mapped or not"
-            );
+            let covered = sp.leaves.contains_key(&(0, v)) || sp.leaves.contains_key(&(1, v & !((1 << 21) - 1)));
+            assert_eq!(m.k.translate(a, v).is_some(), covered, "{what}: {v:#x} mapped or not");
         }
     }
 }
 
-const VADDRS: [u64; 8] = [
-    0x10000,
-    0x11000,
-    0x12000,
-    0x20_0000,
-    0x40_0000,
-    0x4000_0000,
-    0x80_4020_0000,
-    0x7FFF_FFE0_0000,
-];
+const VADDRS: [u64; 8] = [0x10000, 0x11000, 0x12000, 0x20_0000, 0x40_0000, 0x4000_0000, 0x80_4020_0000, 0x7FFF_FFE0_0000];
 
 fn run(seed: u64, ops: u32) {
     let m = Machine::new(if cfg!(miri) { 8 } else { 64 });
     let (ut, d) = m.big_untyped();
-    let mut model = Model {
-        root_cs: m.cs.obj,
-        slots: BTreeMap::new(),
-        spaces: BTreeMap::new(),
-        capspaces: BTreeMap::new(),
-        threads: BTreeSet::new(),
-    };
-    let rootcap = |ty: T, bits: u8, obj: u64| MCap {
-        ty,
-        rights: 15,
-        bits,
-        obj,
-        badge: 0,
-        parent: None,
-        mapped: None,
-        free: 0,
-    };
-    model
-        .slots
-        .insert(Sid::Cs(m.cs.obj, ut), rootcap(T::Untyped, d.bits, d.base));
+    let mut model =
+        Model { root_cs: m.cs.obj, slots: BTreeMap::new(), spaces: BTreeMap::new(), capspaces: BTreeMap::new(), threads: BTreeSet::new() };
+    let rootcap = |ty: T, bits: u8, obj: u64| MCap { ty, rights: 15, bits, obj, badge: 0, parent: None, mapped: None, free: 0 };
+    model.slots.insert(Sid::Cs(m.cs.obj, ut), rootcap(T::Untyped, d.bits, d.base));
     // The root CapSpace capability is used as a destination; the model
     // only needs to know it is there.
-    model.slots.insert(
-        Sid::Cs(m.cs.obj, SLOT_CAPSPACE),
-        rootcap(T::CapSpace, 12, m.cs.obj),
-    );
+    model.slots.insert(Sid::Cs(m.cs.obj, SLOT_CAPSPACE), rootcap(T::CapSpace, 12, m.cs.obj));
     assert!(ut >= SLOT_FIRST_UNTYPED);
 
     let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -518,44 +426,20 @@ fn run(seed: u64, ops: u32) {
         let has = |model: &Model, i: u64| model.slots.contains_key(&Sid::Cs(m.cs.obj, i));
         // A window slot: usually one that holds a capability (`full`) or one that does not.
         let w = |r: &mut Rng, model: &Model, full: bool| {
-            let fit: Vec<u64> = (WINDOW..WINDOW + NWIN)
-                .filter(|&i| has(model, i) == full)
-                .collect();
-            if fit.is_empty() || r.below(8) == 0 {
-                WINDOW + r.below(NWIN)
-            } else {
-                r.pick(&fit)
-            }
+            let fit: Vec<u64> = (WINDOW..WINDOW + NWIN).filter(|&i| has(model, i) == full).collect();
+            if fit.is_empty() || r.below(8) == 0 { WINDOW + r.below(NWIN) } else { r.pick(&fit) }
         };
         // A window slot holding a capability of type `ty`, most of the time.
         let of = |r: &mut Rng, model: &Model, ty: T| {
-            let have: Vec<u64> = (WINDOW..WINDOW + NWIN)
-                .filter(|&i| {
-                    model
-                        .slots
-                        .get(&Sid::Cs(m.cs.obj, i))
-                        .is_some_and(|c| c.ty == ty)
-                })
-                .collect();
-            if have.is_empty() || r.below(8) == 0 {
-                WINDOW + r.below(NWIN)
-            } else {
-                r.pick(&have)
-            }
+            let have: Vec<u64> =
+                (WINDOW..WINDOW + NWIN).filter(|&i| model.slots.get(&Sid::Cs(m.cs.obj, i)).is_some_and(|c| c.ty == ty)).collect();
+            if have.is_empty() || r.below(8) == 0 { WINDOW + r.below(NWIN) } else { r.pick(&have) }
         };
         let cs = |r: &mut Rng, model: &Model| {
-            if r.below(3) == 0 {
-                of(r, model, T::CapSpace)
-            } else {
-                SLOT_CAPSPACE
-            }
+            if r.below(3) == 0 { of(r, model, T::CapSpace) } else { SLOT_CAPSPACE }
         };
         let idx = |r: &mut Rng, model: &Model, c: u64| {
-            if c == SLOT_CAPSPACE {
-                w(r, model, false)
-            } else {
-                r.below(9)
-            }
+            if c == SLOT_CAPSPACE { w(r, model, false) } else { r.below(9) }
         };
         let (n, a) = match r.below(100) {
             0..30 => {
@@ -578,11 +462,7 @@ fn run(seed: u64, ops: u32) {
                     T::AddressSpace => r.pick(&[13, 14, 15, 16, 16, 12]),
                     _ => 0,
                 };
-                let from = if r.below(3) == 0 {
-                    of(&mut r, &model, T::Untyped)
-                } else {
-                    ut
-                };
+                let from = if r.below(3) == 0 { of(&mut r, &model, T::Untyped) } else { ut };
                 let c = cs(&mut r, &model);
                 let i = idx(&mut r, &model, c);
                 let tyn = match r.below(40) {
@@ -590,26 +470,13 @@ fn run(seed: u64, ops: u32) {
                     1 => T::SchedContext as u64,
                     _ => ty as u64,
                 };
-                (
-                    S::Retype,
-                    [from, tyn, bits, c, i, r.pick(&[1, 1, 1, 1, 2, 3, 0, 300])],
-                )
+                (S::Retype, [from, tyn, bits, c, i, r.pick(&[1, 1, 1, 1, 2, 3, 0, 300])])
             }
             30..55 => {
                 let c = cs(&mut r, &model);
                 let i = idx(&mut r, &model, c);
                 let badge = r.pick(&[0, 0, 0, 5, 9]);
-                (
-                    S::CapCopy,
-                    [
-                        c,
-                        i,
-                        w(&mut r, &model, true),
-                        r.pick(&[15, 15, 15, 3, 1, 2, 7]),
-                        badge,
-                        r.pick(&[0, 0, 0, 1, 1, 1, 2]),
-                    ],
-                )
+                (S::CapCopy, [c, i, w(&mut r, &model, true), r.pick(&[15, 15, 15, 3, 1, 2, 7]), badge, r.pick(&[0, 0, 0, 1, 1, 1, 2])])
             }
             55..63 => {
                 let c = cs(&mut r, &model);
@@ -617,37 +484,10 @@ fn run(seed: u64, ops: u32) {
                 (S::CapMove, [c, i, w(&mut r, &model, true), 0, 0, 0])
             }
             63..70 => (S::CapDelete, [w(&mut r, &model, true), 0, 0, 0, 0, 0]),
-            70..73 => (
-                S::CapRevoke,
-                [
-                    if r.below(10) == 0 {
-                        ut
-                    } else {
-                        w(&mut r, &model, true)
-                    },
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-            ),
+            70..73 => (S::CapRevoke, [if r.below(10) == 0 { ut } else { w(&mut r, &model, true) }, 0, 0, 0, 0, 0]),
             73..90 => {
-                let (a, f) = (
-                    of(&mut r, &model, T::AddressSpace),
-                    of(&mut r, &model, T::Frame),
-                );
-                (
-                    S::Map,
-                    [
-                        a,
-                        f,
-                        r.pick(&VADDRS) + r.pick(&[0, 0, 0, 0, 0, 0x800]),
-                        r.pick(&[1, 3, 3, 3, 5, 7, 2]),
-                        0,
-                        0,
-                    ],
-                )
+                let (a, f) = (of(&mut r, &model, T::AddressSpace), of(&mut r, &model, T::Frame));
+                (S::Map, [a, f, r.pick(&VADDRS) + r.pick(&[0, 0, 0, 0, 0, 0x800]), r.pick(&[1, 3, 3, 3, 5, 7, 2]), 0, 0])
             }
             90..94 => (S::Unmap, [of(&mut r, &model, T::Frame), 0, 0, 0, 0, 0]),
             _ => {
@@ -656,16 +496,8 @@ fn run(seed: u64, ops: u32) {
                     1 => 0,
                     _ => of(&mut r, &model, ty),
                 };
-                let (c, a, e, b) = (
-                    f(T::CapSpace),
-                    f(T::AddressSpace),
-                    f(T::Endpoint),
-                    f(T::Frame),
-                );
-                (
-                    S::ThreadConfigure,
-                    [of(&mut r, &model, T::Thread), c, a, e, b, 0],
-                )
+                let (c, a, e, b) = (f(T::CapSpace), f(T::AddressSpace), f(T::Endpoint), f(T::Frame));
+                (S::ThreadConfigure, [of(&mut r, &model, T::Thread), c, a, e, b, 0])
             }
         };
         // Sometimes an interrupt is pending, so long operations restart.
@@ -674,18 +506,12 @@ fn run(seed: u64, ops: u32) {
         }
         if std::env::var_os("MODEL_DUMP").is_some_and(|v| v.to_str() == Some(&step.to_string())) {
             for (k, c) in &model.slots {
-                eprintln!(
-                    "model {k:x?}: {:?} obj {:x} parent {:x?}",
-                    c.ty, c.obj, c.parent
-                );
+                eprintln!("model {k:x?}: {:?} obj {:x} parent {:x?}", c.ty, c.obj, c.parent);
             }
             let mut at = m.k.slot_addr(&m.cs, ut).unwrap();
             while at != 0 {
                 let v = m.k.view(at).unwrap();
-                eprintln!(
-                    "kernel {at:x}: depth {} {:?} obj {:x}",
-                    v.depth, v.cap.ty, v.cap.obj
-                );
+                eprintln!("kernel {at:x}: depth {} {:?} obj {:x}", v.depth, v.cap.ty, v.cap.obj);
                 at = v.next;
             }
         }
@@ -708,10 +534,7 @@ fn run(seed: u64, ops: u32) {
     m.ok(S::CapRevoke, [ut, 0, 0, 0, 0, 0]);
     compare(&m, &model, "after the final revoke");
     for i in WINDOW..WINDOW + NWIN {
-        assert!(
-            m.cap(i).is_none(),
-            "seed {seed}: slot {i} survived revoking the Untyped everything came from"
-        );
+        assert!(m.cap(i).is_none(), "seed {seed}: slot {i} survived revoking the Untyped everything came from");
     }
     m.retype(ut, T::Frame, d.bits as u64, WINDOW, 1);
 }
@@ -719,10 +542,7 @@ fn run(seed: u64, ops: u32) {
 #[test]
 fn kernel_matches_reference_model() {
     let (seeds, ops) = if cfg!(miri) { (2, 150) } else { (48, 3000) };
-    if let Some(seed) = std::env::var("MODEL_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
+    if let Some(seed) = std::env::var("MODEL_SEED").ok().and_then(|s| s.parse().ok()) {
         return run(seed, ops);
     }
     for seed in 1..=seeds {

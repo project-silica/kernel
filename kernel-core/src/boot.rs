@@ -105,10 +105,7 @@ pub struct Cmdline<'a>(pub &'a [u8]);
 impl<'a> Cmdline<'a> {
     /// The value of `key`, the empty slice for a bare flag, `None` when absent.
     pub fn get(&self, key: &str) -> Option<&'a [u8]> {
-        for word in self
-            .0
-            .split(|&b| b == b' ' || b == b'\n' || b == b'\r' || b == b'\t')
-        {
+        for word in self.0.split(|&b| b == b' ' || b == b'\n' || b == b'\r' || b == b'\t') {
             let (k, v) = match word.iter().position(|&b| b == b'=') {
                 Some(i) => (&word[..i], &word[i + 1..]),
                 None => (word, &word[word.len()..]),
