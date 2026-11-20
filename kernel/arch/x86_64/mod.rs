@@ -1,9 +1,11 @@
 //! x86_64: boot, the `Hal` implementation, the clock and the panic path.
 //!
-//! Required of the processor: x2APIC, the TSC-deadline timer, an invariant
-//! TSC, XSAVE and NX. Every x86_64 processor made since 2013 and QEMU (KVM,
-//! or TCG with `-cpu max`) has them; the kernel stops with a message naming
-//! the missing one otherwise. There is no PIC, PIT or xAPIC fallback.
+//! Required of the processor: x2APIC, an invariant TSC, XSAVE and NX. Every
+//! x86_64 processor made since 2013 and QEMU (KVM, or TCG with `-cpu max`)
+//! has them; the kernel stops with a message naming the missing one
+//! otherwise. There is no PIC, PIT or xAPIC fallback. The timer is the
+//! TSC-deadline timer; where the platform does not offer it (QEMU's own
+//! APIC emulation) the local APIC's one-shot counter is used instead.
 
 mod cpu;
 mod serial;
@@ -49,6 +51,9 @@ const MSR_X2APIC_EOI: u32 = 0x80B;
 const MSR_X2APIC_SVR: u32 = 0x80F;
 const MSR_X2APIC_IRR0: u32 = 0x820;
 const MSR_X2APIC_LVT_TIMER: u32 = 0x832;
+const MSR_X2APIC_TIMER_COUNT: u32 = 0x838;
+const MSR_X2APIC_TIMER_NOW: u32 = 0x839;
+const MSR_X2APIC_TIMER_DIVIDE: u32 = 0x83E;
 const MSR_FS_BASE: u32 = 0xC000_0100;
 const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
@@ -64,7 +69,11 @@ pub struct X86 {
     deadline: Cell<u64>,
     /// The page table with only the kernel's mappings.
     kernel_root: Cell<u64>,
+    /// Local APIC timer counts per nanosecond as 32.32 fixed point; 0 when
+    /// the TSC-deadline timer is in use.
+    apic_per_ns: Cell<u64>,
     slide: Cell<u64>,
+    polls: Cell<u32>,
     stray_irqs: Cell<u64>,
 }
 
@@ -82,7 +91,9 @@ static KERNEL: Global = Global(Kernel::new(
         ticks_per_ns: Cell::new(0),
         deadline: Cell::new(u64::MAX),
         kernel_root: Cell::new(0),
+        apic_per_ns: Cell::new(0),
         slide: Cell::new(0),
+        polls: Cell::new(0),
         stray_irqs: Cell::new(0),
     },
     // SAFETY: the loader maps all physical memory at PHYS_MAP_BASE and the
@@ -222,16 +233,34 @@ impl Hal for X86 {
             (self.tsc0.get() as u128 + ticks).clamp(1, u64::MAX as u128 - 1) as u64
         };
         self.deadline.set(tsc);
-        // SAFETY: the TSC-deadline MSR exists (checked at boot); 0 disarms.
-        unsafe { wrmsr(MSR_TSC_DEADLINE, if tsc == u64::MAX { 0 } else { tsc }) }
+        let per_ns = self.apic_per_ns.get();
+        // SAFETY: the timer MSRs exist (x2APIC and, for the first branch,
+        // TSC-deadline were checked at boot). A zero count or deadline disarms.
+        unsafe {
+            if per_ns == 0 {
+                wrmsr(MSR_TSC_DEADLINE, if tsc == u64::MAX { 0 } else { tsc });
+            } else if tsc == u64::MAX {
+                wrmsr(MSR_X2APIC_TIMER_COUNT, 0);
+            } else {
+                // One-shot: a count from now. Too long a wait fires early
+                // and the scheduler arms the timer again.
+                let ns = deadline.saturating_sub(self.now());
+                let count = ((ns as u128 * per_ns as u128) >> 32).clamp(1, u32::MAX as u128) as u64;
+                wrmsr(MSR_X2APIC_TIMER_COUNT, count);
+            }
+        }
     }
 
     fn irq_pending(&self) -> bool {
         if rdtsc() >= self.deadline.get() {
             return true;
         }
-        // Any request for a vector from 32 up in the local APIC.
-        (1..8).any(|i| rdmsr(MSR_X2APIC_IRR0 + i) != 0)
+        // Any request for a vector from 32 up in the local APIC. Reading
+        // the APIC can cost a trip to the hypervisor, so look only every
+        // sixteenth time: callers poll once per small step of a long loop.
+        let n = self.polls.get().wrapping_add(1);
+        self.polls.set(n);
+        n % 16 == 0 && (1..8).any(|i| rdmsr(MSR_X2APIC_IRR0 + i) != 0)
     }
 
     fn idle(&self) {
@@ -393,7 +422,6 @@ fn init_processor() {
     let f1 = cpuid(1, 0);
     let f7 = cpuid(7, 0);
     require(f1[2] & 1 << 21 != 0, "x2APIC");
-    require(f1[2] & 1 << 24 != 0, "the TSC-deadline timer");
     require(f1[2] & 1 << 26 != 0, "XSAVE");
     // SAFETY: boot-time processor setup with interrupts off. Each bit set
     // is one the processor reports supporting.
@@ -458,9 +486,35 @@ fn init_processor() {
         wrmsr(0x835, 0x1_0000); // LINT0 masked
         wrmsr(0x836, 0x400); // LINT1: NMI
         wrmsr(0x837, 0x1_0000); // error LVT masked
-        wrmsr(MSR_X2APIC_LVT_TIMER, TIMER_VECTOR | 0b10 << 17); // TSC-deadline mode
-        wrmsr(MSR_TSC_DEADLINE, 0);
+        if f1[2] & 1 << 24 != 0 {
+            wrmsr(MSR_X2APIC_LVT_TIMER, TIMER_VECTOR | 0b10 << 17); // TSC-deadline mode
+            wrmsr(MSR_TSC_DEADLINE, 0);
+        } else {
+            wrmsr(MSR_X2APIC_TIMER_DIVIDE, 0b1011); // divide by 1
+            wrmsr(MSR_X2APIC_LVT_TIMER, 1 << 16); // masked until calibrated
+        }
     }
+}
+
+/// Without a TSC-deadline timer: measure the local APIC timer against the
+/// timestamp counter and switch it to one-shot mode.
+fn init_oneshot_timer(tsc_hz: u64) {
+    if cpuid(1, 0)[2] & 1 << 24 != 0 {
+        return;
+    }
+    // SAFETY: x2APIC timer registers, present on every x2APIC.
+    let counted = unsafe {
+        wrmsr(MSR_X2APIC_TIMER_COUNT, u32::MAX as u64);
+        let t0 = rdtsc();
+        while rdtsc() - t0 < tsc_hz / 500 {}
+        let left = rdmsr(MSR_X2APIC_TIMER_NOW);
+        wrmsr(MSR_X2APIC_TIMER_COUNT, 0);
+        wrmsr(MSR_X2APIC_LVT_TIMER, TIMER_VECTOR); // one-shot, unmasked
+        u32::MAX as u64 - left
+    };
+    // `counted` ticks in 2 ms.
+    let per_ns = ((counted as u128 * 500) << 32) / 1_000_000_000;
+    kernel().hal.apic_per_ns.set((per_ns as u64).max(1));
 }
 
 /// The frequency of the timestamp counter.
@@ -628,6 +682,7 @@ pub extern "C" fn kmain(info: u64) -> ! {
     k.hal
         .ticks_per_ns
         .set((((hz as u128) << 32) / 1_000_000_000) as u64);
+    init_oneshot_timer(hz);
 
     // SAFETY: loader memory, read-only until the root task owns it.
     let (regions, cmdline, ramdisk) = unsafe {

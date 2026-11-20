@@ -280,6 +280,9 @@ impl<H: Hal> Kernel<H> {
     /// The timer interrupt: note that the slice ended. Expired deadlines are
     /// handled by `schedule`.
     pub fn on_timer(&self) {
+        // The timer is one-shot: having fired, it is no longer armed, and
+        // it may have fired early (an architecture can only count so far).
+        self.timer_at.set(u64::MAX);
         if self.hal.now() >= self.slice_end.get() {
             self.resched.set(true);
         }
