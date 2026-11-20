@@ -53,6 +53,21 @@ impl IpcBuffer {
         unsafe { self.at(i * 8).write_volatile(v) }
     }
 
+    /// Copy `bytes` into the message area starting at byte `offset`.
+    pub fn copy_in(&self, offset: usize, bytes: &[u8]) {
+        assert!(offset.checked_add(bytes.len()).is_some_and(|end| end <= MsgInfo::MAX_WORDS * 8));
+        // SAFETY: the range was just checked to lie in the message area of
+        // the buffer page; `bytes` is ordinary memory elsewhere.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.0.cast::<u8>().add(offset), bytes.len()) }
+    }
+
+    /// Copy from the message area starting at byte `offset` into `out`.
+    pub fn copy_out(&self, offset: usize, out: &mut [u8]) {
+        assert!(offset.checked_add(out.len()).is_some_and(|end| end <= MsgInfo::MAX_WORDS * 8));
+        // SAFETY: as for `copy_in`.
+        unsafe { core::ptr::copy_nonoverlapping(self.0.cast::<u8>().add(offset), out.as_mut_ptr(), out.len()) }
+    }
+
     /// Name the capability to pass as number `i` of the next message that
     /// says it carries more than `i` capabilities.
     pub fn pass(&self, i: usize, cap: Cap, how: Pass) {
