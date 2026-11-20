@@ -39,7 +39,7 @@ impl Src<'_> {
             10 => (b & 15) as u64,
             11 => [12, 13, 16, 21, 6, 3, 2, 1][b as usize & 7],
             12 => VADDRS[b as usize % VADDRS.len()],
-            13 => [KEEP, 0, 1, 3, 5, 7, 15, 0x105, 0x201, 0x300][b as usize % 10],
+            13 => [KEEP, 0, 1, 3, 5, 7, 15, 0x105, 0x401, 0x800, 0x9f4][b as usize % 11],
             14 => (WINDOW + (b & 15) as u64) | NONBLOCK,
             _ => {
                 // A wild value, including the root task's own vital slots.

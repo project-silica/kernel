@@ -253,6 +253,11 @@ fn call_and_reply_carry_message_badge_and_buffer_words() {
     // the spawned thread has none, so the message is cut to four words.
     m.sys(S::Call, [FREE, MsgInfo::new(1, 10).0, 1, 2, 3, 4]);
     assert_eq!(MsgInfo(m.arg(t, 1)).words(), 4);
+    // The descriptor's fields do not run into each other at their limits.
+    let full = MsgInfo::with_caps(0xABCD, 500, 4);
+    assert_eq!((full.label(), full.words(), full.caps()), (0xABCD, 500, 4));
+    assert_eq!(MsgInfo::with_caps(1, 1023, 7).words(), 500);
+    assert_eq!(MsgInfo::with_caps(1, 1023, 7).caps(), 4);
 }
 
 #[test]

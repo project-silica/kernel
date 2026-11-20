@@ -310,12 +310,14 @@ impl Error {
     }
 }
 
-/// The message descriptor word: bits 0..6 the number of message words
-/// (at most [`MsgInfo::MAX_WORDS`]), bits 8..10 the number of capabilities
+/// The message descriptor word: bits 0..9 the number of message words
+/// (at most [`MsgInfo::MAX_WORDS`]), bits 10..12 the number of capabilities
 /// (at most [`MsgInfo::MAX_CAPS`]), bits 16..63 a label the kernel does not
 /// interpret. Words 0..3 travel in registers; the rest in the IPC buffer.
+/// A message is at most 4000 bytes, which is what an IDL message may be
+/// (`spec/IDL.md` section 3); anything larger belongs in a shared Frame.
 ///
-/// The IPC buffer is one page: message words 0..63 at byte 0; at
+/// The IPC buffer is one page: message words 0..499 at byte 0; at
 /// [`IPC_CAPS`] the capabilities a sender passes (a slot index with one of
 /// the `IPC_CAP_` modes in the top four bits); at [`IPC_RECV`] the slots, in
 /// the receiver's own CapSpace, that capabilities it is sent are put in.
@@ -328,7 +330,7 @@ pub struct MsgInfo(pub u64);
 
 impl MsgInfo {
     /// Most words in one message.
-    pub const MAX_WORDS: usize = 64;
+    pub const MAX_WORDS: usize = 500;
     /// Most capabilities in one message.
     pub const MAX_CAPS: usize = 4;
     /// Words carried in registers.
@@ -336,11 +338,11 @@ impl MsgInfo {
 
     /// A descriptor with `label` and `words` message words.
     pub const fn new(label: u64, words: usize) -> MsgInfo {
-        MsgInfo(label << 16 | (words as u64 & 0x7f))
+        MsgInfo(label << 16 | (words as u64 & 0x3ff))
     }
     /// A descriptor with `label`, `words` message words and `caps` capabilities.
     pub const fn with_caps(label: u64, words: usize, caps: usize) -> MsgInfo {
-        MsgInfo(label << 16 | (caps as u64 & 7) << 8 | (words as u64 & 0x7f))
+        MsgInfo(label << 16 | (caps as u64 & 7) << 10 | (words as u64 & 0x3ff))
     }
     /// The label.
     pub const fn label(self) -> u64 {
@@ -348,20 +350,20 @@ impl MsgInfo {
     }
     /// The number of capabilities, clamped to the maximum.
     pub const fn caps(self) -> usize {
-        let n = (self.0 >> 8 & 7) as usize;
+        let n = (self.0 >> 10 & 7) as usize;
         if n > Self::MAX_CAPS { Self::MAX_CAPS } else { n }
     }
     /// The number of message words, clamped to the maximum.
     pub const fn words(self) -> usize {
-        let n = (self.0 & 0x7f) as usize;
+        let n = (self.0 & 0x3ff) as usize;
         if n > Self::MAX_WORDS { Self::MAX_WORDS } else { n }
     }
 }
 
 /// Byte offset in the IPC buffer of the capabilities being sent.
-pub const IPC_CAPS: usize = 512;
+pub const IPC_CAPS: usize = 4000;
 /// Byte offset in the IPC buffer of the slots received capabilities go to.
-pub const IPC_RECV: usize = 544;
+pub const IPC_RECV: usize = 4032;
 /// The slot index part of an entry at [`IPC_CAPS`].
 pub const IPC_CAP_SLOT: u64 = (1 << 60) - 1;
 /// Pass a capability derived from the sender's: the sender can revoke it.
