@@ -102,6 +102,11 @@ impl<H: Hal> Kernel<H> {
         }
         let q = self.queue(cap.obj);
         let head = q.head.get();
+        // Answering a parked call unlinks the caller from the endpoint
+        // its call came through.
+        if q.kind.get() == crate::ipc::PARKED && self.queue(self.thread(head).via.get()).owner.get() != self.hal.cpu() as u64 + 1 {
+            return false;
+        }
         q.owner.get() == self.hal.cpu() as u64 + 1
             && (head == 0 || (self.here(head) && MsgInfo(self.thread(head).regs[H::ARG[1]].get()).caps() == 0))
             && self.here(t)
@@ -173,7 +178,8 @@ impl<H: Hal> Kernel<H> {
         let grant = |cap: &Cap| if cap.rights.has(Rights::GRANT) { IPC_GRANT } else { 0 };
         match s {
             Syscall::Call => {
-                let (_, ep) = self.ccap(t, a[0], ObjectType::Endpoint, Rights::WRITE)?;
+                let (slot, ep) = self.ccap(t, a[0], ObjectType::Endpoint, Rights::WRITE)?;
+                self.thread(t).via_slot.set(slot);
                 self.send(t, ep.obj, ep.badge, IPC_CALL | grant(&ep), true)
             }
             Syscall::Send => {
@@ -182,6 +188,7 @@ impl<H: Hal> Kernel<H> {
                 if !cap.rights.has(Rights::WRITE) {
                     return Err(Error::NoRights);
                 }
+                self.thread(t).via_slot.set(slot);
                 match cap.ty {
                     ObjectType::Endpoint => self.send(t, cap.obj, cap.badge, grant(&cap), a[0] & NONBLOCK == 0),
                     // A capability without a badge signals bit 0.
@@ -457,6 +464,7 @@ impl<H: Hal> Kernel<H> {
         if !cap.rights.has(Rights::READ) {
             return Err(Error::NoRights);
         }
+        self.thread(t).via_slot.set(slot);
         match cap.ty {
             ObjectType::Endpoint => self.recv(t, cap.obj, deadline, park),
             ObjectType::Notification => self.wait(t, cap.obj, deadline),
@@ -530,6 +538,8 @@ pub struct ThreadView {
     pub blocked_on: Paddr,
     /// The thread it owes a reply (0: none).
     pub caller: Paddr,
+    /// The processor it runs on.
+    pub cpu: usize,
 }
 
 impl<H: Hal> Kernel<H> {
@@ -551,7 +561,63 @@ impl<H: Hal> Kernel<H> {
     /// The state of the thread object at `t` (from a Thread capability).
     pub fn thread_view(&self, t: Paddr) -> ThreadView {
         let th = self.thread(t);
-        ThreadView { state: th.state.get(), slots: Thread::embedded_slots(t), blocked_on: th.blocked_on.get(), caller: th.caller.get() }
+        ThreadView {
+            state: th.state.get(),
+            slots: Thread::embedded_slots(t),
+            blocked_on: th.blocked_on.get(),
+            caller: th.caller.get(),
+            cpu: th.cpu.get() as usize,
+        }
+    }
+
+    /// Check the waiting lists of the endpoint or notification at `q`
+    /// (from a capability to it) for consistency: every thread queued
+    /// there waits on it, every delivered call is linked to it, and each
+    /// of them came through a slot that still holds a capability to it.
+    /// For tests and fuzzing; says what is wrong.
+    pub fn check_queue(&self, q: Paddr) -> Result<(), &'static str> {
+        use crate::thread::{RECEIVING, REPLY, SENDING};
+        let qu = self.queue(q);
+        let through = |t: Paddr| {
+            let s = self.thread(t).via_slot.get();
+            s == 0 || self.slot(s).cap().is_some_and(|c| c.obj == q)
+        };
+        let (mut t, mut prev) = (qu.head.get(), 0);
+        if qu.kind.get() == crate::ipc::PARKED {
+            let th = self.thread(t);
+            if t == 0 || qu.tail.get() != t || th.state.get() != REPLY || th.blocked_on.get() != q || th.via.get() == 0 {
+                return Err("a notification marked as holding a parked call does not hold one");
+            }
+        } else {
+            while t != 0 {
+                let th = self.thread(t);
+                if !matches!(th.state.get(), SENDING | RECEIVING) || th.blocked_on.get() != q || th.qprev.get() != prev {
+                    return Err("a queued thread does not wait on the queue it is linked in");
+                }
+                if !through(t) {
+                    return Err("a thread waits through a slot that no longer holds the capability");
+                }
+                (prev, t) = (t, th.qnext.get());
+            }
+            if qu.tail.get() != prev || (prev == 0) != (qu.kind.get() == 0) {
+                return Err("the queue's tail or kind does not match its contents");
+            }
+        }
+        let (mut c, mut prev) = (qu.pend_head.get(), 0);
+        while c != 0 {
+            let ct = self.thread(c);
+            if ct.state.get() != REPLY || ct.via.get() != q || ct.qprev.get() != prev {
+                return Err("a call in progress is not linked to its endpoint");
+            }
+            if !through(c) {
+                return Err("a call in progress came through a slot that no longer holds the capability");
+            }
+            (prev, c) = (c, ct.qnext.get());
+        }
+        if qu.pend_tail.get() != prev {
+            return Err("the list of calls in progress has the wrong tail");
+        }
+        Ok(())
     }
 
     /// Whether any thread of this processor can run now or will be woken by a deadline.

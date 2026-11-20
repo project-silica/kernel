@@ -141,8 +141,10 @@ pub fn run(data: &[u8]) {
         m.raw(n, a);
     }
 
-    m.settle(1);
-    m.settle(0);
+    // The root task finishes on whichever processor it was last moved to.
+    let home = m.k.thread_view(m.root).cpu;
+    m.settle(1 - home);
+    m.settle(home);
     // The root task may have destroyed itself (it holds the capabilities to
     // do so); then there is nobody left to ask and the run ends here.
     let rv = m.k.thread_view(m.root);
@@ -159,6 +161,11 @@ pub fn run(data: &[u8]) {
     for i in 1..4096 {
         let s = m.k.slot_addr(&m.cs, i).unwrap();
         let Some(v) = m.k.view(s) else { continue };
+        if matches!(v.cap.ty, T::Endpoint | T::Notification)
+            && let Err(what) = m.k.check_queue(v.cap.obj)
+        {
+            panic!("slot {i}, {:?}: {what}", v.cap);
+        }
         if v.next != 0 {
             let n = m.k.view(v.next).expect("next link points at an empty slot");
             assert_eq!(n.prev, s, "slot {i}: next.prev");
@@ -193,6 +200,6 @@ pub fn run(data: &[u8]) {
     m.retype(ut, T::Frame, d.bits as u64, free, 1);
     assert!(m.k.can_run());
     // Nothing is left on the other processor: its threads came from the Untyped.
-    m.on(1);
-    assert_eq!(m.k.current(), 0, "a thread from the revoked Untyped still runs on processor 1");
+    m.on(1 - home);
+    assert_eq!(m.k.current(), 0, "a thread from the revoked Untyped still runs on the other processor");
 }

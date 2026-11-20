@@ -271,8 +271,10 @@ pub enum Error {
     WouldBlock = 10,
     /// The deadline passed.
     Timeout = 11,
-    /// The object the thread was waiting on, or the thread that owed it a
-    /// reply, was destroyed.
+    /// The thread was waiting and can no longer be served: the capability
+    /// it sent, called or received through left its slot (deleted, revoked
+    /// or moved), the object was destroyed, or the thread that owed it a
+    /// reply was destroyed or took another call without answering.
     Gone = 12,
     /// There is no caller to reply to.
     NoCaller = 13,

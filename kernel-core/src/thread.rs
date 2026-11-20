@@ -38,6 +38,9 @@ pub(crate) const IPC_CALL: u64 = 1;
 pub(crate) const IPC_FAULT: u64 = 2;
 /// `ipc_flags`: the capability used to send may pass capabilities.
 pub(crate) const IPC_GRANT: u64 = 4;
+/// `ipc_flags`: the call was delivered and waits parked on a notification
+/// (`blocked_on`), not for a server thread's reply.
+pub(crate) const IPC_PARKED: u64 = 8;
 
 /// A thread object. The first [`FPU_OFFSET`] bytes are this structure; the
 /// rest of the 4 KiB object is the extended-state save area.
@@ -65,9 +68,13 @@ pub struct Thread {
     pub(crate) reap_next: Cell<u64>,
     /// The processor this thread runs on.
     pub(crate) cpu: Cell<u64>,
-    /// While waiting for a server's reply: the endpoint the call went
+    /// While a call is delivered and unanswered: the endpoint it went
     /// through, on whose list of calls in progress this thread is linked.
     pub(crate) via: Cell<Paddr>,
+    /// The capability slot the thread's last send, call or receive went
+    /// through (0: none, a fault report). When the capability leaves that
+    /// slot while the thread still waits, the operation fails with `Gone`.
+    pub(crate) via_slot: Cell<Paddr>,
     /// While receiving: the slot of a notification to park the next call on.
     pub(crate) park: Cell<u64>,
 }
@@ -262,16 +269,7 @@ impl<H: Hal> Kernel<H> {
                 }
             }
             REPLY => {
-                if th.via.get() != 0 {
-                    // Waiting for a server thread's reply.
-                    self.unpend(t);
-                    self.thread(on).caller.set(0);
-                } else {
-                    // Parked on a notification.
-                    let q = self.queue(on);
-                    self.q_remove(&q.head, &q.tail, t);
-                    q.kind.set(0);
-                }
+                self.unanswer(t);
                 if th.ipc_flags.get() & IPC_FAULT == 0 {
                     th.regs[H::SYS].set(Error::Gone as u64);
                 }
@@ -284,13 +282,26 @@ impl<H: Hal> Kernel<H> {
         cpu.dirty.set(true);
     }
 
-    /// Fail the thread waiting for `server`'s reply, if any.
-    pub(crate) fn drop_caller(&self, server: Paddr) {
-        let c = self.thread(server).caller.replace(0);
-        if c == 0 {
-            return;
-        }
+    /// Unlink `c`, whose call was delivered and is unanswered, from the
+    /// endpoint's list of calls in progress and from whoever owes the answer.
+    pub(crate) fn unanswer(&self, c: Paddr) {
+        let ct = self.thread(c);
         self.unpend(c);
+        let on = ct.blocked_on.get();
+        if ct.ipc_flags.get() & IPC_PARKED != 0 {
+            let q = self.queue(on);
+            q.head.set(0);
+            q.tail.set(0);
+            q.kind.set(0);
+        } else {
+            self.thread(on).caller.set(0);
+        }
+    }
+
+    /// Fail the delivered, unanswered call of `c` with `Gone`. (A thread
+    /// whose fault report is the call stays stopped.)
+    pub(crate) fn abort_call(&self, c: Paddr) {
+        self.unanswer(c);
         let ct = self.thread(c);
         if ct.ipc_flags.replace(0) & IPC_FAULT != 0 {
             ct.blocked_on.set(0);
@@ -298,6 +309,47 @@ impl<H: Hal> Kernel<H> {
             self.home(c).dirty.set(true);
         } else {
             self.wake(c, Err(Error::Gone));
+        }
+    }
+
+    /// Fail the thread waiting for `server`'s reply, if any.
+    pub(crate) fn drop_caller(&self, server: Paddr) {
+        let c = self.thread(server).caller.get();
+        if c != 0 {
+            self.abort_call(c);
+        }
+    }
+
+    /// The capability in `slot`, to the endpoint or notification `q`, is
+    /// leaving the slot while the object lives on: every operation made
+    /// through that capability and still waiting fails with `Gone` (a
+    /// queued send or call, a receive, a call delivered and unanswered).
+    pub(crate) fn revoke_waiters(&self, slot: Paddr, q: Paddr) {
+        let qu = self.queue(q);
+        if qu.kind.get() != crate::ipc::PARKED {
+            let mut t = qu.head.get();
+            while t != 0 {
+                let th = self.thread(t);
+                let next = th.qnext.get();
+                if th.via_slot.get() == slot {
+                    self.q_remove(&qu.head, &qu.tail, t);
+                    th.ipc_flags.set(0);
+                    self.wake(t, Err(Error::Gone));
+                }
+                t = next;
+            }
+            if qu.head.get() == 0 {
+                qu.kind.set(0);
+            }
+        }
+        let mut c = qu.pend_head.get();
+        while c != 0 {
+            let ct = self.thread(c);
+            let next = ct.qnext.get();
+            if ct.via_slot.get() == slot {
+                self.abort_call(c);
+            }
+            c = next;
         }
     }
 
@@ -318,6 +370,10 @@ impl<H: Hal> Kernel<H> {
     /// waiting on it fails with `Gone`.
     pub(crate) fn finalise_queue(&self, q: Paddr) {
         let qu = self.queue(q);
+        if qu.kind.get() == crate::ipc::PARKED {
+            // The call parked here can no longer be answered.
+            self.abort_call(qu.head.get());
+        }
         loop {
             let t = self.q_pop(&qu.head, &qu.tail);
             if t == 0 {
@@ -350,8 +406,7 @@ impl<H: Hal> Kernel<H> {
             if c == 0 {
                 break;
             }
-            let server = self.thread(c).blocked_on.get();
-            self.drop_caller(server);
+            self.abort_call(c);
         }
     }
 

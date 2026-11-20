@@ -3,14 +3,14 @@
 use crate::hal::Hal;
 use crate::kernel::{Exit, Kernel};
 use crate::mem::Paddr;
-use crate::thread::{INACTIVE, IPC_CALL, IPC_FAULT, IPC_GRANT, RECEIVING, REPLY, SENDING};
+use crate::thread::{INACTIVE, IPC_CALL, IPC_FAULT, IPC_GRANT, IPC_PARKED, RECEIVING, REPLY, SENDING};
 use silica_abi::{Error, FAULT_LABEL, FAULT_MAP, FAULT_RESUME, Fault, MsgInfo, ObjectType, Rights};
 
 const SENDERS: u64 = 1;
 const RECEIVERS: u64 = 2;
 
 /// The queue holds one call waiting for its answer (a parked caller).
-const PARKED: u64 = 3;
+pub(crate) const PARKED: u64 = 3;
 
 impl<H: Hal> Kernel<H> {
     fn ipc_buffer(&self, t: Paddr) -> Option<Paddr> {
@@ -87,6 +87,18 @@ impl<H: Hal> Kernel<H> {
     /// and any thread holding that notification can answer by sending to it;
     /// otherwise the caller waits for the server's `ReplyRecv`.
     fn await_reply(&self, caller: Paddr, server: Paddr, ep: Paddr) {
+        // Linked on the endpoint, so destroying it, or revoking the
+        // capability the call came through, finds the call.
+        let q = self.queue(ep);
+        self.q_push(&q.pend_head, &q.pend_tail, caller);
+        let ct = self.thread(caller);
+        ct.via.set(ep);
+        // A caller that gave away the very capability it called through
+        // (in this message) is tied to no slot any more.
+        let vs = ct.via_slot.get();
+        if vs != 0 && !self.slot(vs).cap().is_some_and(|c| c.obj == ep) {
+            ct.via_slot.set(0);
+        }
         let park = self.thread(server).park.replace(0);
         if park != 0
             && let Some(n) = self.cslot(server, park).ok().and_then(|s| self.slot(s).cap())
@@ -97,25 +109,25 @@ impl<H: Hal> Kernel<H> {
             // A notification nobody waits on and nobody owns yet, or one
             // this processor already owns.
             if q.head.get() == 0 && q.word.get() == 0 && (q.owner.claim(cpu) || self.global.get()) {
+                // One call at most is parked on a notification, so it is
+                // the whole queue; the caller's links stay the endpoint's.
                 q.kind.set(PARKED);
-                self.q_push(&q.head, &q.tail, caller);
-                self.thread(caller).via.set(0);
+                q.head.set(caller);
+                q.tail.set(caller);
+                let ct = self.thread(caller);
+                ct.ipc_flags.set(ct.ipc_flags.get() | IPC_PARKED);
                 self.block(caller, REPLY, n.obj, 0);
                 return;
             }
         }
         self.drop_caller(server);
         self.thread(server).caller.set(caller);
-        // Linked on the endpoint, so destroying the endpoint finds the call.
-        let q = self.queue(ep);
-        self.q_push(&q.pend_head, &q.pend_tail, caller);
-        self.thread(caller).via.set(ep);
         // Keeps the IPC_FAULT flag: the reply path needs it.
         self.block(caller, REPLY, server, 0);
     }
 
-    /// Take `caller` (waiting for a server's reply) off its endpoint's list
-    /// of calls in progress.
+    /// Take `caller` (its call delivered and unanswered) off its endpoint's
+    /// list of calls in progress.
     pub(crate) fn unpend(&self, caller: Paddr) {
         let ep = self.thread(caller).via.replace(0);
         if ep != 0 {
@@ -304,16 +316,9 @@ impl<H: Hal> Kernel<H> {
             let (fs, _) = self.ccap(t, word(2), ObjectType::Frame, Rights::NONE)?;
             self.map(asp.obj, fs, word(3) & !0xFFF, Rights(word(3) as u8 & 0xF))?;
         }
-        // Off whatever it waits on: the endpoint's list of calls in
-        // progress, or the notification it is parked on.
-        if ct.via.get() != 0 {
-            self.unpend(c);
-            self.thread(ct.blocked_on.get()).caller.set(0);
-        } else {
-            let q = self.queue(ct.blocked_on.get());
-            self.q_remove(&q.head, &q.tail, c);
-            q.kind.set(0);
-        }
+        // Off the endpoint's list of calls in progress and off the thread
+        // or notification the answer was owed by.
+        self.unanswer(c);
         ct.ipc_flags.set(0);
         if fault {
             if word(0) == FAULT_RESUME || word(0) == FAULT_MAP {
@@ -367,6 +372,7 @@ impl<H: Hal> Kernel<H> {
         th.fault[2].set(code);
         match th.fault_ep.cap() {
             Some(c) if c.ty == ObjectType::Endpoint => {
+                self.thread(t).via_slot.set(0);
                 let _ = self.send(t, c.obj, c.badge, IPC_CALL | IPC_FAULT, true);
             }
             _ => {

@@ -904,3 +904,96 @@ fn inspect_shows_slots_and_threads_without_changing_them() {
     m.ok(S::Inspect, [FREE + 2, 0, 0, 0, 0, 0]);
     assert_eq!([m.arg(m.root, 0), m.arg(m.root, 1), m.arg(m.root, 4)], [silica_abi::THREAD_RECEIVING, 0, ep.obj]);
 }
+
+#[test]
+fn revoking_a_capability_fails_what_waits_through_it_and_nothing_else() {
+    let (m, t) = pair();
+    let (ut, _) = m.big_untyped();
+    let t2 = m.spawn(ut, FREE + 5);
+    let regrant = |m: &Machine| m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 15, 77, 0]);
+    // A second client capability, a sibling of the first: its users are untouched.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 20, FREE, 15, 78, 0]);
+
+    // 1. A call still queued (no receiver yet): revoking the caller's
+    // capability takes it out of the queue with `Gone`.
+    assert!(m.sys(S::Call, [FREE + 1, 0, 1, 0, 0, 0]).blocked);
+    assert!(m.sys_as(t2, S::Call, [FREE + 20, 0, 2, 0, 0, 0]).blocked);
+    assert_eq!(m.sys_as(t, S::CapRevoke, [FREE, 0, 0, 0, 0, 0]).status, 0);
+    for c in [m.root, t2] {
+        assert_eq!((m.k.thread_view(c).state, Error::result(m.status(c))), (RUNNABLE, Err(Error::Gone)));
+    }
+    // The endpoint itself lives on and nothing is left queued on it.
+    assert_eq!(Error::result(m.sys_as(t, S::Recv, [FREE, 1, 0, 0, 0, 0]).status), Err(Error::WouldBlock));
+
+    // 2. A call delivered and held by the server: deleting the caller's
+    // capability fails the call on both sides. The other caller, queued
+    // through a different capability, is delivered next.
+    regrant(&m);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 20, FREE, 15, 78, 0]);
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
+    assert!(m.sys(S::Call, [FREE + 1, 0, 3, 0, 0, 0]).blocked);
+    assert!(m.sys_as(t2, S::Call, [FREE + 20, 0, 4, 0, 0, 0]).blocked);
+    assert_eq!(m.k.thread_view(t).caller, m.root);
+    assert_eq!(m.sys_as(t, S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]).status, 0);
+    assert_eq!((m.k.thread_view(m.root).state, Error::result(m.status(m.root))), (RUNNABLE, Err(Error::Gone)));
+    assert_eq!(m.k.thread_view(t).caller, 0);
+    assert_eq!(Error::result(m.sys_as(t, S::ReplyRecv, [0, 0, 9, 0, 0, 0]).status), Err(Error::NoCaller));
+    assert_eq!(m.k.thread_view(t2).state, SENDING, "a call through another capability still waits");
+    let r = m.sys_as(t, S::Recv, [FREE, 0, 0, 0, 0, 0]);
+    assert_eq!((r.status, m.arg(t, 0), m.arg(t, 2)), (0, 78, 4));
+    m.sys_as(t, S::ReplyRecv, [0, 0, 5, 0, 0, 0]);
+    assert_eq!((m.status(t2), m.arg(t2, 2)), (0, 5));
+
+    // 3. The same slot granted again is a working capability again.
+    regrant(&m);
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
+    assert!(m.sys(S::Call, [FREE + 1, 0, 6, 0, 0, 0]).blocked);
+    m.sys_as(t, S::ReplyRecv, [0, 0, 7, 0, 0, 0]);
+    assert_eq!((m.status(m.root), m.arg(m.root, 2)), (0, 7));
+
+    // 4. A parked call: revoking the capability it came through fails it
+    // and frees the notification it was parked on.
+    m.retype(ut, T::Notification, 0, FREE + 10, 1);
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, FREE + 10, 0, 0, 0]).blocked);
+    assert!(m.sys(S::Call, [FREE + 1, 0, 8, 0, 0, 0]).blocked);
+    assert_eq!(m.sys_as(t, S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]).status, 0);
+    assert_eq!((m.k.thread_view(m.root).state, Error::result(m.status(m.root))), (RUNNABLE, Err(Error::Gone)));
+    m.ok(S::Send, [FREE + 10, 0, 0, 0, 0, 0]);
+    m.ok(S::Recv, [FREE + 10, 1, 0, 0, 0, 0]);
+    // A parked call also fails when its endpoint is destroyed (step 6).
+    regrant(&m);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 30, FREE, 15, 0, 1]);
+    m.retype(ut, T::Notification, 0, FREE + 12, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 13, FREE + 12, 15, 0, 0]);
+    let t3 = m.spawn(ut, FREE + 40);
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, FREE + 10, 0, 0, 0]).blocked);
+    assert!(m.sys(S::Call, [FREE + 1, 0, 8, 0, 0, 0]).blocked);
+
+    // 5. A receiver whose capability goes stops waiting; one that waits
+    // through another capability to the same endpoint does not.
+    assert!(m.sys_as(t, S::Recv, [FREE + 30, 0, 0, 0, 0, 0]).blocked);
+    assert!(m.sys_as(t2, S::Recv, [FREE + 13, 0, 0, 0, 0, 0]).blocked);
+    assert_eq!(m.sys_as(t3, S::CapDelete, [FREE + 13, 0, 0, 0, 0, 0]).status, 0);
+    assert_eq!((m.k.thread_view(t2).state, Error::result(m.status(t2))), (RUNNABLE, Err(Error::Gone)));
+    assert_eq!(m.k.thread_view(t).state, RECEIVING);
+    assert_eq!(m.sys_as(t3, S::CapDelete, [FREE + 30, 0, 0, 0, 0, 0]).status, 0);
+    assert_eq!((m.k.thread_view(t).state, Error::result(m.status(t))), (RUNNABLE, Err(Error::Gone)));
+
+    // 6. Destroying the endpoint (revoking the original capability, then
+    // deleting it) fails the parked call and frees the notification.
+    assert_eq!(m.k.thread_view(m.root).state, REPLY);
+    m.sys_as(t3, S::CapRevoke, [FREE, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        (m.k.thread_view(m.root).state, Error::result(m.status(m.root))),
+        (RUNNABLE, Err(Error::Gone)),
+        "its capability was revoked"
+    );
+    m.ok(S::Send, [FREE + 10, 0, 0, 0, 0, 0]);
+    m.ok(S::Recv, [FREE + 10, 1, 0, 0, 0, 0]);
+}
+
+/// Inputs the syscall fuzzer once failed on, kept as seeds and replayed here.
+#[test]
+fn syscall_sequences_the_fuzzer_found_keep_the_kernel_invariants() {
+    support::fuzz::run(include_bytes!("../fuzz/corpus/syscalls/root-moved-to-the-other-processor"));
+}

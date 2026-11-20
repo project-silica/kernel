@@ -190,6 +190,9 @@ impl<H: Hal> Kernel<H> {
         }
         slot.wipe();
         if !last {
+            if matches!(cap.ty, ObjectType::Endpoint | ObjectType::Notification) {
+                self.revoke_waiters(s, cap.obj);
+            }
             return;
         }
         match cap.ty {
@@ -295,6 +298,11 @@ impl<H: Hal> Kernel<H> {
             if mn != 0 {
                 self.slot(mn).mprev.set(dst);
             }
+        }
+        // Whoever waits through the capability waits through this slot,
+        // which no longer holds it.
+        if let Some(c) = s.cap().filter(|c| matches!(c.ty, ObjectType::Endpoint | ObjectType::Notification)) {
+            self.revoke_waiters(src, c.obj);
         }
         s.wipe();
     }
