@@ -150,10 +150,14 @@ impl<'a> Elf<'a> {
             if u32_at(f, o) != Some(PT_DYNAMIC) {
                 continue;
             }
-            let off = u64_at(f, o + 8).unwrap_or(0) as usize;
-            let n = u64_at(f, o + 32).unwrap_or(0) as usize / 16;
-            for j in 0..n {
-                let (Some(tag), Some(val)) = (u64_at(f, off + j * 16), u64_at(f, off + j * 16 + 8)) else {
+            // The dynamic section: (tag, value) pairs inside the file.
+            let off = usize::try_from(u64_at(f, o + 8).unwrap_or(0)).unwrap_or(usize::MAX);
+            let len = usize::try_from(u64_at(f, o + 32).unwrap_or(0)).unwrap_or(usize::MAX);
+            let Some(dynamic) = off.checked_add(len).and_then(|end| f.get(off..end)) else {
+                continue;
+            };
+            for pair in dynamic.as_chunks::<16>().0 {
+                let (Some(tag), Some(val)) = (u64_at(pair, 0), u64_at(pair, 8)) else {
                     break;
                 };
                 match tag {
@@ -166,8 +170,8 @@ impl<'a> Elf<'a> {
         }
         // DT_RELA is a virtual address; find its file offset through the segments.
         let table = self.segments().find_map(|s| {
-            let o = rela.checked_sub(s.vaddr)? as usize;
-            s.data.get(o..o.checked_add(relasz as usize)?)
+            let o = usize::try_from(rela.checked_sub(s.vaddr)?).ok()?;
+            s.data.get(o..o.checked_add(usize::try_from(relasz).ok()?)?)
         });
         let table = if relasz == 0 { Some(&f[..0]) } else { table };
         let count = table.map_or(1, |t| t.len() / 24);

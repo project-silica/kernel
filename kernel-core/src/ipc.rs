@@ -4,7 +4,7 @@ use crate::hal::Hal;
 use crate::kernel::{Exit, Kernel};
 use crate::mem::Paddr;
 use crate::thread::{INACTIVE, IPC_CALL, IPC_FAULT, RECEIVING, REPLY, SENDING};
-use silica_abi::{Error, FAULT_LABEL, FAULT_RESUME, Fault, MsgInfo, ObjectType};
+use silica_abi::{Error, FAULT_LABEL, FAULT_MAP, FAULT_RESUME, Fault, MsgInfo, ObjectType, Rights};
 
 const SENDERS: u64 = 1;
 const RECEIVERS: u64 = 2;
@@ -152,25 +152,41 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// Answer the call `t` received last. Returns whether there was a caller.
-    pub(crate) fn reply(&self, t: Paddr) -> bool {
+    ///
+    /// The answer to a fault can carry the cure: with word 0 `FAULT_MAP` the
+    /// kernel maps a frame (words 1 to 3: address space, frame, address with
+    /// rights in its low bits; capabilities of the replying thread) and then
+    /// resumes the thread. If the mapping fails the error goes to the
+    /// replying thread and the fault stays unanswered.
+    pub(crate) fn reply(&self, t: Paddr) -> Result<bool, Error> {
         let th = self.thread(t);
-        let c = th.caller.replace(0);
+        let c = th.caller.get();
         if c == 0 {
-            return false;
+            return Ok(false);
         }
         let ct = self.thread(c);
-        if ct.ipc_flags.replace(0) & IPC_FAULT != 0 {
-            if th.regs[H::ARG[2]].get() == FAULT_RESUME {
+        let fault = ct.ipc_flags.get() & IPC_FAULT != 0;
+        let word = |i: usize| th.regs[H::ARG[2 + i]].get();
+        if fault && word(0) == FAULT_MAP {
+            let (_, asp) = self.ccap(t, word(1), ObjectType::AddressSpace, Rights::WRITE)?;
+            let (fs, _) = self.ccap(t, word(2), ObjectType::Frame, Rights::NONE)?;
+            self.map(asp.obj, fs, word(3) & !0xFFF, Rights(word(3) as u8 & 0xF))?;
+        }
+        th.caller.set(0);
+        ct.ipc_flags.set(0);
+        if fault {
+            if word(0) == FAULT_RESUME || word(0) == FAULT_MAP {
                 self.make_runnable(c);
             } else {
                 ct.blocked_on.set(0);
                 ct.state.set(INACTIVE);
+                self.dirty.set(true);
             }
-            return true;
+            return Ok(true);
         }
         self.transfer(t, c, 0);
         self.wake(c, Ok(()));
-        true
+        Ok(true)
     }
 
     /// The current thread took a fault it cannot continue from. The fault is

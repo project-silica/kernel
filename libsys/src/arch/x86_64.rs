@@ -8,10 +8,17 @@ use core::arch::asm;
 /// arguments: the kernel validates every one. The typed wrappers in the
 /// crate root mark the operations that can pull memory or a stack out from
 /// under running code as `unsafe`.
+///
+/// Register contract: the kernel preserves the general registers a function
+/// call preserves (rbx, rbp, rsp, r12 to r15), MXCSR and the x87 control
+/// word. Like a function call, it does not preserve vector or x87 data
+/// registers; that is what lets a switch to another thread inside a call
+/// skip saving them.
 pub fn syscall(n: u64, a: [u64; 6]) -> (u64, [u64; 6]) {
     let (status, a0, a1, a2, a3, a4, a5): (u64, u64, u64, u64, u64, u64, u64);
-    // SAFETY: the kernel preserves every register except rax and the six
-    // argument registers, and `syscall` itself clobbers rcx and r11.
+    // SAFETY: every register the kernel may change is declared: the result
+    // registers explicitly, the rest through the calling convention's
+    // caller-saved set (which includes rcx and r11, used by `syscall` itself).
     unsafe {
         asm!(
             "syscall",
@@ -22,8 +29,7 @@ pub fn syscall(n: u64, a: [u64; 6]) -> (u64, [u64; 6]) {
             inout("r10") a[3] => a3,
             inout("r8") a[4] => a4,
             inout("r9") a[5] => a5,
-            out("rcx") _,
-            out("r11") _,
+            clobber_abi("sysv64"),
             options(nostack),
         );
     }

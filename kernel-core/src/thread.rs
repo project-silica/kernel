@@ -176,6 +176,7 @@ impl<H: Hal> Kernel<H> {
     pub(crate) fn block(&self, t: Paddr, state: u64, on: Paddr, deadline: u64) {
         let th = self.thread(t);
         th.state.set(state);
+        self.dirty.set(true);
         th.blocked_on.set(on);
         if deadline != 0 {
             self.timer_insert(t, deadline);
@@ -188,6 +189,7 @@ impl<H: Hal> Kernel<H> {
         let th = self.thread(t);
         th.blocked_on.set(0);
         th.state.set(RUNNABLE);
+        self.dirty.set(true);
         if t != self.cur.get() {
             self.q_push(&self.rq_head, &self.rq_tail, t);
         }
@@ -230,6 +232,7 @@ impl<H: Hal> Kernel<H> {
         th.ipc_flags.set(0);
         th.blocked_on.set(0);
         th.state.set(INACTIVE);
+        self.dirty.set(true);
     }
 
     /// Fail the thread waiting for `server`'s reply, if any.
@@ -242,6 +245,7 @@ impl<H: Hal> Kernel<H> {
         if ct.ipc_flags.replace(0) & IPC_FAULT != 0 {
             ct.blocked_on.set(0);
             ct.state.set(INACTIVE);
+            self.dirty.set(true);
         } else {
             self.wake(c, Err(Error::Gone));
         }
@@ -270,6 +274,7 @@ impl<H: Hal> Kernel<H> {
                 self.timer_remove(t);
                 th.blocked_on.set(0);
                 th.state.set(INACTIVE);
+                self.dirty.set(true);
             } else {
                 self.wake(t, Err(Error::Gone));
             }
@@ -284,6 +289,7 @@ impl<H: Hal> Kernel<H> {
         // have fired early: it is only ever reprogrammed to fire sooner.
         self.timer_at.set(u64::MAX);
         self.tick.set(true);
+        self.dirty.set(true);
     }
 
     /// Wake every thread whose deadline has passed and note the end of the slice.
@@ -310,6 +316,7 @@ impl<H: Hal> Kernel<H> {
         let th = self.thread(t);
         th.blocked_on.set(0);
         th.state.set(RUNNABLE);
+        self.dirty.set(true);
         if self.direct.get() == 0 && t != self.cur.get() {
             self.direct.set(t);
         } else if t != self.cur.get() {
@@ -321,6 +328,11 @@ impl<H: Hal> Kernel<H> {
     /// way out of the kernel; when it returns, [`Kernel::current`] is
     /// runnable and loaded.
     pub fn schedule(&self) {
+        // Most kernel entries change nothing the scheduler cares about.
+        if !self.dirty.get() {
+            debug_assert!(self.settled(), "scheduling state changed without `dirty` being set");
+            return;
+        }
         loop {
             if self.tick.replace(false) {
                 self.expire();
@@ -364,6 +376,22 @@ impl<H: Hal> Kernel<H> {
             self.loaded.set(cur);
             self.loaded_root.set(root);
         }
+        self.dirty.set(false);
+    }
+
+    /// Whether the scheduler would decide what it decided last time: the
+    /// claim `dirty == false` makes, checked in debug builds.
+    fn settled(&self) -> bool {
+        let cur = self.cur.get();
+        cur != 0
+            && self.thread(cur).state.get() == RUNNABLE
+            && !self.tick.get()
+            && !self.resched.get()
+            && self.direct.get() == 0
+            && self.loaded.get() == cur
+            && self.loaded_root.get() == self.thread(cur).aspace.cap().map_or(0, |c| c.obj + 4096)
+            && (self.rq_head.get() == 0 || self.timer_at.get() <= self.slice_end.get())
+            && (self.timers.get() == 0 || self.timer_at.get() <= self.thread(self.timers.get()).deadline.get())
     }
 
     /// Make sure the timer fires no later than the next deadline or the end

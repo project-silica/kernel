@@ -37,6 +37,9 @@ pub struct Kernel<H: Hal> {
     pub(crate) tick: Cell<bool>,
     /// The thread to switch to directly at the end of this kernel entry.
     pub(crate) direct: Cell<Paddr>,
+    /// Something changed that the scheduler must look at on the way out.
+    /// While it is false the current thread simply continues.
+    pub(crate) dirty: Cell<bool>,
     pub(crate) reap: Cell<u64>,
 }
 
@@ -57,6 +60,7 @@ impl<H: Hal> Kernel<H> {
             resched: Cell::new(false),
             tick: Cell::new(false),
             direct: Cell::new(0),
+            dirty: Cell::new(true),
             reap: Cell::new(0),
         }
     }
@@ -78,7 +82,7 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// The capability at `index`, which must be of type `ty` and carry `rights`.
-    fn ccap(&self, t: Paddr, index: u64, ty: ObjectType, rights: Rights) -> Result<(Paddr, Cap), Error> {
+    pub(crate) fn ccap(&self, t: Paddr, index: u64, ty: ObjectType, rights: Rights) -> Result<(Paddr, Cap), Error> {
         let s = self.cslot(t, index)?;
         let cap = self.slot(s).cap().ok_or(Error::BadCap)?;
         if cap.ty != ty {
@@ -94,7 +98,8 @@ impl<H: Hal> Kernel<H> {
     pub fn syscall(&self) {
         let t = self.cur.get();
         let r = &self.thread(t).regs;
-        let a = [0, 1, 2, 3, 4, 5].map(|i| r[H::ARG[i]].get());
+        let g = |i: usize| r[H::ARG[i]].get();
+        let a = [g(0), g(1), g(2), g(3), g(4), g(5)];
         let res = match Syscall::from_u64(r[H::SYS].get()) {
             Some(s) => self.dispatch(s, t, a),
             None => Err(Error::BadSyscall),
@@ -132,7 +137,7 @@ impl<H: Hal> Kernel<H> {
             Syscall::Recv => self.recv_any(t, a[0], a[1]),
             Syscall::ReplyRecv => {
                 let caller = self.thread(t).caller.get();
-                let replied = self.reply(t);
+                let replied = self.reply(t)?;
                 if a[0] == 0 {
                     return if replied { Ok(Exit::Done) } else { Err(Error::NoCaller) };
                 }
@@ -146,6 +151,7 @@ impl<H: Hal> Kernel<H> {
             }
             Syscall::Yield => {
                 self.resched.set(true);
+                self.dirty.set(true);
                 Ok(Exit::Done)
             }
             Syscall::Retype => {
@@ -219,6 +225,7 @@ impl<H: Hal> Kernel<H> {
                     }
                     src[i] = s;
                 }
+                self.dirty.set(true);
                 let slots = Thread::embedded_slots(th.obj);
                 for i in 0..4 {
                     if a[i + 1] == KEEP {

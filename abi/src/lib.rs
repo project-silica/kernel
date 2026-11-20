@@ -15,6 +15,11 @@ pub mod root;
 /// roles): number in `rax`, arguments `a0..a5` in `rdi rsi rdx r10 r8 r9`.
 /// On return `rax` holds an [`Error`] code (0 is success) and results come
 /// back in the argument registers as documented per call.
+///
+/// A system call preserves what a function call preserves: `rbx`, `rbp`,
+/// `rsp`, `r12`..`r15`, MXCSR and the x87 control word. Vector and x87 data
+/// registers are not preserved (they come back cleared or unchanged, never
+/// holding another thread's data).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub enum Syscall {
@@ -287,7 +292,8 @@ impl MsgInfo {
 /// Label of a fault message, sent on behalf of a faulting thread to its
 /// fault endpoint as a call. Words: 0 instruction pointer, 1 fault address,
 /// 2 architecture error code, 3 stack pointer. Replying resumes the thread
-/// when reply word 0 is [`FAULT_RESUME`]; otherwise it stays suspended.
+/// when reply word 0 is [`FAULT_RESUME`] or [`FAULT_MAP`]; otherwise it stays
+/// suspended.
 pub const FAULT_LABEL: u64 = 0xFFFF_0000_0000;
 
 /// Kinds of fault, added to [`FAULT_LABEL`].
@@ -304,3 +310,10 @@ pub enum Fault {
 
 /// Reply word 0 that resumes a faulted thread.
 pub const FAULT_RESUME: u64 = 1;
+/// Reply word 0 that maps a frame and then resumes the faulted thread, in
+/// one kernel entry: word 1 the address space, word 2 the frame (both
+/// capabilities of the replying thread), word 3 the page-aligned virtual
+/// address with the rights in its low four bits. What `Map` followed by a
+/// `FAULT_RESUME` reply does; if the mapping fails, the reply fails with
+/// that error and the fault stays unanswered.
+pub const FAULT_MAP: u64 = 2;

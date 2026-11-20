@@ -13,7 +13,7 @@
 mod arch;
 
 pub use silica_abi::root;
-pub use silica_abi::{Error, FAULT_LABEL, FAULT_RESUME, Fault, KEEP, MsgInfo, ObjectType, Rights};
+pub use silica_abi::{Error, FAULT_LABEL, FAULT_MAP, FAULT_RESUME, Fault, KEEP, MsgInfo, ObjectType, Rights};
 use silica_abi::{NONBLOCK, Syscall};
 
 /// Platform API level (`spec/CI_RELEASE.md` section 7).
@@ -107,6 +107,21 @@ pub fn reply(info: MsgInfo, w: [u64; 4]) -> Result<()> {
 /// gone), then receive the next message from `from`. The server loop.
 pub fn reply_recv(from: Cap, info: MsgInfo, w: [u64; 4]) -> Result<Message> {
     sys(Syscall::ReplyRecv, [from.0, info.0, w[0], w[1], w[2], w[3]]).map(message)
+}
+
+/// A pager's answer to a page fault: map `frame` at `vaddr` in `aspace`,
+/// resume the faulted thread, and receive the next message from `from`, all
+/// in one kernel entry. If the mapping fails its error is returned and the
+/// fault is still unanswered.
+pub fn fault_map_recv(from: Cap, aspace: Cap, frame: Cap, vaddr: usize, rights: Rights) -> Result<Message> {
+    let at = (vaddr as u64 & !0xFFF) | rights.0 as u64;
+    sys(Syscall::ReplyRecv, [from.0, MsgInfo::new(0, 4).0, FAULT_MAP, aspace.0, frame.0, at]).map(message)
+}
+
+/// Like [`fault_map_recv`] without receiving again.
+pub fn fault_map(aspace: Cap, frame: Cap, vaddr: usize, rights: Rights) -> Result<()> {
+    let at = (vaddr as u64 & !0xFFF) | rights.0 as u64;
+    sys(Syscall::ReplyRecv, [0, MsgInfo::new(0, 4).0, FAULT_MAP, aspace.0, frame.0, at]).map(|_| ())
 }
 
 /// Let another runnable thread use the processor.

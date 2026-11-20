@@ -24,6 +24,10 @@ panic = "abort"
 panic = "abort"
 # Line tables for the symbolizer; the image carries stripped copies.
 debug = "line-tables-only"
-opt-level = "s"
+# Arithmetic that overflows stops the kernel instead of wrapping silently.
+overflow-checks = true
+# Speed first: at this level the kernel is about 60 KB of a 256 KB budget,
+# and "s" cost 10% on the IPC path (rep movs for small copies, loops kept).
+opt-level = 3
 lto = true
 codegen-units = 1

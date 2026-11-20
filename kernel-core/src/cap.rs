@@ -169,6 +169,10 @@ impl<H: Hal> Kernel<H> {
         if cap.ty == ObjectType::Frame {
             self.unmap_slot(s);
         }
+        if cap.ty == ObjectType::AddressSpace {
+            // It may be the running thread's own: the scheduler reloads.
+            self.dirty.set(true);
+        }
         let last = !self.same_obj(slot.prev.get(), &cap) && !self.same_obj(slot.next.get(), &cap);
         let (p, n) = (slot.prev.get(), slot.next.get());
         if p != 0 {

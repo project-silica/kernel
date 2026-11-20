@@ -34,6 +34,11 @@ const REG_RFLAGS: usize = 16;
 const REG_RSP: usize = 17;
 const REG_FS_BASE: usize = 18;
 const REG_GS_BASE: usize = 19;
+/// Not 0 when the frame was saved by `syscall` (set by the entry stubs).
+const REG_BY_SYSCALL: usize = 20;
+/// MXCSR (low half) and the x87 control word of a thread switched out
+/// inside a system call.
+const REG_FPCTL: usize = 21;
 
 const PTE_P: u64 = 1;
 const PTE_W: u64 = 2;
@@ -77,6 +82,8 @@ pub struct X86 {
     /// How extended state is saved: 0 XSAVE, 1 XSAVEOPT, 2 XSAVES (compacted).
     xsave_kind: Cell<u8>,
     xcr0: Cell<u64>,
+    /// XGETBV with ECX = 1 reports which state components are in use.
+    xgetbv1: Cell<bool>,
     fsgsbase: Cell<bool>,
     /// Process-context identifiers: the generation and the next free one.
     /// 0 in `pcid_gen` means the processor has none.
@@ -107,6 +114,7 @@ static KERNEL: Global = Global(Kernel::new(
         polls: Cell::new(0),
         xsave_kind: Cell::new(0),
         xcr0: Cell::new(0),
+        xgetbv1: Cell::new(false),
         fsgsbase: Cell::new(false),
         pcid_gen: Cell::new(0),
         pcid_next: Cell::new(1),
@@ -188,6 +196,13 @@ impl Hal for X86 {
         let kind = self.xsave_kind.get();
         let to_regs = kernel().regs(to);
         let (fs, gs) = (canonical(to_regs[REG_FS_BASE].get()), canonical(to_regs[REG_GS_BASE].get()));
+        // Extended state. A thread that entered the kernel by a system call
+        // has no vector or x87 data to keep: the ABI says a system call
+        // clobbers them, as a function call does. Only its control words are
+        // saved, and when it resumes the registers are cleared so it cannot
+        // see another thread's data. A thread that was interrupted or took a
+        // fault gets a full save and restore.
+        //
         // SAFETY: `from` and `to` are live Thread objects (4 KiB, so the save
         // area at FPU_OFFSET is 64-byte aligned and large enough: checked
         // against CPUID at boot, as were the instructions used here). While
@@ -195,18 +210,38 @@ impl Hal for X86 {
         // SWAPGS; interrupts are off, so nothing runs between the two swaps.
         unsafe {
             if from != 0 {
-                let area = phys.ptr(from + FPU_OFFSET as u64);
-                match kind {
-                    2 => asm!("xsaves64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack)),
-                    1 => asm!("xsaveopt64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack)),
-                    _ => asm!("xsave64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack)),
+                let regs = kernel().regs(from);
+                if regs[REG_BY_SYSCALL].get() != 0 {
+                    let mut ctl = [0u32; 2];
+                    asm!("stmxcsr [{p}]", "fnstcw [{p} + 4]", p = in(reg) ctl.as_mut_ptr(), options(nostack));
+                    regs[REG_FPCTL].set(ctl[0] as u64 | (ctl[1] as u64) << 32);
+                } else {
+                    let area = phys.ptr(from + FPU_OFFSET as u64);
+                    match kind {
+                        2 => asm!("xsaves64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack)),
+                        1 => asm!("xsaveopt64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack)),
+                        _ => asm!("xsave64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack)),
+                    }
                 }
             }
-            let area = phys.ptr(to + FPU_OFFSET as u64);
-            if kind == 2 {
-                asm!("xrstors64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
+            if to_regs[REG_BY_SYSCALL].get() != 0 {
+                let ctl = to_regs[REG_FPCTL].get();
+                let ctl = [ctl as u32, (ctl >> 32) as u32];
+                if self.xcr0.get() & !0b111 != 0 || !self.xgetbv1.get() {
+                    // More than x87, SSE and AVX is enabled, or the processor
+                    // cannot say what is in use: restore the initial image.
+                    self.restore(INIT_STATE.0.get().cast());
+                } else {
+                    // VZEROALL clears every SSE and AVX register. x87 is
+                    // reset only when XINUSE says it holds anything.
+                    asm!(
+                        "vzeroall", "mov ecx, 1", "xgetbv", "test al, 1", "jz 2f", "fninit", "2:",
+                        out("eax") _, out("ecx") _, out("edx") _, options(nostack, nomem),
+                    );
+                }
+                asm!("ldmxcsr [{p}]", "fldcw [{p} + 4]", p = in(reg) ctl.as_ptr(), options(nostack));
             } else {
-                asm!("xrstor64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
+                self.restore(phys.ptr(to + FPU_OFFSET as u64));
             }
             let (old_fs, old_gs): (u64, u64);
             if self.fsgsbase.get() {
@@ -353,7 +388,29 @@ impl Hal for X86 {
     }
 }
 
+/// The extended state every thread starts with, for clearing the registers.
+#[repr(C, align(64))]
+struct InitState(core::cell::UnsafeCell<[u8; 4096 - FPU_OFFSET]>);
+// SAFETY: written once during boot, then only read by XRSTOR.
+unsafe impl Sync for InitState {}
+static INIT_STATE: InitState = InitState(core::cell::UnsafeCell::new([0; 4096 - FPU_OFFSET]));
+
 impl X86 {
+    /// Load extended state from a save area.
+    ///
+    /// # Safety
+    /// `area` must be a 64-byte-aligned XSAVE image in the format chosen at boot.
+    unsafe fn restore(&self, area: *const u8) {
+        // SAFETY: guaranteed by the caller.
+        unsafe {
+            if self.xsave_kind.get() == 2 {
+                asm!("xrstors64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
+            } else {
+                asm!("xrstor64 [{}]", in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
+            }
+        }
+    }
+
     /// The CR3 value that loads `root`. With process-context identifiers a
     /// switch keeps the translations cached for the address space: each has
     /// an identifier for the current generation, kept in its header page (a
@@ -544,6 +601,14 @@ fn init_processor() {
             k.hal.xsave_kind.set(2);
         } else if xs & 1 != 0 {
             k.hal.xsave_kind.set(1);
+        }
+        k.hal.xgetbv1.set(xs & 1 << 2 != 0);
+        // The initial image: default control words, nothing in use.
+        let init = INIT_STATE.0.get().cast::<u8>();
+        init.cast::<u16>().write(0x037F);
+        init.add(24).cast::<u32>().write(0x1F80);
+        if k.hal.xsave_kind.get() == 2 {
+            init.add(520).cast::<u64>().write(1 << 63 | xcr0);
         }
         init_mitigations();
         // Legacy interrupt controllers off: remap out of the exception

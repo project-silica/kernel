@@ -99,11 +99,8 @@ fn finish(arg: u64) -> ! {
 
 fn raw_syscall(n: u64) -> u64 {
     let r: u64;
-    // SAFETY: a syscall with no arguments; the kernel preserves everything
-    // but rax, rcx and r11.
-    unsafe {
-        asm!("syscall", inout("rax") n => r, out("rcx") _, out("r11") _, lateout("rdi") _, lateout("rsi") _, lateout("rdx") _, lateout("r10") _, lateout("r8") _, lateout("r9") _, options(nostack))
-    }
+    // SAFETY: a syscall with no arguments; it changes what a function call may change.
+    unsafe { asm!("syscall", inout("rax") n => r, clobber_abi("sysv64"), options(nostack)) }
     r
 }
 
@@ -227,6 +224,7 @@ fn t_fault_kernel_memory() -> T {
 }
 
 #[inline(never)]
+#[allow(unconditional_recursion)]
 fn recurse(n: u64) -> u64 {
     let mut pad = [0u8; 512];
     // SAFETY: plain volatile accesses to a local, to keep the frame.
@@ -280,6 +278,22 @@ fn t_fault_resume() -> T {
     let f = new(ObjectType::Frame, 12);
     map(ASPACE, f, at, RW).map_err(|_| "cannot map the missing page")?;
     reply(MsgInfo::new(0, 1), [FAULT_RESUME, 0, 0, 0]).map_err(|_| "cannot reply to the fault")?;
+    wait_for(&SHARED[2], 42)?;
+    // The same again with the mapping carried by the reply. A mapping that
+    // cannot be made leaves the fault unanswered and reports why.
+    let at = region(1 << 12);
+    DEMAND_AT.store(at as u64 + 16, SeqCst);
+    SHARED[2].store(0, SeqCst);
+    let _ = spawn(touch, 0, ep);
+    let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000)).map_err(|_| "no second fault message arrived")?;
+    let g = new(ObjectType::Frame, 12);
+    if fault_map(ASPACE, f, m.words[1] as usize, RW) != Err(Error::Mapped) {
+        return Err("a fault reply mapping an already mapped frame did not fail with Mapped");
+    }
+    if fault_map(ASPACE, g, m.words[1] as usize, Rights(7)) != Err(Error::BadArg) {
+        return Err("a fault reply mapping writable and executable was accepted");
+    }
+    fault_map(ASPACE, g, m.words[1] as usize, RW).map_err(|_| "cannot map and resume in one reply")?;
     wait_for(&SHARED[2], 42)
 }
 
@@ -420,34 +434,39 @@ fn t_preempt() -> T {
     Ok(())
 }
 
+/// Spin for `ticks` of the timestamp counter with a value in SSE and AVX
+/// registers, making no system call, and return what the registers hold
+/// afterwards. Another thread running in between must not change them.
+fn hold_in_vector_registers(v: u64, ticks: u64) -> [u64; 3] {
+    let (a, b, c): (u64, u64, u64);
+    // SAFETY: only registers declared here are touched.
+    unsafe {
+        asm!(
+            "vmovq xmm0, {v}",
+            "vpbroadcastq ymm15, xmm0",
+            "vmovq xmm7, {v}",
+            "rdtsc", "shl rdx, 32", "lea {end}, [rax + rdx]", "add {end}, {ticks}",
+            "2: pause", "rdtsc", "shl rdx, 32", "add rax, rdx", "cmp rax, {end}", "jb 2b",
+            "vmovq {a}, xmm0",
+            "vmovq {b}, xmm7",
+            "vextracti128 xmm1, ymm15, 1",
+            "vpextrq {c}, xmm1, 1",
+            "vzeroupper",
+            v = in(reg) v, ticks = in(reg) ticks, end = out(reg) _, a = out(reg) a, b = out(reg) b, c = out(reg) c,
+            out("rax") _, out("rdx") _, out("xmm0") _, out("xmm1") _, out("xmm7") _, out("xmm15") _,
+            options(nostack),
+        );
+    }
+    [a, b, c]
+}
+
 extern "C" fn fpu_worker(arg: u64) -> ! {
     let id = arg & 0xFFFF_FFFF;
+    let slice = CLOCK_CELL[0].load(SeqCst) / 500; // 2 ms: several per time slice
     let mut bad = 0u64;
-    for round in 0..20_000u64 {
-        let v = id << 32 | round;
-        let (a, b, c): (u64, u64, u64);
-        // SAFETY: loads a value into SSE and AVX registers, yields (syscall
-        // 4) so the other worker runs with its own values, and reads the
-        // registers back. Declares every register it touches.
-        unsafe {
-            asm!(
-                "vmovq xmm0, {v}",
-                "vpbroadcastq ymm15, xmm0",
-                "vmovq xmm7, {v}",
-                "mov eax, 4",
-                "syscall",
-                "vmovq {a}, xmm0",
-                "vmovq {b}, xmm7",
-                "vextracti128 xmm1, ymm15, 1",
-                "vpextrq {c}, xmm1, 1",
-                "vzeroupper",
-                v = in(reg) v, a = out(reg) a, b = out(reg) b, c = out(reg) c,
-                out("rax") _, out("rcx") _, out("r11") _, out("rdi") _, out("rsi") _, out("rdx") _, out("r10") _, out("r8") _, out("r9") _,
-                out("xmm0") _, out("xmm1") _, out("xmm7") _, out("xmm15") _,
-                options(nostack),
-            );
-        }
-        if a != v || b != v || c != v {
+    for round in 0..60u64 {
+        let v = (id + 1) << 32 | round;
+        if hold_in_vector_registers(v, slice) != [v, v, v] {
             bad += 1;
         }
     }
@@ -455,21 +474,93 @@ extern "C" fn fpu_worker(arg: u64) -> ! {
     finish(arg)
 }
 
+extern "C" fn fpu_secret_holder(arg: u64) -> ! {
+    // Fill the vector registers with a recognisable value and yield, for ever.
+    loop {
+        // SAFETY: only registers declared here are touched; `syscall` 4 is Yield.
+        unsafe {
+            asm!(
+                "vmovq xmm0, {v}", "vpbroadcastq ymm0, xmm0", "vmovdqa ymm1, ymm0", "vmovdqa ymm7, ymm0", "vmovdqa ymm15, ymm0",
+                "fld1",
+                "mov eax, 4", "syscall",
+                "fstp st(0)",
+                v = in(reg) 0x5EC2_E75E_C2E7_u64 | arg << 48, clobber_abi("sysv64"), options(nostack),
+            );
+        }
+        if SHARED[2].load(SeqCst) != 0 {
+            finish(arg)
+        }
+    }
+}
+
 fn t_fpu() -> T {
+    // 1. Preempted threads keep their vector registers: three threads spin
+    // without a system call, so only the timer switches between them.
     SHARED[0].store(0, SeqCst);
     SHARED[1].store(0, SeqCst);
     let _ = spawn(fpu_worker, 0, Cap::NONE);
     let _ = spawn(fpu_worker, 1, Cap::NONE);
-    // This thread computes in floating point across the same switches.
-    let mut x = 1.0f64;
-    for _ in 0..20_000 {
-        x = x * 1.000_1 + 0.5;
-        yield_now();
+    let slice = CLOCK_CELL[0].load(SeqCst) / 500;
+    for round in 0..60u64 {
+        let v = 0x7777 << 32 | round;
+        if hold_in_vector_registers(v, slice) != [v, v, v] {
+            return Err("the main thread's vector registers changed while it was preempted");
+        }
     }
-    if !(x > 10_000.0 && x < 100_000.0) {
-        return Err("floating-point state of the main thread was corrupted");
+    let n = new(ObjectType::Notification, 0);
+    for flag in [&SHARED[0], &SHARED[1]] {
+        for _ in 0..200 {
+            if flag.load(SeqCst) != 0 {
+                break;
+            }
+            let _ = recv(n, Wait::Until(CLOCK.now() + 5_000_000));
+        }
+        if flag.load(SeqCst) != 1 {
+            return Err("SSE or AVX registers changed across a preemption (or the worker did not finish)");
+        }
     }
-    wait_for(&SHARED[0], 1).and(wait_for(&SHARED[1], 1)).map_err(|_| "SSE or AVX registers changed across a thread switch")
+    // 2. A system call does not keep vector registers, and what comes back
+    // is never another thread's: after yielding to a thread that fills its
+    // registers with a secret, this thread's are clear.
+    SHARED[2].store(0, SeqCst);
+    let _ = spawn(fpu_secret_holder, 1, Cap::NONE);
+    for _ in 0..200 {
+        let (a, b, x87): (u64, u64, u16);
+        // SAFETY: only registers declared here are touched; `syscall` 4 is Yield.
+        unsafe {
+            asm!(
+                "mov eax, 4", "syscall",
+                "vextracti128 xmm2, ymm15, 1", "vpextrq r12, xmm2, 1", "vmovq r13, xmm7",
+                "fnstsw ax",
+                out("r12") a, out("r13") b, lateout("ax") x87, clobber_abi("sysv64"), options(nostack),
+            );
+        }
+        if a != 0 || b != 0 {
+            SHARED[2].store(1, SeqCst);
+            return Err("after a system call a thread saw another thread's vector registers");
+        }
+        if x87 & 0x3800 != 0 {
+            SHARED[2].store(1, SeqCst);
+            return Err("after a system call a thread saw another thread's x87 stack");
+        }
+    }
+    // 3. The control words are the thread's own across a switch.
+    let mxcsr_in = 0x1F80u32 | 0x6000; // round toward zero
+    let mut mxcsr_out = 0u32;
+    // SAFETY: loads and stores MXCSR around a Yield; restores the default.
+    unsafe {
+        asm!(
+            // Registers the system call preserves, so the pointers survive it.
+            "ldmxcsr [r12]", "mov eax, 4", "syscall", "stmxcsr [r13]", "ldmxcsr [r14]",
+            in("r12") &mxcsr_in, in("r13") &mut mxcsr_out, in("r14") &0x1F80u32,
+            clobber_abi("sysv64"), options(nostack),
+        );
+    }
+    SHARED[2].store(1, SeqCst);
+    if mxcsr_out != mxcsr_in {
+        return Err("MXCSR was not preserved across a system call that switched threads");
+    }
+    Ok(())
 }
 
 fn t_untyped() -> T {
@@ -598,9 +689,10 @@ core::arch::global_asm!(
     "stub_echo_end:",
     // Yield for ever with live AVX state.
     "stub_yield:",
-    "vmovq xmm0, rdi",
+    "mov r15, rdi",
+    "3: vmovq xmm0, r15",
     "vpbroadcastq ymm15, xmm0",
-    "3: mov eax, 4",
+    "mov eax, 4",
     "syscall",
     "jmp 3b",
     "stub_yield_end:",
@@ -682,13 +774,12 @@ fn bench_ctx_switch() {
             asm!(
                 "vmovq xmm0, {v}",
                 "vpbroadcastq ymm15, xmm0",
-                "lfence", "rdtsc", "shl rdx, 32", "lea {t0}, [rax + rdx]",
+                "lfence", "rdtsc", "shl rdx, 32", "lea r12, [rax + rdx]",
                 "mov eax, 4",
                 "syscall",
-                "lfence", "rdtsc", "shl rdx, 32", "add rax, rdx", "sub rax, {t0}",
-                v = in(reg) i as u64, t0 = out(reg) _,
-                out("rax") t, out("rdx") _, out("rcx") _, out("r11") _, out("rdi") _, out("rsi") _, out("r10") _, out("r8") _, out("r9") _,
-                out("xmm0") _, out("xmm15") _,
+                "lfence", "rdtsc", "shl rdx, 32", "add rax, rdx", "sub rax, r12",
+                v = in(reg) i as u64, out("r12") _,
+                lateout("rax") t, clobber_abi("sysv64"),
                 options(nostack),
             );
         }
@@ -730,11 +821,10 @@ fn bench_page_fault() {
     let _ = spawn(toucher, 0, ep);
     let mut m = recv(ep, Wait::Forever).expect("fault");
     for i in 0..FAULT_PAGES as u64 {
-        map(ASPACE, Cap(first + i), m.words[1] as usize & !0xFFF, RW).expect("map");
         if i + 1 == FAULT_PAGES as u64 {
-            reply(MsgInfo::new(0, 1), [FAULT_RESUME, 0, 0, 0]).expect("reply");
+            fault_map(ASPACE, Cap(first + i), m.words[1] as usize, RW).expect("map and resume");
         } else {
-            m = reply_recv(ep, MsgInfo::new(0, 1), [FAULT_RESUME, 0, 0, 0]).expect("next fault");
+            m = fault_map_recv(ep, ASPACE, Cap(first + i), m.words[1] as usize, RW).expect("map, resume, next fault");
         }
     }
     let _ = wait_for(&SHARED[0], 99);

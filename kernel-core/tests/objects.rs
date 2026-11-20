@@ -540,3 +540,49 @@ fn a_call_hands_the_processor_to_the_receiver_and_the_reply_hands_it_back() {
     assert_eq!(m.k.thread_view(other).state, RUNNABLE);
     assert_eq!(m.arg(m.root, 2), 2);
 }
+
+/// Found by the `elf` fuzz target: a dynamic segment whose file offset is
+/// near the top of the address range made the relocation reader overflow.
+#[test]
+fn elf_reader_survives_a_dynamic_segment_at_the_end_of_the_address_space() {
+    let mut f = tiny_elf(&[1, 2, 3], 10);
+    // Turn the second program header into PT_DYNAMIC with a wild offset and size.
+    let o = 64 + 56;
+    f[o..o + 4].copy_from_slice(&2u32.to_le_bytes());
+    f[o + 8..o + 16].copy_from_slice(&(u64::MAX - 7).to_le_bytes());
+    f[o + 32..o + 40].copy_from_slice(&u64::MAX.to_le_bytes());
+    let e = Elf::parse(&f, 62).unwrap();
+    assert_eq!(e.relative_relocs().count(), 0);
+    let crash = include_bytes!("../fuzz/corpus/elf/dynamic-offset-overflow");
+    for machine in [62, 183, 243] {
+        if let Ok(e) = Elf::parse(crash, machine) {
+            let _ = e.relative_relocs().count();
+        }
+    }
+}
+
+#[test]
+fn a_fault_reply_can_map_the_missing_page_and_resume_in_one_call() {
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Endpoint, 0, FREE, 1);
+    m.retype(ut, T::Frame, 12, FREE + 1, 2);
+    let t = m.spawn(ut, FREE + 3);
+    m.ok(S::ThreadConfigure, [FREE + 3, KEEP, KEEP, FREE, KEEP, 0]);
+    while m.k.current() != t {
+        m.sys(S::Yield, [0; 6]);
+    }
+    m.k.fault(Fault::Page, 0x5000_0123, 6);
+    m.k.schedule();
+    m.ok(S::Recv, [FREE, 0, 0, 0, 0, 0]);
+    let asp = m.cap(SLOT_ASPACE).unwrap().obj;
+    // A mapping that fails leaves the fault pending and tells the pager why.
+    assert_eq!(m.err(S::ReplyRecv, [0, 0, silica_abi::FAULT_MAP, SLOT_ASPACE, FREE + 1, 0x5000_0000 | 7]), Error::BadArg);
+    assert_eq!(m.err(S::ReplyRecv, [0, 0, silica_abi::FAULT_MAP, SLOT_THREAD, FREE + 1, 0x5000_0000 | 3]), Error::WrongType);
+    assert_eq!(m.k.thread_view(t).state, REPLY);
+    assert_eq!(m.k.thread_view(m.root).caller, t);
+    m.ok(S::ReplyRecv, [0, 0, silica_abi::FAULT_MAP, SLOT_ASPACE, FREE + 1, 0x5000_0000 | 3]);
+    assert_eq!(m.k.thread_view(t).state, RUNNABLE);
+    assert_eq!(m.k.translate(asp, 0x5000_0123), Some(m.cap(FREE + 1).unwrap().obj + 0x123));
+    assert_eq!(m.err(S::ReplyRecv, [0; 6]), Error::NoCaller);
+}
