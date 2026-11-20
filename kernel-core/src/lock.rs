@@ -114,28 +114,40 @@ impl Presence {
             Presence(AtomicU8::new(KERNEL))
         }
     }
+    // Orderings. A reader holds the owner's lock. What it needs from a
+    // value it reads is what the owner did before storing it: having saved
+    // its thread's registers before "kernel" (release here, acquire in the
+    // reader). Everything else is ordered by the lock itself: "user" and
+    // "idle" are stored while the owner holds its lock, so a reader that
+    // takes the lock afterwards sees them; a reader that holds the lock
+    // while the owner stores "kernel" may see the old "user" and then
+    // interrupts a processor that has already left, which costs an
+    // interrupt and nothing else. So no store needs to be sequentially
+    // consistent, and on x86 none is a locked instruction: two of the
+    // three atomic read-modify-writes a system call made are gone.
+
     /// The processor came into the kernel (registers saved, lock not yet taken),
     /// or woke from idling.
     pub fn enter_kernel(&self) {
-        self.0.store(KERNEL, Ordering::SeqCst);
+        self.0.store(KERNEL, Ordering::Release);
     }
     /// The processor is about to run user code (it still holds its lock).
     pub fn leave_to_user(&self) {
-        self.0.store(USER, Ordering::SeqCst);
+        self.0.store(USER, Ordering::Release);
     }
     /// The processor is about to halt until an interrupt (it still holds its
     /// lock, and lets go of it next).
     pub fn idle(&self) {
-        self.0.store(IDLE, Ordering::SeqCst);
+        self.0.store(IDLE, Ordering::Release);
     }
     /// Whether the processor is running user code.
     pub fn is_user(&self) -> bool {
-        self.0.load(Ordering::SeqCst) == USER
+        self.0.load(Ordering::Acquire) == USER
     }
     /// Whether the processor is in the kernel: it will look at what changed
     /// before it leaves, so it need not be interrupted.
     pub fn in_kernel(&self) -> bool {
-        self.0.load(Ordering::SeqCst) == KERNEL
+        self.0.load(Ordering::Acquire) == KERNEL
     }
 }
 
