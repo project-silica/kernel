@@ -4,9 +4,9 @@ use crate::cap::{Cap, FLAG_DEVICE, FLAG_PORTS};
 use crate::hal::Hal;
 use crate::mem::{Paddr, Phys};
 use crate::smp::{Cpu, MAX_CPUS};
-use crate::thread::{INACTIVE, IPC_CALL, RUNNABLE, Thread};
+use crate::thread::{INACTIVE, IPC_CALL, IPC_GRANT, RUNNABLE, Thread};
 use core::cell::Cell;
-use silica_abi::{Error, KEEP, NONBLOCK, ObjectType, PAGE_BITS, Rights, Syscall};
+use silica_abi::{Error, KEEP, MsgInfo, NONBLOCK, ObjectType, PAGE_BITS, Rights, Syscall};
 
 /// How a syscall handler finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,7 +63,7 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// The slot `index` of the current thread's CapSpace.
-    fn cslot(&self, t: Paddr, index: u64) -> Result<Paddr, Error> {
+    pub(crate) fn cslot(&self, t: Paddr, index: u64) -> Result<Paddr, Error> {
         let cs = self.thread(t).cspace.cap().ok_or(Error::BadCap)?;
         self.slot_in(&cs, index)
     }
@@ -97,7 +97,10 @@ impl<H: Hal> Kernel<H> {
             return true; // an error, reported without touching anything
         }
         let q = self.queue(cap.obj);
-        q.owner.get() == self.hal.cpu() as u64 + 1 && (q.head.get() == 0 || self.here(q.head.get())) && self.here(t)
+        let head = q.head.get();
+        q.owner.get() == self.hal.cpu() as u64 + 1
+            && (head == 0 || (self.here(head) && MsgInfo(self.thread(head).regs[H::ARG[1]].get()).caps() == 0))
+            && self.here(t)
     }
 
     /// Whether syscall `s` can run holding only this processor's lock.
@@ -112,9 +115,15 @@ impl<H: Hal> Kernel<H> {
         match s {
             // `Map` takes the structure lock itself.
             Syscall::Yield | Syscall::PortIo | Syscall::Map => true,
-            Syscall::Call | Syscall::Send => queue(a[0] & !NONBLOCK),
+            // Passing capabilities changes capability slots.
+            Syscall::Call | Syscall::Send => MsgInfo(a[1]).caps() == 0 && queue(a[0] & !NONBLOCK),
             Syscall::Recv => queue(a[0]),
-            Syscall::ReplyRecv => self.here(t) && (a[0] == 0 || queue(a[0])),
+            Syscall::ReplyRecv => {
+                // The reply unlinks the caller from the endpoint its call came through.
+                let c = self.thread(t).caller.get();
+                let via = c == 0 || self.queue(self.thread(c).via.get()).owner.get() == self.hal.cpu() as u64 + 1;
+                MsgInfo(a[1]).caps() == 0 && via && self.here(t) && (a[0] == 0 || queue(a[0]))
+            }
             _ => false,
         }
     }
@@ -157,10 +166,11 @@ impl<H: Hal> Kernel<H> {
     }
 
     fn dispatch(&self, s: Syscall, t: Paddr, a: [u64; 6]) -> Result<Exit, Error> {
+        let grant = |cap: &Cap| if cap.rights.has(Rights::GRANT) { IPC_GRANT } else { 0 };
         match s {
             Syscall::Call => {
                 let (_, ep) = self.ccap(t, a[0], ObjectType::Endpoint, Rights::WRITE)?;
-                self.send(t, ep.obj, ep.badge, IPC_CALL, true)
+                self.send(t, ep.obj, ep.badge, IPC_CALL | grant(&ep), true)
             }
             Syscall::Send => {
                 let slot = self.cslot(t, a[0] & !NONBLOCK)?;
@@ -169,23 +179,20 @@ impl<H: Hal> Kernel<H> {
                     return Err(Error::NoRights);
                 }
                 match cap.ty {
-                    ObjectType::Endpoint => self.send(t, cap.obj, cap.badge, 0, a[0] & NONBLOCK == 0),
-                    ObjectType::Notification => {
-                        // A capability without a badge signals bit 0.
-                        self.signal(cap.obj, cap.badge.max(1));
-                        Ok(Exit::Done)
-                    }
+                    ObjectType::Endpoint => self.send(t, cap.obj, cap.badge, grant(&cap), a[0] & NONBLOCK == 0),
+                    // A capability without a badge signals bit 0.
+                    ObjectType::Notification => self.notify(t, cap.obj, cap.badge.max(1)),
                     _ => Err(Error::WrongType),
                 }
             }
-            Syscall::Recv => self.recv_any(t, a[0], a[1]),
+            Syscall::Recv => self.recv_any(t, a[0], a[1], a[2]),
             Syscall::ReplyRecv => {
                 let caller = self.thread(t).caller.get();
                 let replied = self.reply(t)?;
                 if a[0] == 0 {
                     return if replied { Ok(Exit::Done) } else { Err(Error::NoCaller) };
                 }
-                let r = self.recv_any(t, a[0], 0);
+                let r = self.recv_any(t, a[0], 0, 0);
                 // The server now waits: the caller it answered runs next.
                 let me = self.me();
                 if replied
@@ -377,14 +384,14 @@ impl<H: Hal> Kernel<H> {
         }
     }
 
-    fn recv_any(&self, t: Paddr, index: u64, deadline: u64) -> Result<Exit, Error> {
+    fn recv_any(&self, t: Paddr, index: u64, deadline: u64, park: u64) -> Result<Exit, Error> {
         let slot = self.cslot(t, index)?;
         let cap = self.slot(slot).cap().ok_or(Error::BadCap)?;
         if !cap.rights.has(Rights::READ) {
             return Err(Error::NoRights);
         }
         match cap.ty {
-            ObjectType::Endpoint => self.recv(t, cap.obj, deadline),
+            ObjectType::Endpoint => self.recv(t, cap.obj, deadline, park),
             ObjectType::Notification => self.wait(t, cap.obj, deadline),
             _ => Err(Error::WrongType),
         }

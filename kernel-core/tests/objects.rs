@@ -716,3 +716,129 @@ fn a_thread_stopped_while_its_processor_waited_for_the_lock_does_not_run_its_sys
     m.k.leave();
     assert!(m.cap(FREE).is_some(), "the stopped thread's syscall must not take effect");
 }
+
+// ---- capabilities in messages, calls in progress, parked calls -------------
+
+/// Root and a second thread, each with an IPC buffer; an endpoint at FREE
+/// (all rights) and a copy without GRANT at FREE + 1. Returns the machine,
+/// the thread, and the two buffers' physical addresses (root's, thread's).
+fn pair_with_buffers() -> (Machine, u64, u64, u64) {
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Endpoint, 0, FREE, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 3, 0, 0]);
+    let t = m.spawn(ut, FREE + 2);
+    m.retype(ut, T::Frame, 12, FREE + 3, 1);
+    m.ok(S::ThreadConfigure, [FREE + 2, KEEP, KEEP, KEEP, FREE + 3, 0]);
+    let (rb, tb) = (m.cap(SLOT_IPCBUF).unwrap().obj, m.cap(FREE + 3).unwrap().obj);
+    (m, t, rb, tb)
+}
+
+fn poke(m: &Machine, buffer: u64, offset: usize, index: usize, v: u64) {
+    m.k.phys.write_val(buffer + (offset + index * 8) as u64, &v);
+}
+
+#[test]
+fn a_message_passes_capabilities_derived_duplicated_or_moved() {
+    use silica_abi::{IPC_CAP_DUPLICATE, IPC_CAP_MOVE, IPC_CAPS, IPC_RECV};
+    let (m, t, rb, tb) = pair_with_buffers();
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE + 10, 3);
+    // The receiver (sharing the CapSpace) wants what it is sent in slots 40, 41, 42.
+    for i in 0..3 {
+        poke(&m, tb, IPC_RECV, i, FREE + 40 + i as u64);
+    }
+    poke(&m, rb, IPC_CAPS, 0, FREE + 10);
+    poke(&m, rb, IPC_CAPS, 1, (FREE + 11) | (IPC_CAP_DUPLICATE << 60));
+    poke(&m, rb, IPC_CAPS, 2, (FREE + 12) | (IPC_CAP_MOVE << 60));
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
+    // Without the GRANT right the message arrives and the capabilities do not.
+    m.ok(S::Send, [FREE + 1, MsgInfo::with_caps(1, 1, 3).0, 7, 0, 0, 0]);
+    assert_eq!(MsgInfo(m.arg(t, 1)).caps(), 0);
+    assert!(m.cap(FREE + 40).is_none());
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.ok(S::Send, [FREE, MsgInfo::with_caps(1, 1, 3).0, 7, 0, 0, 0]);
+    assert_eq!((MsgInfo(m.arg(t, 1)).caps(), m.arg(t, 2)), (3, 7));
+    let slot = |i| m.k.view(m.k.slot_addr(&m.cs, i).unwrap());
+    assert_eq!(slot(FREE + 40).unwrap().depth, slot(FREE + 10).unwrap().depth + 1, "derived: a child of the sender's");
+    assert_eq!(slot(FREE + 41).unwrap().depth, slot(FREE + 11).unwrap().depth, "duplicated: beside the sender's");
+    assert!(slot(FREE + 12).is_none() && slot(FREE + 42).is_some(), "moved: the sender no longer has it");
+    // The sender takes back what it lent, and only that.
+    m.ok(S::CapRevoke, [FREE + 10, 0, 0, 0, 0, 0]);
+    assert!(slot(FREE + 40).is_none() && slot(FREE + 41).is_some());
+    // A full receiving slot ends the transfer there; the count says so.
+    poke(&m, rb, IPC_CAPS, 0, FREE + 10);
+    poke(&m, rb, IPC_CAPS, 1, FREE + 11);
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.ok(S::Send, [FREE, MsgInfo::with_caps(1, 0, 2).0, 0, 0, 0, 0]);
+    assert_eq!(MsgInfo(m.arg(t, 1)).caps(), 1, "slot 41 is occupied");
+    assert!(slot(FREE + 40).is_some());
+    // A reply may carry capabilities whatever the caller's rights were.
+    m.ok(S::CapDelete, [FREE + 40, 0, 0, 0, 0, 0]);
+    poke(&m, rb, IPC_RECV, 0, FREE + 50);
+    poke(&m, tb, IPC_CAPS, 0, FREE + 42);
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
+    assert!(m.sys(S::Call, [FREE + 1, 0, 0, 0, 0, 0]).blocked);
+    m.sys_as(t, S::ReplyRecv, [0, MsgInfo::with_caps(2, 0, 1).0, 0, 0, 0, 0]);
+    assert_eq!(MsgInfo(m.arg(m.root, 1)).caps(), 1);
+    assert!(slot(FREE + 50).is_some());
+}
+
+#[test]
+fn destroying_an_endpoint_fails_the_calls_in_progress_through_it_on_both_sides() {
+    let (m, t) = pair();
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
+    assert!(m.sys(S::Call, [FREE + 1, 0, 1, 0, 0, 0]).blocked);
+    // The server holds the call. The endpoint goes (the server's own
+    // capability is in the shared CapSpace, so it can delete it).
+    assert_eq!(m.k.thread_view(t).caller, m.root);
+    let r = m.sys_as(t, S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
+    assert_eq!(r.status, 0);
+    assert_eq!(Error::result(m.status(m.root)), Err(Error::Gone), "the caller's call fails");
+    assert_eq!(m.k.thread_view(m.root).state, RUNNABLE);
+    assert_eq!(m.k.thread_view(t).caller, 0);
+    let r = m.sys_as(t, S::ReplyRecv, [0, 0, 2, 0, 0, 0]);
+    assert_eq!(Error::result(r.status), Err(Error::NoCaller), "the server's reply finds no caller");
+}
+
+#[test]
+fn a_parked_call_is_answered_later_through_its_notification() {
+    let (m, t) = pair();
+    let (ut, _) = m.big_untyped();
+    let t2 = m.spawn(ut, FREE + 5);
+    m.retype(ut, T::Notification, 0, FREE + 10, 2);
+    // The server takes two calls, parking each, before answering either.
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, FREE + 10, 0, 0, 0]).blocked);
+    assert!(m.sys(S::Call, [FREE + 1, 0, 100, 0, 0, 0]).blocked);
+    assert_eq!(m.k.thread_view(t).caller, 0, "the call is parked, not held by the server thread");
+    assert_eq!(m.arg(t, 2), 100);
+    let r = m.sys_as(t, S::Recv, [FREE, 0, FREE + 11, 0, 0, 0]);
+    assert!(r.blocked);
+    assert!(m.sys_as(t2, S::Call, [FREE + 1, 0, 200, 0, 0, 0]).blocked);
+    assert_eq!(m.arg(t, 2), 200);
+    // While a call is parked the notification cannot be waited on, and a
+    // signal to it does not answer the call.
+    let r = m.sys_as(t, S::Recv, [FREE + 10, 1, 0, 0, 0, 0]);
+    assert_eq!(Error::result(r.status), Err(Error::InUse));
+    // Answers in the other order.
+    m.sys_as(t, S::Send, [FREE + 11, MsgInfo::new(9, 1).0, 201, 0, 0, 0]);
+    assert_eq!((m.k.thread_view(t2).state, m.status(t2), m.arg(t2, 2)), (RUNNABLE, 0, 201));
+    assert_eq!(m.k.thread_view(m.root).state, REPLY);
+    m.sys_as(t, S::Send, [FREE + 10, MsgInfo::new(9, 1).0, 101, 0, 0, 0]);
+    assert_eq!((m.k.thread_view(m.root).state, m.status(m.root), m.arg(m.root, 2)), (RUNNABLE, 0, 101));
+    // The notification is an ordinary notification again.
+    m.ok(S::Send, [FREE + 10, 0, 0, 0, 0, 0]);
+    m.ok(S::Recv, [FREE + 10, 1, 0, 0, 0, 0]);
+    // Destroying the notification a call is parked on fails the call.
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, FREE + 10, 0, 0, 0]).blocked);
+    assert!(m.sys(S::Call, [FREE + 1, 0, 1, 0, 0, 0]).blocked);
+    let r = m.sys_as(t, S::CapDelete, [FREE + 10, 0, 0, 0, 0, 0]);
+    assert_eq!(r.status, 0);
+    assert_eq!(Error::result(m.status(m.root)), Err(Error::Gone));
+    // And a parked caller that is destroyed leaves the notification free.
+    assert!(m.sys_as(t, S::Recv, [FREE, 0, FREE + 11, 0, 0, 0]).blocked);
+    assert!(m.sys_as(t2, S::Call, [FREE + 1, 0, 1, 0, 0, 0]).blocked);
+    m.ok(S::CapDelete, [FREE + 5, 0, 0, 0, 0, 0]);
+    m.ok(S::Send, [FREE + 11, 0, 0, 0, 0, 0]);
+    m.ok(S::Recv, [FREE + 11, 1, 0, 0, 0, 0]);
+}

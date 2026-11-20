@@ -68,6 +68,13 @@ impl Word {
     pub fn set(&self, v: u64) {
         self.0.store(v, Ordering::Relaxed);
     }
+    /// Make the word `v` if it is 0. Returns whether it is `v` afterwards.
+    pub fn claim(&self, v: u64) -> bool {
+        match self.0.compare_exchange(0, v, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => true,
+            Err(now) => now == v,
+        }
+    }
 }
 
 /// Where a processor is, as other processors need to know it.

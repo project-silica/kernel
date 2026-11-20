@@ -12,6 +12,9 @@
 #[allow(unsafe_code)]
 mod arch;
 
+mod buffer;
+
+pub use buffer::{IpcBuffer, Pass};
 pub use silica_abi::root;
 pub use silica_abi::{Error, FAULT_LABEL, FAULT_MAP, FAULT_RESUME, Fault, KEEP, MsgInfo, ObjectType, Rights};
 use silica_abi::{NONBLOCK, Syscall};
@@ -96,6 +99,25 @@ pub fn recv(from: Cap, wait: Wait) -> Result<Message> {
         Wait::Until(t) => t.max(2),
     };
     sys(Syscall::Recv, [from.0, deadline, 0, 0, 0, 0]).map(message)
+}
+
+/// Receive from an endpoint; if what arrives is a call, park it on the
+/// notification `park` instead of holding it on this thread. A parked call
+/// is answered, by any thread and at any later time, with [`answer`]; until
+/// then this thread is free to receive and answer others. One call parks on
+/// one notification at a time.
+pub fn recv_parking(from: Cap, wait: Wait, park: Cap) -> Result<Message> {
+    let deadline = match wait {
+        Wait::Forever => 0,
+        Wait::Poll => 1,
+        Wait::Until(t) => t.max(2),
+    };
+    sys(Syscall::Recv, [from.0, deadline, park.0, 0, 0, 0]).map(message)
+}
+
+/// Answer the call parked on notification `parked`.
+pub fn answer(parked: Cap, info: MsgInfo, w: [u64; 4]) -> Result<()> {
+    send(parked, info, w)
 }
 
 /// Reply to the call received last. Fails with `NoCaller` when there is none.

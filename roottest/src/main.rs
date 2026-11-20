@@ -628,9 +628,112 @@ fn t_caps() -> T {
     Ok(())
 }
 
+static SERVER_BUFFER: AtomicU64 = AtomicU64::new(0);
+
+/// A thread with its own IPC buffer, mapped at the returned address (also
+/// left in `SERVER_BUFFER` for the thread to find).
+fn spawn_with_buffer(entry: extern "C" fn(u64) -> !, arg: u64) -> (Cap, usize) {
+    let t = new(ObjectType::Thread, 0);
+    let (_, stack) = memory();
+    let frame = new(ObjectType::Frame, 12);
+    let at = region(1 << 12);
+    map(ASPACE, frame, at, RW).expect("map buffer");
+    thread_configure(t, SPACE, ASPACE, Cap::NONE, frame).expect("configure");
+    // SAFETY: `entry` is a function of this program; the stack was just mapped.
+    SERVER_BUFFER.store(at as u64, SeqCst);
+    unsafe { thread_start(t, entry as usize, stack + (1 << 16) - 8, arg | t.0 << 32, true) }.expect("start");
+    (t, at)
+}
+
+extern "C" fn cap_server(arg: u64) -> ! {
+    // SAFETY: the address of the buffer frame this thread was configured with.
+    let buf = unsafe { IpcBuffer::new(SERVER_BUFFER.load(SeqCst) as usize) };
+    let ep = Cap(SHARED[3].load(SeqCst));
+    let slot_for_gift = SHARED[2].load(SeqCst);
+    buf.accept(0, slot_for_gift);
+    let Ok(m) = recv(ep, Wait::Forever) else { finish(arg) };
+    // Use what was sent: signal the notification, then say how many arrived.
+    let got = m.info.caps() as u64;
+    let _ = signal(Cap(slot_for_gift));
+    let _ = reply(MsgInfo::new(0, 2), [got, buf.word(5), 0, 0]);
+    finish(arg)
+}
+
+/// A capability lent in a message works for the receiver until the sender revokes it.
+fn t_ipc_caps() -> T {
+    // SAFETY: the root thread's buffer, mapped by the kernel.
+    let buf = unsafe { IpcBuffer::new(ROOT_BUFFER.load(SeqCst) as usize) };
+    let ep = new(ObjectType::Endpoint, 0);
+    let n = new(ObjectType::Notification, 0);
+    let gift = slot();
+    SHARED[3].store(ep.0, SeqCst);
+    SHARED[2].store(gift, SeqCst);
+    let _ = spawn_with_buffer(cap_server, 0);
+    buf.pass(0, n, Pass::Lend);
+    buf.set_word(5, 0xFEED);
+    let r = call(ep, MsgInfo::with_caps(1, 6, 1), [0; 4]).map_err(|_| "the call carrying a capability failed")?;
+    if r.words[0] != 1 {
+        return Err("the receiver did not get the capability");
+    }
+    if r.words[1] != 0xFEED {
+        return Err("a message word beyond the registers did not arrive through the buffers");
+    }
+    if recv(n, Wait::Poll).is_err() {
+        return Err("the receiver could not use the capability it was lent");
+    }
+    // SAFETY: only the lent capability derives from `n`.
+    unsafe { cap_revoke(n) }.map_err(|_| "revoke")?;
+    if signal(Cap(gift)) != Err(Error::BadCap) {
+        return Err("a lent capability survived the lender's revoke");
+    }
+    // Without the GRANT right on the endpoint nothing is passed.
+    let plain = slot();
+    cap_derive(SPACE, plain, ep, Rights(3), 0).map_err(|_| "derive")?;
+    let _ = spawn_with_buffer(cap_server, 0);
+    buf.pass(0, n, Pass::Duplicate);
+    let r = call(Cap(plain), MsgInfo::with_caps(1, 0, 1), [0; 4]).map_err(|_| "call")?;
+    (r.words[0] == 0).then_some(()).ok_or("a capability passed through an endpoint capability without GRANT")
+}
+
+extern "C" fn parking_server(arg: u64) -> ! {
+    let ep = Cap(SHARED[3].load(SeqCst));
+    let (n1, n2) = (Cap(SHARED[1].load(SeqCst)), Cap(SHARED[2].load(SeqCst)));
+    // Take two calls before answering either, then answer the second first.
+    let (Ok(a), Ok(b)) = (recv_parking(ep, Wait::Forever, n1), recv_parking(ep, Wait::Forever, n2)) else { finish(arg) };
+    let _ = answer(n2, MsgInfo::new(0, 1), [b.words[0] + 1, 0, 0, 0]);
+    let _ = answer(n1, MsgInfo::new(0, 1), [a.words[0] + 1, 0, 0, 0]);
+    finish(arg)
+}
+
+extern "C" fn parked_client(arg: u64) -> ! {
+    let r = call(Cap(SHARED[3].load(SeqCst)), MsgInfo::new(0, 1), [500, 0, 0, 0]);
+    SHARED[0].store(r.map_or(1, |m| m.words[0]), SeqCst);
+    finish(arg)
+}
+
+/// A server holds two calls at once and answers them out of order.
+fn t_ipc_parked() -> T {
+    let ep = new(ObjectType::Endpoint, 0);
+    SHARED[3].store(ep.0, SeqCst);
+    SHARED[1].store(new(ObjectType::Notification, 0).0, SeqCst);
+    SHARED[2].store(new(ObjectType::Notification, 0).0, SeqCst);
+    SHARED[0].store(0, SeqCst);
+    let _ = spawn(parking_server, 0, Cap::NONE);
+    let _ = spawn(parked_client, 0, Cap::NONE);
+    let r = call(ep, MsgInfo::new(0, 1), [700, 0, 0, 0]).map_err(|_| "a parked call failed")?;
+    wait_for(&SHARED[0], 501).or_else(|_| wait_for(&SHARED[0], 701))?;
+    let other = SHARED[0].load(SeqCst);
+    // Each caller got the answer to its own call.
+    match (r.words[0], other) {
+        (701, 501) | (501, 701) => Ok(()),
+        _ => Err("parked calls were answered with the wrong replies"),
+    }
+}
+
 // ---- more than one processor ---------------------------------------------
 
 static CPUS: AtomicU64 = AtomicU64::new(1);
+static ROOT_BUFFER: AtomicU64 = AtomicU64::new(0);
 
 /// Like `spawn`, on processor `cpu`.
 fn spawn_on(cpu: usize, entry: extern "C" fn(u64) -> !, arg: u64, fault: Cap) -> (Cap, usize) {
@@ -1170,6 +1273,8 @@ const TESTS: &[(&str, fn() -> T)] = &[
     ("fpu", t_fpu),
     ("untyped", t_untyped),
     ("caps", t_caps),
+    ("ipc_caps", t_ipc_caps),
+    ("ipc_parked", t_ipc_parked),
     ("smp_run", t_smp_run),
     ("smp_ipc", t_smp_ipc),
     ("smp_shootdown", t_smp_shootdown),
@@ -1189,6 +1294,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     }
     NEXT_SLOT.store(info.first_free_slot, SeqCst);
     CPUS.store(info.cpus, SeqCst);
+    ROOT_BUFFER.store(info.ipc_buffer, SeqCst);
     let big = (0..info.untyped_count as usize).filter(|&i| info.untyped[i].kind == KIND_RAM).max_by_key(|&i| info.untyped[i].bits);
     let Some(big) = big else {
         println!("ERROR: roottest: the kernel handed over no ordinary memory");

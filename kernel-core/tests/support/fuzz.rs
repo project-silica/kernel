@@ -39,7 +39,7 @@ impl Src<'_> {
             10 => (b & 15) as u64,
             11 => [12, 13, 16, 21, 6, 3, 2, 1][b as usize & 7],
             12 => VADDRS[b as usize % VADDRS.len()],
-            13 => [KEEP, 0, 1, 3, 5, 7, 15, 0x105][b as usize & 7],
+            13 => [KEEP, 0, 1, 3, 5, 7, 15, 0x105, 0x201, 0x300][b as usize % 10],
             14 => (WINDOW + (b & 15) as u64) | NONBLOCK,
             _ => {
                 // A wild value, including the root task's own vital slots.
@@ -59,6 +59,13 @@ pub fn run(data: &[u8]) {
     let (ut, d) = m.big_untyped();
     for i in 0..3 {
         m.spawn(ut, THREADS + i);
+    }
+    // Every thread has an IPC buffer, so messages can carry capabilities.
+    let mut buffers = vec![m.cap(SLOT_IPCBUF).unwrap().obj];
+    for i in 0..3 {
+        m.retype(ut, T::Frame, 12, THREADS + 4 + i, 1);
+        m.ok(S::ThreadConfigure, [THREADS + i, KEEP, KEEP, KEEP, THREADS + 4 + i, 0]);
+        buffers.push(m.cap(THREADS + 4 + i).unwrap().obj);
     }
     // One of them starts out on the second processor.
     m.ok(S::ThreadControl, [THREADS + 2, 2, 1, 0, 0, 0]);
@@ -96,6 +103,17 @@ pub fn run(data: &[u8]) {
             }
             248..=251 => {
                 m.k.hal.pending.set(op as u32 - 247);
+                continue;
+            }
+            // A thread fills in which capabilities it sends or where it
+            // wants received ones (its IPC buffer is its own memory).
+            252..=255 => {
+                let (Some(b), Some(v)) = (src.byte(), src.arg(ut)) else { break };
+                let base = if b & 4 == 0 { silica_abi::IPC_CAPS } else { silica_abi::IPC_RECV };
+                let buffer = buffers[op as usize & 3];
+                // The buffer may have been unmapped or freed by now; the
+                // write goes to machine memory either way, as a thread's would.
+                m.k.phys.write_val(buffer + (base + (b as usize >> 3 & 3) * 8) as u64, &(v | (b as u64 >> 6) << 60));
                 continue;
             }
             _ => {}

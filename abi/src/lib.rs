@@ -28,12 +28,20 @@ pub enum Syscall {
     Call = 0,
     /// `a0` endpoint or notification, `a1` [`MsgInfo`], `a2..a5` words,
     /// `a0` bit 63 set: do not block. On a notification, ORs the capability's
-    /// badge into the pending word (bit 0 for a capability without a badge).
+    /// badge into the pending word (bit 0 for a capability without a badge),
+    /// or answers the call parked there (see `Recv`).
     Send = 1,
     /// `a0` endpoint or notification, `a1` deadline in monotonic nanoseconds
-    /// (0: wait for ever, 1: do not block). Returns `a0` badge, `a1`
-    /// [`MsgInfo`], `a2..a5` words. For a notification `a0` is the pending
-    /// word, cleared by the read.
+    /// (0: wait for ever, 1: do not block), `a2` for an endpoint: a
+    /// notification to park the next call on (0: none). Returns `a0` badge,
+    /// `a1` [`MsgInfo`], `a2..a5` words. For a notification `a0` is the
+    /// pending word, cleared by the read.
+    ///
+    /// A call received with a parking notification waits there instead of
+    /// on the receiving thread: any thread answers it by a `Send` to that
+    /// notification, at any later time, so a server can take further calls
+    /// first. One call parks on one notification; while it does, signals to
+    /// the notification accumulate and waiting on it is refused (`InUse`).
     Recv = 2,
     /// Reply to the caller received last (`a1` [`MsgInfo`], `a2..a5` words),
     /// then, when `a0` is not 0, `Recv` on `a0` with no deadline.
@@ -264,14 +272,26 @@ impl Error {
 }
 
 /// The message descriptor word: bits 0..6 the number of message words
-/// (at most [`MsgInfo::MAX_WORDS`]), bits 16..63 a label the kernel does not
+/// (at most [`MsgInfo::MAX_WORDS`]), bits 8..10 the number of capabilities
+/// (at most [`MsgInfo::MAX_CAPS`]), bits 16..63 a label the kernel does not
 /// interpret. Words 0..3 travel in registers; the rest in the IPC buffer.
+///
+/// The IPC buffer is one page: message words 0..63 at byte 0; at
+/// [`IPC_CAPS`] the capabilities a sender passes (a slot index with one of
+/// the `IPC_CAP_` modes in the top four bits); at [`IPC_RECV`] the slots, in
+/// the receiver's own CapSpace, that capabilities it is sent are put in.
+/// Sending capabilities needs the `GRANT` right on the endpoint capability;
+/// a reply may always carry them. Capabilities are passed in order and the
+/// first that cannot be (no such capability, receiving slot missing or
+/// full) ends the transfer; the receiver's descriptor says how many arrived.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MsgInfo(pub u64);
 
 impl MsgInfo {
     /// Most words in one message.
     pub const MAX_WORDS: usize = 64;
+    /// Most capabilities in one message.
+    pub const MAX_CAPS: usize = 4;
     /// Words carried in registers.
     pub const REG_WORDS: usize = 4;
 
@@ -279,9 +299,18 @@ impl MsgInfo {
     pub const fn new(label: u64, words: usize) -> MsgInfo {
         MsgInfo(label << 16 | (words as u64 & 0x7f))
     }
+    /// A descriptor with `label`, `words` message words and `caps` capabilities.
+    pub const fn with_caps(label: u64, words: usize, caps: usize) -> MsgInfo {
+        MsgInfo(label << 16 | (caps as u64 & 7) << 8 | (words as u64 & 0x7f))
+    }
     /// The label.
     pub const fn label(self) -> u64 {
         self.0 >> 16
+    }
+    /// The number of capabilities, clamped to the maximum.
+    pub const fn caps(self) -> usize {
+        let n = (self.0 >> 8 & 7) as usize;
+        if n > Self::MAX_CAPS { Self::MAX_CAPS } else { n }
     }
     /// The number of message words, clamped to the maximum.
     pub const fn words(self) -> usize {
@@ -289,6 +318,19 @@ impl MsgInfo {
         if n > Self::MAX_WORDS { Self::MAX_WORDS } else { n }
     }
 }
+
+/// Byte offset in the IPC buffer of the capabilities being sent.
+pub const IPC_CAPS: usize = 512;
+/// Byte offset in the IPC buffer of the slots received capabilities go to.
+pub const IPC_RECV: usize = 544;
+/// The slot index part of an entry at [`IPC_CAPS`].
+pub const IPC_CAP_SLOT: u64 = (1 << 60) - 1;
+/// Pass a capability derived from the sender's: the sender can revoke it.
+pub const IPC_CAP_DERIVE: u64 = 0;
+/// Pass an independent duplicate.
+pub const IPC_CAP_DUPLICATE: u64 = 1;
+/// Pass the capability itself; the sender no longer has it.
+pub const IPC_CAP_MOVE: u64 = 2;
 
 /// Label of a fault message, sent on behalf of a faulting thread to its
 /// fault endpoint as a call. Words: 0 instruction pointer, 1 fault address,

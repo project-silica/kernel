@@ -3,19 +3,23 @@
 use crate::hal::Hal;
 use crate::kernel::{Exit, Kernel};
 use crate::mem::Paddr;
-use crate::thread::{INACTIVE, IPC_CALL, IPC_FAULT, RECEIVING, REPLY, SENDING};
+use crate::thread::{INACTIVE, IPC_CALL, IPC_FAULT, IPC_GRANT, RECEIVING, REPLY, SENDING};
 use silica_abi::{Error, FAULT_LABEL, FAULT_MAP, FAULT_RESUME, Fault, MsgInfo, ObjectType, Rights};
 
 const SENDERS: u64 = 1;
 const RECEIVERS: u64 = 2;
+
+/// The queue holds one call waiting for its answer (a parked caller).
+const PARKED: u64 = 3;
 
 impl<H: Hal> Kernel<H> {
     fn ipc_buffer(&self, t: Paddr) -> Option<Paddr> {
         self.thread(t).ipcbuf.cap().map(|c| c.obj)
     }
 
-    /// Copy the pending message of `from` into `to`'s registers and buffer.
-    fn transfer(&self, from: Paddr, to: Paddr, badge: u64) {
+    /// Copy the pending message of `from` into `to`'s registers and buffer,
+    /// and with `grant` pass the capabilities it names.
+    fn transfer(&self, from: Paddr, to: Paddr, badge: u64, grant: bool) {
         let (f, t) = (self.thread(from), self.thread(to));
         t.regs[H::ARG[0]].set(badge);
         if f.ipc_flags.get() & IPC_FAULT != 0 {
@@ -31,26 +35,93 @@ impl<H: Hal> Kernel<H> {
         for i in 2..6 {
             t.regs[H::ARG[i]].set(f.regs[H::ARG[i]].get());
         }
+        let buffers = match (self.ipc_buffer(from), self.ipc_buffer(to)) {
+            (Some(src), Some(dst)) => Some((src, dst)),
+            _ => None,
+        };
         if words > MsgInfo::REG_WORDS {
-            match (self.ipc_buffer(from), self.ipc_buffer(to)) {
-                (Some(src), Some(dst)) => {
+            match buffers {
+                Some((src, dst)) => {
                     for i in MsgInfo::REG_WORDS..words {
                         let o = (i * 8) as u64;
                         self.phys.word(dst + o).set(self.phys.word(src + o).get());
                     }
                 }
-                _ => words = MsgInfo::REG_WORDS,
+                None => words = MsgInfo::REG_WORDS,
             }
         }
-        t.regs[H::ARG[1]].set(MsgInfo::new(info.label(), words).0);
+        // Capabilities: each one the sender lists goes into the slot the
+        // receiver listed at the same position. The first that cannot be
+        // passed ends the transfer; the receiver is told how many arrived.
+        let mut passed = 0;
+        if grant
+            && info.caps() > 0
+            && let Some((src, dst)) = buffers
+        {
+            for i in 0..info.caps() {
+                let o = (i * 8) as u64;
+                let named = self.phys.word(src + silica_abi::IPC_CAPS as u64 + o).get();
+                let into = self.phys.word(dst + silica_abi::IPC_RECV as u64 + o).get();
+                let (Ok(s), Ok(d)) = (self.cslot(from, named & silica_abi::IPC_CAP_SLOT), self.cslot(to, into)) else { break };
+                let ok = match named >> 60 {
+                    silica_abi::IPC_CAP_DERIVE => self.copy(s, d, Rights::ALL, 0, false).is_ok(),
+                    silica_abi::IPC_CAP_DUPLICATE => self.copy(s, d, Rights::ALL, 0, true).is_ok(),
+                    silica_abi::IPC_CAP_MOVE if !self.slot(s).is_empty() && self.slot(d).is_empty() => {
+                        self.move_slot(s, d);
+                        true
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    break;
+                }
+                passed += 1;
+            }
+        }
+        t.regs[H::ARG[1]].set(MsgInfo::with_caps(info.label(), words, passed).0);
     }
 
-    /// `server` has received `caller`'s call and now owes it a reply.
-    fn await_reply(&self, caller: Paddr, server: Paddr) {
+    /// `server` has received `caller`'s call through endpoint `ep` and owes
+    /// it an answer. If the server asked for the call to be parked on a
+    /// notification (the `park` argument of `Recv`), the caller waits there
+    /// and any thread holding that notification can answer by sending to it;
+    /// otherwise the caller waits for the server's `ReplyRecv`.
+    fn await_reply(&self, caller: Paddr, server: Paddr, ep: Paddr) {
+        let park = self.thread(server).park.replace(0);
+        if park != 0
+            && let Some(n) = self.cslot(server, park).ok().and_then(|s| self.slot(s).cap())
+            && n.ty == ObjectType::Notification
+        {
+            let q = self.queue(n.obj);
+            let cpu = self.thread(server).cpu.get() + 1;
+            // A notification nobody waits on and nobody owns yet, or one
+            // this processor already owns.
+            if q.head.get() == 0 && q.word.get() == 0 && (q.owner.claim(cpu) || self.global.get()) {
+                q.kind.set(PARKED);
+                self.q_push(&q.head, &q.tail, caller);
+                self.thread(caller).via.set(0);
+                self.block(caller, REPLY, n.obj, 0);
+                return;
+            }
+        }
         self.drop_caller(server);
         self.thread(server).caller.set(caller);
+        // Linked on the endpoint, so destroying the endpoint finds the call.
+        let q = self.queue(ep);
+        self.q_push(&q.pend_head, &q.pend_tail, caller);
+        self.thread(caller).via.set(ep);
         // Keeps the IPC_FAULT flag: the reply path needs it.
         self.block(caller, REPLY, server, 0);
+    }
+
+    /// Take `caller` (waiting for a server's reply) off its endpoint's list
+    /// of calls in progress.
+    pub(crate) fn unpend(&self, caller: Paddr) {
+        let ep = self.thread(caller).via.replace(0);
+        if ep != 0 {
+            let q = self.queue(ep);
+            self.q_remove(&q.pend_head, &q.pend_tail, caller);
+        }
     }
 
     /// Send the current thread's message to endpoint `ep`.
@@ -63,14 +134,15 @@ impl<H: Hal> Kernel<H> {
             if q.head.get() == 0 {
                 q.kind.set(0);
             }
-            self.transfer(t, r, badge);
+            self.transfer(t, r, badge, flags & IPC_GRANT != 0);
             if flags & IPC_CALL != 0 {
                 // The caller waits for the receiver, so the receiver runs now.
                 self.thread(r).regs[H::SYS].set(0);
                 self.hand_off(r);
-                self.await_reply(t, r);
+                self.await_reply(t, r, ep);
                 return Ok(Exit::Blocked);
             }
+            self.thread(r).park.set(0);
             self.wake(r, Ok(()));
             th.ipc_flags.set(0);
             return Ok(Exit::Done);
@@ -87,24 +159,32 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// Receive on endpoint `ep`. `deadline`: 0 for ever, 1 do not block.
-    pub(crate) fn recv(&self, t: Paddr, ep: Paddr, deadline: u64) -> Result<Exit, Error> {
+    /// `park`: a notification of the receiver's on which the next call is
+    /// parked (0: none).
+    pub(crate) fn recv(&self, t: Paddr, ep: Paddr, deadline: u64, park: u64) -> Result<Exit, Error> {
         let q = self.queue(ep);
+        self.thread(t).park.set(park);
         if q.kind.get() == SENDERS {
             let s = self.q_pop(&q.head, &q.tail);
             if q.head.get() == 0 {
                 q.kind.set(0);
             }
             let st = self.thread(s);
-            self.transfer(s, t, st.ipc_badge.get());
+            self.transfer(s, t, st.ipc_badge.get(), st.ipc_flags.get() & IPC_GRANT != 0);
             if st.ipc_flags.get() & IPC_CALL != 0 {
-                self.await_reply(s, t);
+                self.await_reply(s, t, ep);
             } else {
                 st.ipc_flags.set(0);
                 self.wake(s, Ok(()));
             }
+            self.thread(t).park.set(0);
             return Ok(Exit::Done);
         }
-        self.wait_on(t, ep, deadline)
+        let r = self.wait_on(t, ep, deadline);
+        if r.is_err() {
+            self.thread(t).park.set(0);
+        }
+        r
     }
 
     fn wait_on(&self, t: Paddr, q: Paddr, deadline: u64) -> Result<Exit, Error> {
@@ -126,9 +206,27 @@ impl<H: Hal> Kernel<H> {
         Ok(Exit::Blocked)
     }
 
+    /// A message sent to notification `n`: if a call is parked there, this
+    /// is its answer; otherwise OR `badge` into the pending word, waking one waiter.
+    pub(crate) fn notify(&self, t: Paddr, n: Paddr, badge: u64) -> Result<Exit, Error> {
+        let q = self.queue(n);
+        if q.kind.get() != PARKED {
+            self.signal(n, badge);
+            return Ok(Exit::Done);
+        }
+        let c = q.head.get();
+        self.answer(t, c)?;
+        Ok(Exit::Done)
+    }
+
     /// OR `badge` into notification `n`, waking one waiter.
     pub fn signal(&self, n: Paddr, badge: u64) {
         let q = self.queue(n);
+        if q.kind.get() == PARKED {
+            // A parked call is answered with a message, not woken by a signal.
+            q.word.set(q.word.get() | badge);
+            return;
+        }
         let w = self.q_pop(&q.head, &q.tail);
         if w == 0 {
             q.word.set(q.word.get() | badge);
@@ -146,6 +244,10 @@ impl<H: Hal> Kernel<H> {
     /// Take the pending word of notification `n`, or wait for a signal.
     pub(crate) fn wait(&self, t: Paddr, n: Paddr, deadline: u64) -> Result<Exit, Error> {
         let q = self.queue(n);
+        if q.kind.get() == PARKED {
+            // A call is parked here; it cannot also be waited on.
+            return Err(Error::InUse);
+        }
         let word = q.word.replace(0);
         if word != 0 {
             let th = self.thread(t);
@@ -156,19 +258,16 @@ impl<H: Hal> Kernel<H> {
         self.wait_on(t, n, deadline)
     }
 
-    /// Answer the call `t` received last. Returns whether there was a caller.
+    /// Deliver `t`'s message as the answer to the call of `c`, which waits
+    /// on `t` or is parked on a notification.
     ///
     /// The answer to a fault can carry the cure: with word 0 `FAULT_MAP` the
     /// kernel maps a frame (words 1 to 3: address space, frame, address with
-    /// rights in its low bits; capabilities of the replying thread) and then
-    /// resumes the thread. If the mapping fails the error goes to the
-    /// replying thread and the fault stays unanswered.
-    pub(crate) fn reply(&self, t: Paddr) -> Result<bool, Error> {
+    /// rights in its low bits; capabilities of the answering thread) and
+    /// then resumes the thread. If the mapping fails the error goes to the
+    /// answering thread and the call stays unanswered.
+    fn answer(&self, t: Paddr, c: Paddr) -> Result<(), Error> {
         let th = self.thread(t);
-        let c = th.caller.get();
-        if c == 0 {
-            return Ok(false);
-        }
         let ct = self.thread(c);
         let fault = ct.ipc_flags.get() & IPC_FAULT != 0;
         let word = |i: usize| th.regs[H::ARG[2 + i]].get();
@@ -177,7 +276,16 @@ impl<H: Hal> Kernel<H> {
             let (fs, _) = self.ccap(t, word(2), ObjectType::Frame, Rights::NONE)?;
             self.map(asp.obj, fs, word(3) & !0xFFF, Rights(word(3) as u8 & 0xF))?;
         }
-        th.caller.set(0);
+        // Off whatever it waits on: the endpoint's list of calls in
+        // progress, or the notification it is parked on.
+        if ct.via.get() != 0 {
+            self.unpend(c);
+            self.thread(ct.blocked_on.get()).caller.set(0);
+        } else {
+            let q = self.queue(ct.blocked_on.get());
+            self.q_remove(&q.head, &q.tail, c);
+            q.kind.set(0);
+        }
         ct.ipc_flags.set(0);
         if fault {
             if word(0) == FAULT_RESUME || word(0) == FAULT_MAP {
@@ -187,10 +295,21 @@ impl<H: Hal> Kernel<H> {
                 ct.state.set(INACTIVE);
                 self.home(c).dirty.set(true);
             }
-            return Ok(true);
+            return Ok(());
         }
-        self.transfer(t, c, 0);
+        // An answer may always carry capabilities: the caller chose to call.
+        self.transfer(t, c, 0, true);
         self.wake(c, Ok(()));
+        Ok(())
+    }
+
+    /// Answer the call `t` received last. Returns whether there was one.
+    pub(crate) fn reply(&self, t: Paddr) -> Result<bool, Error> {
+        let c = self.thread(t).caller.get();
+        if c == 0 {
+            return Ok(false);
+        }
+        self.answer(t, c)?;
         Ok(true)
     }
 

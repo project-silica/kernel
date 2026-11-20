@@ -9,6 +9,7 @@
 use crate::cap::Slot;
 use crate::hal::{Hal, NREGS};
 use crate::kernel::Kernel;
+use crate::lock::Word;
 use crate::mem::{KObj, Paddr};
 use crate::smp::Cpu;
 use core::cell::Cell;
@@ -35,6 +36,8 @@ pub const REPLY: u64 = 4;
 pub(crate) const IPC_CALL: u64 = 1;
 /// `ipc_flags`: the message is a fault report built by the kernel.
 pub(crate) const IPC_FAULT: u64 = 2;
+/// `ipc_flags`: the capability used to send may pass capabilities.
+pub(crate) const IPC_GRANT: u64 = 4;
 
 /// A thread object. The first [`FPU_OFFSET`] bytes are this structure; the
 /// rest of the 4 KiB object is the extended-state save area.
@@ -62,6 +65,11 @@ pub struct Thread {
     pub(crate) reap_next: Cell<u64>,
     /// The processor this thread runs on.
     pub(crate) cpu: Cell<u64>,
+    /// While waiting for a server's reply: the endpoint the call went
+    /// through, on whose list of calls in progress this thread is linked.
+    pub(crate) via: Cell<Paddr>,
+    /// While receiving: the slot of a notification to park the next call on.
+    pub(crate) park: Cell<u64>,
 }
 impl KObj for Thread {}
 const _: () = assert!(core::mem::size_of::<Thread>() <= FPU_OFFSET);
@@ -92,7 +100,10 @@ pub struct Queue {
     pub(crate) word: Cell<u64>,
     /// The processor whose lock alone protects this queue, plus one (0:
     /// none yet). The processor of the thread that last waited to receive.
-    pub(crate) owner: Cell<u64>,
+    pub(crate) owner: Word,
+    /// Endpoint: calls delivered through it and not yet answered.
+    pub(crate) pend_head: Cell<Paddr>,
+    pub(crate) pend_tail: Cell<Paddr>,
 }
 impl KObj for Queue {}
 
@@ -249,7 +260,16 @@ impl<H: Hal> Kernel<H> {
                 }
             }
             REPLY => {
-                self.thread(on).caller.set(0);
+                if th.via.get() != 0 {
+                    // Waiting for a server thread's reply.
+                    self.unpend(t);
+                    self.thread(on).caller.set(0);
+                } else {
+                    // Parked on a notification.
+                    let q = self.queue(on);
+                    self.q_remove(&q.head, &q.tail, t);
+                    q.kind.set(0);
+                }
                 if th.ipc_flags.get() & IPC_FAULT == 0 {
                     th.regs[H::SYS].set(Error::Gone as u64);
                 }
@@ -268,6 +288,7 @@ impl<H: Hal> Kernel<H> {
         if c == 0 {
             return;
         }
+        self.unpend(c);
         let ct = self.thread(c);
         if ct.ipc_flags.replace(0) & IPC_FAULT != 0 {
             ct.blocked_on.set(0);
@@ -311,6 +332,16 @@ impl<H: Hal> Kernel<H> {
             }
         }
         qu.kind.set(0);
+        // Calls delivered through this endpoint and not yet answered fail
+        // too: the server's reply would find no caller.
+        loop {
+            let c = qu.pend_head.get();
+            if c == 0 {
+                break;
+            }
+            let server = self.thread(c).blocked_on.get();
+            self.drop_caller(server);
+        }
     }
 
     /// The timer interrupt on this processor. Deadlines and the time slice
