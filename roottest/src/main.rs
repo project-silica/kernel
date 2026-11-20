@@ -946,6 +946,7 @@ fn t_smp_shootdown() -> T {
 
 static ROUNDS: AtomicU64 = AtomicU64::new(0);
 static LOST: AtomicU64 = AtomicU64::new(0);
+static RETRIES: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn stress_client(arg: u64) -> ! {
     let ep = Cap(SHARED[3].load(SeqCst));
@@ -960,7 +961,10 @@ extern "C" fn stress_client(arg: u64) -> ! {
             }
             // The endpoint capability is being revoked and granted again
             // under us: the documented errors, then try again.
-            Err(Error::BadCap) | Err(Error::Gone) => yield_now(),
+            Err(Error::BadCap) | Err(Error::Gone) => {
+                RETRIES.fetch_add(1, SeqCst);
+                yield_now()
+            }
             Err(_) => {
                 LOST.fetch_add(1 << 32, SeqCst);
                 done += 1;
@@ -1005,6 +1009,7 @@ fn smp_stress(rounds: u64, revoke: bool) -> T {
     SHARED[3].store(lent, SeqCst);
     ROUNDS.store(0, SeqCst);
     LOST.store(0, SeqCst);
+    RETRIES.store(0, SeqCst);
     // Server and client share processor 1 (the fast, local path); a second
     // client calls from processor 2 (the cross-processor path).
     let _ = spawn_on(1, stress_server, master.0, Cap::NONE);
@@ -1016,6 +1021,7 @@ fn smp_stress(rounds: u64, revoke: bool) -> T {
     let mut revokes = 0u64;
     while ROUNDS.load(SeqCst) < total {
         if CLOCK.now() > end {
+            println!("smp_stress: {} of {total} round trips, {revokes} revokes, {} retries", ROUNDS.load(SeqCst), RETRIES.load(SeqCst));
             return Err("the round trips did not finish in two minutes");
         }
         if revoke {
@@ -1023,6 +1029,16 @@ fn smp_stress(rounds: u64, revoke: bool) -> T {
             unsafe { cap_delete(Cap(lent)) }.map_err(|_| "revoke")?;
             cap_derive(SPACE, lent, master, Rights::ALL, 0).map_err(|_| "grant again")?;
             revokes += 1;
+            // A revoke fails the calls in flight through the capability
+            // (spec/ARCHITECTURE.md section 6, IPC). Revoking again before
+            // any call could finish would starve the clients by design, so
+            // the capability stays granted for 20 microseconds: longer than
+            // a cross-processor round trip, short enough that thousands of
+            // calls are cut off mid-flight.
+            let until = CLOCK.now() + 20_000;
+            while CLOCK.now() < until {
+                core::hint::spin_loop();
+            }
         } else {
             sleep_ms(5);
         }
@@ -1030,8 +1046,14 @@ fn smp_stress(rounds: u64, revoke: bool) -> T {
     if LOST.load(SeqCst) != 0 {
         return Err("a call returned a wrong reply or an undocumented error");
     }
-    if revoke && revokes < 100 {
-        return Err("the capability was revoked fewer than 100 times during the run");
+    if revoke && revokes < 1000 {
+        return Err("the capability was revoked fewer than 1000 times during the run");
+    }
+    if revoke && RETRIES.load(SeqCst) < 100 {
+        return Err("fewer than 100 calls were cut off by a revoke: the abort path was not exercised");
+    }
+    if revoke {
+        println!("smp_revoke: {total} round trips, {revokes} revokes, {} calls cut off and retried", RETRIES.load(SeqCst));
     }
     Ok(())
 }
@@ -1042,6 +1064,95 @@ fn t_smp_stress() -> T {
 
 fn t_smp_revoke() -> T {
     smp_stress(1_000_000, true)
+}
+
+static TIMEOUT_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const STOP: usize = 5;
+const GOT: usize = 0;
+const SENT: usize = 1;
+const TIMED_OUT: usize = 2;
+const WRONG: usize = 3;
+const FINISHED: usize = 4;
+
+extern "C" fn impatient_receiver(arg: u64) -> ! {
+    let ep = Cap(SHARED[3].load(SeqCst));
+    let mut n = arg & 0xFF;
+    while TIMEOUT_STATS[STOP].load(SeqCst) == 0 {
+        n += 1;
+        match recv(ep, Wait::Until(CLOCK.now() + 10_000 + n % 7 * 3_000)) {
+            Ok(m) if m.words[0] == 9 => TIMEOUT_STATS[GOT].fetch_add(1, SeqCst),
+            Err(Error::Timeout) => TIMEOUT_STATS[TIMED_OUT].fetch_add(1, SeqCst),
+            _ => TIMEOUT_STATS[WRONG].fetch_add(1, SeqCst),
+        };
+    }
+    TIMEOUT_STATS[FINISHED].fetch_add(1, SeqCst);
+    finish(arg)
+}
+
+extern "C" fn hasty_sender(arg: u64) -> ! {
+    let ep = Cap(SHARED[3].load(SeqCst));
+    // The senders pause on one notification they share, so its queue too
+    // holds waiters of several processors, each with a deadline.
+    let pause = Cap(arg & 0xFFFF_FFFF);
+    for i in 0..100_000u64 {
+        if i % 32 == 0 {
+            let _ = recv(pause, Wait::Until(CLOCK.now() + 30_000));
+        }
+        match try_send(ep, MsgInfo::new(7, 1), [9, 0, 0, 0]) {
+            Ok(()) => TIMEOUT_STATS[SENT].fetch_add(1, SeqCst),
+            Err(Error::WouldBlock) => 0,
+            Err(_) => TIMEOUT_STATS[WRONG].fetch_add(1, SeqCst),
+        };
+    }
+    TIMEOUT_STATS[FINISHED].fetch_add(1, SeqCst);
+    finish(arg)
+}
+
+/// Threads on four processors receive on one endpoint, each with a deadline
+/// a few microseconds away, while threads on three processors send to it
+/// without waiting. The queue of receivers is linked through threads of
+/// every processor and belongs to whichever waited last, so each timeout
+/// and each send unlinks a waiter that may be another processor's. Every
+/// message sent is received exactly once and nothing else happens.
+fn t_smp_timeouts() -> T {
+    need_cpus(4)?;
+    let ep = new(ObjectType::Endpoint, 0);
+    SHARED[3].store(ep.0, SeqCst);
+    for s in &TIMEOUT_STATS {
+        s.store(0, SeqCst);
+    }
+    for cpu in 0..4 {
+        let _ = spawn_on(cpu, impatient_receiver, cpu as u64, Cap::NONE);
+    }
+    let pause = new(ObjectType::Notification, 0);
+    for cpu in 1..4 {
+        let _ = spawn_on(cpu, hasty_sender, pause.0, Cap::NONE);
+    }
+    let end = CLOCK.now() + 120_000_000_000;
+    let wait = |finished: u64| {
+        while TIMEOUT_STATS[FINISHED].load(SeqCst) < finished {
+            if CLOCK.now() > end {
+                return Err("the senders and receivers did not finish in two minutes");
+            }
+            sleep_ms(1);
+        }
+        Ok(())
+    };
+    wait(3)?;
+    TIMEOUT_STATS[STOP].store(1, SeqCst);
+    wait(7)?;
+    let stat = |i: usize| TIMEOUT_STATS[i].load(SeqCst);
+    println!("smp_timeouts: {} sent, {} received, {} timeouts", stat(SENT), stat(GOT), stat(TIMED_OUT));
+    if stat(WRONG) != 0 {
+        return Err("a receive or a send returned something undocumented");
+    }
+    if stat(GOT) != stat(SENT) {
+        return Err("messages sent and messages received differ");
+    }
+    if stat(SENT) < 100 || stat(TIMED_OUT) < 100 {
+        return Err("the test did not exercise both sends and timeouts");
+    }
+    Ok(())
 }
 
 static CLOCK_CELL: [AtomicU64; 3] = [const { AtomicU64::new(1) }; 3];
@@ -1290,15 +1401,17 @@ extern "C" fn pair_client(arg: u64) -> ! {
 }
 
 /// Round trips per second of `pairs` independent client and server pairs,
-/// each pair on its own processor, each server in its own address space.
-fn bench_pairs(pairs: usize) -> u64 {
+/// each server in its own address space. Each pair has a processor to
+/// itself, or with `cross` two: the client on one, the server on the next.
+fn bench_pairs(pairs: usize, cross: bool) -> u64 {
     GO.store(0, SeqCst);
     let mut threads = [Cap::NONE; 16];
     for p in 0..pairs {
         COUNTS[p].store(0, SeqCst);
         let ep = new(ObjectType::Endpoint, 0);
-        threads[2 * p] = foreign_thread_on(p, stub(&raw const stub_echo, &raw const stub_echo_end), ep.0);
-        threads[2 * p + 1] = spawn_on(p, pair_client, p as u64 | ep.0 << 8, Cap::NONE).0;
+        let (client_cpu, server_cpu) = if cross { (2 * p, 2 * p + 1) } else { (p, p) };
+        threads[2 * p] = foreign_thread_on(server_cpu, stub(&raw const stub_echo, &raw const stub_echo_end), ep.0);
+        threads[2 * p + 1] = spawn_on(client_cpu, pair_client, p as u64 | ep.0 << 8, Cap::NONE).0;
     }
     // Processor 0 hosts a pair too, so this thread sleeps while they run.
     sleep_ms(20);
@@ -1330,12 +1443,21 @@ fn bench() -> ! {
     bench_ctx_switch();
     bench_page_fault();
     bench_timer();
-    let one = bench_pairs(1);
+    let one = bench_pairs(1, false);
     println!("BENCH ipc_pairs1 {one} ops/s");
     if CPUS.load(SeqCst) >= 8 {
-        let eight = bench_pairs(8);
+        let eight = bench_pairs(8, false);
         println!("BENCH ipc_pairs8 {eight} ops/s");
         println!("BENCH ipc_scaling {}.{:02} x", eight / one, eight * 100 / one % 100);
+    }
+    if CPUS.load(SeqCst) >= 2 {
+        let one = bench_pairs(1, true);
+        println!("BENCH ipc_cross_pairs1 {one} ops/s");
+        if CPUS.load(SeqCst) >= 8 {
+            let four = bench_pairs(4, true);
+            println!("BENCH ipc_cross_pairs4 {four} ops/s");
+            println!("BENCH ipc_cross_scaling {}.{:02} x", four / one, four * 100 / one % 100);
+        }
     }
     println!("BENCH DONE");
     exit(true)
@@ -1365,6 +1487,7 @@ const TESTS: &[(&str, fn() -> T)] = &[
     ("smp_shootdown", t_smp_shootdown),
     ("smp_stress", t_smp_stress),
     ("smp_revoke", t_smp_revoke),
+    ("smp_timeouts", t_smp_timeouts),
 ];
 
 /// Program entry, called by libsys's `_start`.

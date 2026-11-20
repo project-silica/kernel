@@ -426,13 +426,31 @@ impl<H: Hal> Kernel<H> {
     fn expire(&self) {
         let me = self.me();
         let now = self.hal.now();
+        let mut global = false;
         loop {
             let t = me.timers.get();
             if t == 0 || self.thread(t).deadline.get() > now {
                 break;
             }
+            // The links of a queue belong to the processor that owns it. A
+            // waiter of this processor in a queue another one owns (several
+            // processors receive on it) is taken out holding every lock,
+            // and the deadlines are looked at afresh.
+            let th = self.thread(t);
+            if !global
+                && self.ncpu.get() > 1
+                && matches!(th.state.get(), SENDING | RECEIVING)
+                && self.queue(th.blocked_on.get()).owner.get() != self.hal.cpu() as u64 + 1
+            {
+                self.go_global();
+                global = true;
+                continue;
+            }
             self.cancel(t, false);
             self.wake(t, Err(Error::Timeout));
+        }
+        if global {
+            self.go_local();
         }
         if now >= me.slice_end.get() {
             me.resched.set(true);

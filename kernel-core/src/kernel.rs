@@ -3,7 +3,7 @@
 use crate::cap::{Cap, FLAG_DEVICE, FLAG_PORTS};
 use crate::hal::Hal;
 use crate::mem::{Paddr, Phys};
-use crate::smp::{Cpu, MAX_CPUS};
+use crate::smp::{Cpu, Held, MAX_CPUS};
 use crate::thread::{INACTIVE, IPC_CALL, IPC_GRANT, RUNNABLE, Thread};
 use core::cell::Cell;
 use silica_abi::{Error, KEEP, MsgInfo, NONBLOCK, ObjectType, PAGE_BITS, Rights, Syscall};
@@ -86,39 +86,70 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// Whether thread `x` and the thread waiting for its reply, if any,
-    /// belong to this processor. `x` itself must be readable under this
-    /// processor's lock: one of its own, or one found in a queue it owns.
-    fn here(&self, x: Paddr) -> bool {
-        let me = self.hal.cpu() as u64;
+    /// belong to processors whose locks this entry holds. `x` itself must
+    /// be readable under those locks: a thread of one of them, or one found
+    /// in a queue one of them owns.
+    fn here(&self, h: Held, x: Paddr) -> bool {
         let th = self.thread(x);
-        th.cpu.get() == me && (th.caller.get() == 0 || self.thread(th.caller.get()).cpu.get() == me)
+        h.has(th.cpu.get()) && (th.caller.get() == 0 || h.has(self.thread(th.caller.get()).cpu.get()))
+    }
+
+    /// Whether the queue's owner is a processor whose lock this entry holds.
+    fn owned(&self, h: Held, q: Paddr) -> bool {
+        let o = self.queue(q).owner.get();
+        o != 0 && h.has(o - 1)
     }
 
     /// Whether an IPC operation of thread `t` on the queue behind `cap`
-    /// touches only what this processor's lock protects.
-    pub(crate) fn queue_is_local(&self, t: Paddr, cap: &Cap) -> bool {
+    /// touches only what the locks this entry holds protect.
+    pub(crate) fn queue_is_local(&self, h: Held, t: Paddr, cap: &Cap) -> bool {
         if !matches!(cap.ty, ObjectType::Endpoint | ObjectType::Notification) {
             return true; // an error, reported without touching anything
+        }
+        if !self.owned(h, cap.obj) {
+            return false;
         }
         let q = self.queue(cap.obj);
         let head = q.head.get();
         // Answering a parked call unlinks the caller from the endpoint
         // its call came through.
-        if q.kind.get() == crate::ipc::PARKED && self.queue(self.thread(head).via.get()).owner.get() != self.hal.cpu() as u64 + 1 {
+        if q.kind.get() == crate::ipc::PARKED && !self.owned(h, self.thread(head).via.get()) {
             return false;
         }
-        q.owner.get() == self.hal.cpu() as u64 + 1
-            && (head == 0 || (self.here(head) && MsgInfo(self.thread(head).regs[H::ARG[1]].get()).caps() == 0))
-            && self.here(t)
+        // A receiver at the head may have asked for the call it gets to be
+        // parked on a notification of its own.
+        if q.kind.get() == crate::ipc::RECEIVERS && !self.park_is_local(h, head, self.thread(head).park.get()) {
+            return false;
+        }
+        (head == 0 || (self.here(h, head) && MsgInfo(self.thread(head).regs[H::ARG[1]].get()).caps() == 0)) && self.here(h, t)
     }
 
-    /// Whether syscall `s` can run holding only this processor's lock.
+    /// Whether the notification in slot `park` of thread `server`, on which
+    /// the server wants its next call parked, can be used under the locks
+    /// this entry holds: nobody owns it yet, or a processor whose lock is
+    /// held does.
+    fn park_is_local(&self, h: Held, server: Paddr, park: u64) -> bool {
+        if park == 0 {
+            return true;
+        }
+        match self.cslot(server, park).ok().and_then(|s| self.slot(s).cap()) {
+            Some(n) if n.ty == ObjectType::Notification => {
+                let o = self.queue(n.obj).owner.get();
+                o == 0 || h.has(o - 1)
+            }
+            _ => true, // not parked at all
+        }
+    }
+
+    /// Whether syscall `s` can run holding only the locks this entry holds:
+    /// this processor's, and after [`Kernel::go_pair`] one other's.
     fn is_local(&self, s: Syscall, t: Paddr, a: &[u64; 6]) -> bool {
         if self.ncpu.get() == 1 {
             return true;
         }
+        let h = self.held();
         let queue = |index: u64| match self.cslot(t, index).ok().and_then(|slot| self.slot(slot).cap()) {
-            Some(cap) => self.queue_is_local(t, &cap),
+            Some(cap) => self.queue_is_local(h, t, &cap),
             None => true, // BadCap, reported without touching anything
         };
         match s {
@@ -126,15 +157,89 @@ impl<H: Hal> Kernel<H> {
             Syscall::Yield | Syscall::PortIo | Syscall::Map => true,
             // Passing capabilities changes capability slots.
             Syscall::Call | Syscall::Send => MsgInfo(a[1]).caps() == 0 && queue(a[0] & !NONBLOCK),
-            Syscall::Recv => queue(a[0]),
+            Syscall::Recv => queue(a[0]) && self.park_is_local(h, t, a[2]),
             Syscall::ReplyRecv => {
                 // The reply unlinks the caller from the endpoint its call came through.
                 let c = self.thread(t).caller.get();
-                let via = c == 0 || self.queue(self.thread(c).via.get()).owner.get() == self.hal.cpu() as u64 + 1;
-                MsgInfo(a[1]).caps() == 0 && via && self.here(t) && (a[0] == 0 || queue(a[0]))
+                let via = c == 0 || self.owned(h, self.thread(c).via.get());
+                MsgInfo(a[1]).caps() == 0 && via && self.here(h, t) && (a[0] == 0 || queue(a[0]))
             }
             _ => false,
         }
+    }
+
+    /// For a syscall that is not local: the one other processor whose lock
+    /// would make it so, if what can be read under this processor's lock
+    /// names one. A guess, checked by `is_local` once both locks are held.
+    fn partner(&self, s: Syscall, t: Paddr, a: &[u64; 6]) -> Option<usize> {
+        let me = self.hal.cpu() as u64;
+        let other = |cpu: u64| (cpu != me).then_some(cpu as usize);
+        // Of a queue: its owner, or (the queue being this processor's) the
+        // home of the thread at its head or of that thread's caller.
+        let of_queue = |index: u64| -> Option<usize> {
+            let cap = self.cslot(t, index).ok().and_then(|slot| self.slot(slot).cap())?;
+            if !matches!(cap.ty, ObjectType::Endpoint | ObjectType::Notification) {
+                return None;
+            }
+            let q = self.queue(cap.obj);
+            match q.owner.get() {
+                0 => return None,
+                o if o != me + 1 => return Some(o as usize - 1),
+                _ => {}
+            }
+            let head = q.head.get();
+            if head == 0 {
+                return None;
+            }
+            let th = self.thread(head);
+            if th.cpu.get() != me {
+                return other(th.cpu.get());
+            }
+            if q.kind.get() == crate::ipc::PARKED {
+                return self.queue(th.via.get()).owner.get().checked_sub(1).and_then(other);
+            }
+            let c = th.caller.get();
+            if c != 0 { other(self.thread(c).cpu.get()) } else { None }
+        };
+        match s {
+            Syscall::Call | Syscall::Send if MsgInfo(a[1]).caps() == 0 => of_queue(a[0] & !NONBLOCK),
+            Syscall::Recv => of_queue(a[0]),
+            Syscall::ReplyRecv if MsgInfo(a[1]).caps() == 0 => {
+                let c = self.thread(t).caller.get();
+                let of_caller = if c == 0 {
+                    None
+                } else {
+                    other(self.thread(c).cpu.get())
+                        .or_else(|| self.queue(self.thread(c).via.get()).owner.get().checked_sub(1).and_then(other))
+                };
+                of_caller.or_else(|| if a[0] != 0 { of_queue(a[0]) } else { None })
+            }
+            _ => None,
+        }
+    }
+
+    /// A syscall `s` of thread `t` that is not local: if it involves one
+    /// other processor, take that one's lock as well and look again.
+    /// Returns whether the syscall still needs every lock, or `None` when
+    /// the thread no longer runs (it was stopped while the locks were taken).
+    /// Out of line: the path between threads of one processor is the hot
+    /// one and must not pay for this one's registers.
+    #[cold]
+    #[inline(never)]
+    fn try_pair(&self, s: Syscall, t: Paddr, a: &[u64; 6]) -> Option<bool> {
+        let Some(other) = self.partner(s, t, a) else { return Some(true) };
+        self.go_pair(other);
+        let me = self.me();
+        if me.cur.get() != t || self.thread(t).state.get() != RUNNABLE {
+            me.dirty.set(true);
+            self.leave_pair();
+            return None;
+        }
+        let global = !self.is_local(s, t, a);
+        if global {
+            self.leave_pair();
+        }
+        Some(global)
     }
 
     /// Handle the syscall the current thread just made.
@@ -154,7 +259,13 @@ impl<H: Hal> Kernel<H> {
             r[H::SYS].set(Error::BadSyscall as u64);
             return;
         };
-        let global = !self.is_local(s, t, &a);
+        let mut global = !self.is_local(s, t, &a);
+        if global {
+            match self.try_pair(s, t, &a) {
+                Some(g) => global = g,
+                None => return,
+            }
+        }
         if global {
             self.go_global();
             if me.cur.get() != t || self.thread(t).state.get() != RUNNABLE {
@@ -172,6 +283,7 @@ impl<H: Hal> Kernel<H> {
         if global {
             self.go_local();
         }
+        self.leave_pair();
     }
 
     fn dispatch(&self, s: Syscall, t: Paddr, a: [u64; 6]) -> Result<Exit, Error> {

@@ -7,7 +7,7 @@ use crate::thread::{INACTIVE, IPC_CALL, IPC_FAULT, IPC_GRANT, IPC_PARKED, RECEIV
 use silica_abi::{Error, FAULT_LABEL, FAULT_MAP, FAULT_RESUME, Fault, MsgInfo, ObjectType, Rights};
 
 const SENDERS: u64 = 1;
-const RECEIVERS: u64 = 2;
+pub(crate) const RECEIVERS: u64 = 2;
 
 /// The queue holds one call waiting for its answer (a parked caller).
 pub(crate) const PARKED: u64 = 3;
@@ -106,9 +106,11 @@ impl<H: Hal> Kernel<H> {
         {
             let q = self.queue(n.obj);
             let cpu = self.thread(server).cpu.get() + 1;
-            // A notification nobody waits on and nobody owns yet, or one
-            // this processor already owns.
-            if q.head.get() == 0 && q.word.get() == 0 && (q.owner.claim(cpu) || self.global.get()) {
+            // A notification nobody waits on, which nobody owns yet or
+            // whose owner's lock is held (every entry that gets here has
+            // made sure of that): it becomes the server's processor's.
+            if q.head.get() == 0 && q.word.get() == 0 && (q.owner.claim(cpu) || self.holds(q.owner.get() - 1)) {
+                q.owner.set(cpu);
                 // One call at most is parked on a notification, so it is
                 // the whole queue; the caller's links stay the endpoint's.
                 q.kind.set(PARKED);
@@ -208,10 +210,9 @@ impl<H: Hal> Kernel<H> {
         }
         let qu = self.queue(q);
         // The queue belongs to the processor of whoever waits to receive
-        // on it; only a holder of every lock may move it.
-        if self.global.get() {
-            qu.owner.set(self.thread(t).cpu.get() + 1);
-        }
+        // on it. It moves only while its old owner's lock is held, which
+        // every entry that gets here has made sure of.
+        qu.owner.set(self.thread(t).cpu.get() + 1);
         qu.kind.set(RECEIVERS);
         self.q_push(&qu.head, &qu.tail, t);
         self.block(t, RECEIVING, q, deadline);
@@ -358,7 +359,7 @@ impl<H: Hal> Kernel<H> {
             return;
         }
         let th = self.thread(t);
-        let global = self.ncpu.get() > 1 && !th.fault_ep.cap().is_some_and(|c| self.queue_is_local(t, &c));
+        let global = self.ncpu.get() > 1 && !th.fault_ep.cap().is_some_and(|c| self.queue_is_local(self.held(), t, &c));
         if global {
             self.go_global();
             if me.cur.get() != t || th.state.get() != crate::thread::RUNNABLE {

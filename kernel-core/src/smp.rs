@@ -12,8 +12,13 @@
 //!   keeps its own processor's lock and adds one lock shared by all mapping
 //!   (`Kernel::structure`); a fault resolved by a pager never stops the
 //!   other processors.
+//! - *Pair.* A message between threads of two processors, or through a
+//!   queue the other one owns, takes the other processor's lock as well
+//!   (in index order) and then checks that everything the operation will
+//!   touch belongs to one of the two. Pairs of processors talking to each
+//!   other do not wait for the rest of the machine.
 //! - *Global.* An operation that changes anything else (capability slots,
-//!   mappings being removed, threads or queues of another processor) first takes every
+//!   mappings being removed, threads or queues of more than two processors) first takes every
 //!   processor's lock, in index order, having let go of its own. Holding
 //!   them all it is the only code in the kernel, so nothing it changes can
 //!   be in use; before it reuses memory it brings every processor that
@@ -67,6 +72,27 @@ pub struct Cpu {
     /// Another processor changed mappings of the loaded address space:
     /// drop cached translations before running user code again.
     pub(crate) flush: Cell<bool>,
+    /// The other processor whose lock this kernel entry also holds, plus
+    /// one (0: none).
+    pub(crate) pair: Cell<u64>,
+    /// How many of this processor's kernel entries took a second lock.
+    pub(crate) pairs: Cell<u64>,
+}
+
+/// The processors whose locks a kernel entry holds.
+#[derive(Clone, Copy)]
+pub(crate) struct Held {
+    me: u64,
+    /// The second processor plus one (0: none).
+    pair: u64,
+    all: bool,
+}
+
+impl Held {
+    /// Whether processor `cpu`'s lock is among them.
+    pub(crate) fn has(self, cpu: u64) -> bool {
+        cpu == self.me || cpu.wrapping_add(1) == self.pair || self.all
+    }
 }
 
 impl Cpu {
@@ -86,6 +112,8 @@ impl Cpu {
             direct: Cell::new(0),
             dirty: Cell::new(true),
             flush: Cell::new(false),
+            pair: Cell::new(0),
+            pairs: Cell::new(0),
         }
     }
 }
@@ -146,6 +174,43 @@ impl<H: Hal> Kernel<H> {
     /// for tests and the debug console).
     pub fn global_entries(&self) -> u64 {
         self.globals.get()
+    }
+
+    /// From holding this processor's lock to holding processor `other`'s as
+    /// well. This one's may have been let go on the way: the caller
+    /// re-examines everything it looked at before.
+    pub(crate) fn go_pair(&self, other: usize) {
+        let me = self.hal.cpu();
+        crate::lock::go_pair(&self.cpus[me].lock, &self.cpus[other].lock, other < me);
+        let cpu = self.me();
+        cpu.pair.set(other as u64 + 1);
+        cpu.pairs.set(cpu.pairs.get() + 1);
+        self.caught_up();
+    }
+
+    /// Let go of the second lock taken by [`Kernel::go_pair`].
+    pub(crate) fn leave_pair(&self) {
+        let other = self.me().pair.replace(0);
+        if other != 0 {
+            self.unlock(other as usize - 1);
+        }
+    }
+
+    /// The locks this kernel entry holds, read once for a series of checks.
+    pub(crate) fn held(&self) -> Held {
+        Held { me: self.hal.cpu() as u64, pair: self.me().pair.get(), all: self.global.get() }
+    }
+
+    /// Whether this kernel entry holds processor `cpu`'s lock.
+    pub(crate) fn holds(&self, cpu: u64) -> bool {
+        self.held().has(cpu)
+    }
+
+    /// How many times a kernel entry has taken a second processor's lock
+    /// (a statistic for tests and the debug console).
+    /// Only for tests: call it while no processor is in the kernel.
+    pub fn pair_entries(&self) -> u64 {
+        self.cpus[..self.ncpu.get()].iter().map(|c| c.pairs.get()).sum()
     }
 
     /// Back to holding only this processor's lock.

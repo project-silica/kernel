@@ -26,7 +26,7 @@ mod sync {
 #[path = "../src/lock.rs"]
 mod lock;
 
-use lock::{Lock, Presence, go_global, go_local};
+use lock::{Lock, Presence, go_global, go_local, go_pair};
 use loom::cell::UnsafeCell;
 use loom::sync::Arc;
 use loom::sync::atomic::{AtomicBool, Ordering};
@@ -95,6 +95,117 @@ fn two_global_entries_exclude_each_other_and_do_not_deadlock() {
         a.join().unwrap();
         assert_eq!(m.shared.with(|p| unsafe { *p }), 2);
         assert_eq!(m.cpu[0].with(|p| unsafe { *p }), 21);
+    });
+}
+
+/// Three processors. A kernel entry of processor `me` that takes processor
+/// `other`'s lock as well (a message between the two) changes the state of
+/// both and of nobody else.
+struct Three {
+    locks: [Lock; 3],
+    cpu: [UnsafeCell<u32>; 3],
+}
+
+impl Three {
+    fn new() -> Arc<Three> {
+        Arc::new(Three {
+            locks: [Lock::new(), Lock::new(), Lock::new()],
+            cpu: [UnsafeCell::new(0), UnsafeCell::new(0), UnsafeCell::new(0)],
+        })
+    }
+    fn pair(&self, me: usize, other: usize) {
+        self.locks[me].lock();
+        go_pair(&self.locks[me], &self.locks[other], other < me);
+        for c in [me, other] {
+            self.cpu[c].with_mut(|p| unsafe { *p += 1 });
+        }
+        self.locks[other].unlock();
+        self.locks[me].unlock();
+    }
+    fn global(&self, me: usize) {
+        self.locks[me].lock();
+        go_global(&self.locks[me], self.locks.iter());
+        for c in &self.cpu {
+            c.with_mut(|p| unsafe { *p += 10 });
+        }
+        go_local(me, self.locks.iter());
+        self.locks[me].unlock();
+    }
+}
+
+#[test]
+fn two_processors_taking_each_others_locks_do_not_deadlock_or_overlap() {
+    loom::model(|| {
+        let m = Three::new();
+        let a = {
+            let m = m.clone();
+            thread::spawn(move || m.pair(0, 1))
+        };
+        m.pair(1, 0);
+        a.join().unwrap();
+        assert_eq!((m.cpu[0].with(|p| unsafe { *p }), m.cpu[1].with(|p| unsafe { *p })), (2, 2));
+    });
+}
+
+#[test]
+fn a_pair_entry_and_a_global_entry_exclude_each_other() {
+    loom::model(|| {
+        let m = Three::new();
+        let a = {
+            let m = m.clone();
+            thread::spawn(move || m.pair(2, 1))
+        };
+        m.global(0);
+        a.join().unwrap();
+        assert_eq!((m.cpu[0].with(|p| unsafe { *p }), m.cpu[1].with(|p| unsafe { *p }), m.cpu[2].with(|p| unsafe { *p })), (10, 11, 11));
+    });
+}
+
+/// A queue is protected by the lock of the processor that owns it, and its
+/// owner changes only while the old owner's lock is held. Processor 0,
+/// holding both locks, takes the queue over from processor 1; processor 1,
+/// holding its own lock, uses the queue only if it still owns it. Neither
+/// ever uses it while the other does.
+#[test]
+fn a_queue_changing_owner_is_never_used_under_the_old_owners_lock_alone() {
+    loom::model(|| {
+        struct S {
+            locks: [Lock; 2],
+            /// The owning processor plus one, as in a queue's `owner` word.
+            owner: loom::sync::atomic::AtomicU64,
+            queue: UnsafeCell<u32>,
+        }
+        let s = Arc::new(S { locks: [Lock::new(), Lock::new()], owner: loom::sync::atomic::AtomicU64::new(2), queue: UnsafeCell::new(0) });
+        let old_owner = {
+            let s = s.clone();
+            thread::spawn(move || {
+                for _ in 0..2 {
+                    s.locks[1].lock();
+                    if s.owner.load(Ordering::Relaxed) == 2 {
+                        s.queue.with_mut(|p| unsafe { *p += 1 });
+                    }
+                    s.locks[1].unlock();
+                }
+            })
+        };
+        // Processor 0: a receive on a queue processor 1 owns.
+        s.locks[0].lock();
+        if s.owner.load(Ordering::Relaxed) == 2 {
+            go_pair(&s.locks[0], &s.locks[1], false);
+            // Looked at again with both locks held.
+            if s.owner.load(Ordering::Relaxed) == 2 {
+                s.queue.with_mut(|p| unsafe { *p += 10 });
+                s.owner.store(1, Ordering::Relaxed);
+            }
+            s.locks[1].unlock();
+        }
+        // From here on the queue is processor 0's alone.
+        if s.owner.load(Ordering::Relaxed) == 1 {
+            s.queue.with_mut(|p| unsafe { *p += 10 });
+        }
+        s.locks[0].unlock();
+        old_owner.join().unwrap();
+        assert!(s.queue.with(|p| unsafe { *p }) >= 20);
     });
 }
 

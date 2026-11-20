@@ -627,6 +627,7 @@ fn a_call_across_processors_wakes_the_server_there_and_the_reply_comes_back() {
     assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
     m.on(0);
     let kicks = m.k.hal.kicks.borrow().len();
+    let (globals, pairs) = (m.k.global_entries(), m.k.pair_entries());
     assert!(m.raw(S::Call as u64, [FREE + 1, MsgInfo::new(3, 2).0, 10, 20, 0, 0]).blocked);
     assert_eq!(m.k.hal.kicks.borrow()[kicks..], [(1, false)], "processor 1 is kicked to run the server");
     assert_eq!(m.k.thread_view(m.root).state, REPLY);
@@ -637,6 +638,92 @@ fn a_call_across_processors_wakes_the_server_there_and_the_reply_comes_back() {
     m.settle(0);
     assert_eq!(m.k.current(), m.root);
     assert_eq!((m.status(m.root), m.arg(m.root, 2)), (0, 30));
+    // The call and the reply each took the two processors' locks, and
+    // neither stopped the rest of the machine.
+    assert_eq!((m.k.global_entries(), m.k.pair_entries()), (globals, pairs + 2));
+}
+
+#[test]
+fn a_receive_timing_out_on_a_queue_another_processor_owns_takes_every_lock() {
+    let (m, t) = two_processors();
+    // A second thread on each processor, so neither idles (which, here,
+    // would move the clock to the next deadline).
+    let (ut, _) = m.big_untyped();
+    m.spawn(ut, FREE + 3);
+    m.spawn(ut, FREE + 4);
+    m.ok(S::ThreadControl, [FREE + 4, 2, 1, 0, 0, 0]);
+    m.ok(S::ThreadControl, [FREE + 4, 1, 0, 0, 0, 0]);
+    m.settle(1);
+    assert_eq!(m.k.current(), t);
+    m.on(0);
+    assert_eq!(m.k.current(), m.root);
+    let at = m.k.hal.now.get() + 1_000_000;
+    // Processor 1's thread waits first, then the root on processor 0: the
+    // queue now belongs to processor 0 and holds a thread of each.
+    m.on(1);
+    assert!(m.raw(S::Recv as u64, [FREE, at, 0, 0, 0, 0]).blocked);
+    m.on(0);
+    assert!(m.raw(S::Recv as u64, [FREE, at + 9_000_000, 0, 0, 0, 0]).blocked);
+    let globals = m.k.global_entries();
+    // Processor 1's deadline passes. Its waiter is unlinked from a queue
+    // whose links are processor 0's, so not under processor 1's lock alone.
+    m.k.hal.now.set(at);
+    m.on(1);
+    m.tick();
+    assert_eq!(m.k.global_entries(), globals + 1);
+    assert_eq!((m.k.thread_view(t).state, Error::result(m.status(t))), (RUNNABLE, Err(Error::Timeout)));
+    // The queue is whole: a message sent now reaches the root.
+    m.sys_as(t, S::Yield, [0; 6]);
+    assert!(!m.raw(S::Send as u64, [FREE + 1, MsgInfo::new(1, 1).0, 42, 0, 0, 0]).blocked);
+    assert_eq!((m.k.thread_view(m.root).state, m.status(m.root), m.arg(m.root, 0), m.arg(m.root, 2)), (RUNNABLE, 0, 77, 42));
+}
+
+#[test]
+fn a_call_is_parked_on_a_notification_last_used_from_a_third_processor() {
+    // Root on processor 0, servers `a` on processor 1 and `b` on processor 2,
+    // an endpoint at FREE (badged copy at FREE + 1), a notification at FREE + 9.
+    let m = Machine::with_cpus(16, 3);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Endpoint, 0, FREE, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 15, 77, 0]);
+    m.retype(ut, T::Notification, 0, FREE + 9, 1);
+    let place = |slot: u64, cpu: u64| {
+        let t = m.spawn(ut, slot);
+        m.ok(S::ThreadControl, [slot, 2, cpu, 0, 0, 0]);
+        m.ok(S::ThreadControl, [slot, 1, 0, 0, 0, 0]);
+        m.settle(cpu as usize);
+        assert_eq!(m.k.current(), t);
+        m.on(0);
+        t
+    };
+    let (a, b) = (place(FREE + 2, 1), place(FREE + 3, 2));
+    let n = m.cap(FREE + 9).unwrap().obj;
+    // `b` takes a call parked on the notification and answers it: the
+    // notification is now processor 2's.
+    m.on(2);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, FREE + 9, 0, 0, 0]).blocked);
+    m.on(0);
+    assert!(m.raw(S::Call as u64, [FREE + 1, MsgInfo::new(0, 1).0, 1, 0, 0, 0]).blocked);
+    assert_eq!(m.k.thread_view(m.root).blocked_on, n);
+    m.settle(2);
+    assert_eq!(m.k.current(), b);
+    assert!(!m.raw(S::Send as u64, [FREE + 9, MsgInfo::new(0, 1).0, 2, 0, 0, 0]).blocked);
+    m.settle(0);
+    assert_eq!((m.k.current(), m.status(m.root), m.arg(m.root, 2)), (m.root, 0, 2));
+    // Now `a` on processor 1 asks for its next call to be parked there. The
+    // call from processor 0 is parked, although neither processor owned
+    // the notification, and `a` answers it.
+    m.on(1);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, FREE + 9, 0, 0, 0]).blocked);
+    m.on(0);
+    assert!(m.raw(S::Call as u64, [FREE + 1, MsgInfo::new(0, 1).0, 3, 0, 0, 0]).blocked);
+    assert_eq!(m.k.thread_view(m.root).blocked_on, n, "the call is parked");
+    assert_eq!(m.k.thread_view(a).caller, 0);
+    m.settle(1);
+    assert_eq!((m.k.current(), m.arg(a, 2)), (a, 3));
+    assert!(!m.raw(S::Send as u64, [FREE + 9, MsgInfo::new(0, 1).0, 4, 0, 0, 0]).blocked);
+    m.settle(0);
+    assert_eq!((m.k.current(), m.status(m.root), m.arg(m.root, 2)), (m.root, 0, 4));
 }
 
 #[test]
@@ -659,10 +746,12 @@ fn calls_between_threads_of_one_processor_take_only_that_processors_lock() {
         assert_eq!((m.k.current(), m.arg(c, 2)), (c, i + 1));
     }
     assert_eq!(m.k.global_entries(), before, "a call and its reply on one processor never take every lock");
-    // The same call from processor 0 must take them all.
+    // The same call from processor 0 takes that processor's lock and
+    // processor 1's, and still not every lock.
+    let pairs = m.k.pair_entries();
     m.on(0);
     assert!(m.raw(S::Call as u64, [FREE + 5, 0, 5, 0, 0, 0]).blocked);
-    assert_eq!(m.k.global_entries(), before + 1);
+    assert_eq!((m.k.global_entries(), m.k.pair_entries()), (before, pairs + 1));
 }
 
 #[test]

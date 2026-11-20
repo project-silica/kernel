@@ -24,3 +24,4 @@ smp_ipc smp=2
 smp_shootdown smp=2
 smp_stress smp=8
 smp_revoke smp=8
+smp_timeouts smp=8

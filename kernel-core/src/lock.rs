@@ -43,6 +43,20 @@ pub fn go_global<'a>(mine: &Lock, all: impl Iterator<Item = &'a Lock>) {
     }
 }
 
+/// From holding `mine` to holding `mine` and `other`, taken in index order
+/// (the order [`go_global`] uses), so no two of these transitions deadlock.
+/// When `other` comes first `mine` is let go on the way: the caller then
+/// re-examines everything it looked at before.
+pub fn go_pair(mine: &Lock, other: &Lock, other_first: bool) {
+    if other_first {
+        mine.unlock();
+        other.lock();
+        mine.lock();
+    } else {
+        other.lock();
+    }
+}
+
 /// From holding every lock in `all` back to holding only number `mine`.
 pub fn go_local<'a>(mine: usize, all: impl Iterator<Item = &'a Lock>) {
     for (i, l) in all.enumerate() {
