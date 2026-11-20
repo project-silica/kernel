@@ -3,7 +3,7 @@
 //! loader, the kernel and userspace. They trust nothing in the bytes they
 //! are given: every offset is checked before use, and malformed input is an
 //! error or "not found", never a panic.
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
 pub mod elf;

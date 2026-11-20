@@ -1,4 +1,4 @@
-//! Silica UEFI loader for x86_64 (component B01).
+//! Silica UEFI loader for x86_64 and aarch64 (component B01).
 //!
 //! Reads `SILICA\KERNEL.ELF`, and when present `SILICA\RAMDISK.IMG` and
 //! `SILICA\CMDLINE.TXT`, from the volume it was started from; places the
@@ -8,48 +8,32 @@
 //! the memory map, framebuffer, ACPI root, firmware entropy and wall-clock
 //! time into a `BootInfo`; leaves boot services and jumps to the kernel.
 //!
-//! Every failure prints one line on the serial port saying what went wrong.
+//! Every failure prints one line on the serial console saying what went wrong.
+//! What differs between architectures is in `arch/`.
 #![no_std]
 #![no_main]
 
 mod efi;
 
-use core::arch::asm;
+#[cfg_attr(target_arch = "x86_64", path = "arch/x86_64.rs")]
+#[cfg_attr(target_arch = "aarch64", path = "arch/aarch64.rs")]
+mod arch;
+
 use core::ffi::c_void;
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, KERNEL_BASE, PHYS_MAP_BASE, Region, RegionKind};
-use kernel_core::elf::{EM_X86_64, Elf, PF_W, PF_X};
+use kernel_core::elf::{Elf, PF_W, PF_X};
 
-const COM1: u16 = 0x3F8;
 const PAGE: u64 = 4096;
 const HUGE: u64 = 2 << 20;
 
-fn outb(port: u16, v: u8) {
-    // SAFETY: writing a byte to the first serial port or the emulator's exit
-    // device has no memory effect.
-    unsafe { asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack, preserves_flags)) }
-}
-fn inb(port: u16) -> u8 {
-    let v: u8;
-    // SAFETY: reading the serial line status register has no memory effect.
-    unsafe { asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack, preserves_flags)) }
-    v
-}
-fn rdtsc() -> u64 {
-    let (lo, hi): (u32, u32);
-    // SAFETY: RDTSC only reads the timestamp counter.
-    unsafe { asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags)) }
-    (hi as u64) << 32 | lo as u64
-}
+/// A test harness is listening for the exit status (command line
+/// `exit=semihosting`; aarch64 only, see `arch/aarch64.rs`).
+static HARNESS: AtomicBool = AtomicBool::new(false);
 
 fn print(s: &str) {
-    for b in s.bytes() {
-        let mut spins = 0;
-        while inb(COM1 + 5) & 0x20 == 0 && spins < 100_000 {
-            spins += 1;
-        }
-        outb(COM1, b);
-    }
+    arch::print(s);
 }
 
 /// Report a fatal error and stop: status through the emulator's exit device
@@ -58,11 +42,7 @@ fn fail(what: &str) -> ! {
     print("ERROR: loader: ");
     print(what);
     print("\r\n");
-    outb(0xF4, kernel_core::ExitStatus::Failure.code());
-    loop {
-        // SAFETY: halting with interrupts as the firmware left them.
-        unsafe { asm!("hlt", options(nomem, nostack)) }
-    }
+    arch::stop(kernel_core::ExitStatus::Failure.code(), HARNESS.load(Ordering::Relaxed))
 }
 
 struct Boot {
@@ -130,53 +110,52 @@ impl Boot {
     }
 }
 
-/// Page-table builder over pages allocated from the firmware.
+/// Page-table builder over pages allocated from the firmware: `root` for
+/// the kernel half, `low` for the loader's identity alias (the same table
+/// where the architecture has one root).
 struct Tables<'a> {
     boot: &'a Boot,
     root: u64,
+    low: u64,
 }
-
-const P: u64 = 1;
-const W: u64 = 2;
-const PS: u64 = 0x80;
-const G: u64 = 0x100;
-const NX: u64 = 1 << 63;
-const ADDR: u64 = 0x000F_FFFF_FFFF_F000;
 
 impl Tables<'_> {
     fn entry(&self, table: u64, index: u64) -> *mut u64 {
         (table + index * 8) as *mut u64
+    }
+    fn root_for(&self, virt: u64) -> u64 {
+        if virt >> 63 == 1 { self.root } else { self.low }
     }
     /// The table the entry points to, created when missing.
     fn next(&self, e: *mut u64) -> u64 {
         // SAFETY: `e` points into a page-table page this loader allocated;
         // nothing else uses these pages before the kernel starts.
         unsafe {
-            if *e & P == 0 {
-                *e = self.boot.pages(efi::MEM_SILICA_KERNEL, PAGE, "out of memory for page tables") | P | W;
+            if !arch::present(*e) {
+                *e = arch::table(self.boot.pages(efi::MEM_SILICA_KERNEL, PAGE, "out of memory for page tables"));
             }
-            *e & ADDR
+            *e & arch::ADDR
         }
     }
     /// Map `[phys, phys + len)` at `virt` with 2 MiB pages.
-    fn map_huge(&self, virt: u64, phys: u64, len: u64, flags: u64) {
+    fn map_huge(&self, virt: u64, phys: u64, len: u64, write: bool, exec: bool) {
         let mut off = 0;
         while off < len {
             let v = virt + off;
-            let pdpt = self.next(self.entry(self.root, v >> 39 & 511));
+            let pdpt = self.next(self.entry(self.root_for(v), v >> 39 & 511));
             let pd = self.next(self.entry(pdpt, v >> 30 & 511));
             // SAFETY: as in `next`.
-            unsafe { *self.entry(pd, v >> 21 & 511) = (phys + off) | flags | P | PS };
+            unsafe { *self.entry(pd, v >> 21 & 511) = arch::block(phys + off, write, exec) };
             off += HUGE;
         }
     }
     /// Map one 4 KiB page.
-    fn map_page(&self, virt: u64, phys: u64, flags: u64) {
-        let pdpt = self.next(self.entry(self.root, virt >> 39 & 511));
+    fn map_page(&self, virt: u64, phys: u64, write: bool, exec: bool) {
+        let pdpt = self.next(self.entry(self.root_for(virt), virt >> 39 & 511));
         let pd = self.next(self.entry(pdpt, virt >> 30 & 511));
         let pt = self.next(self.entry(pd, virt >> 21 & 511));
         // SAFETY: as in `next`.
-        unsafe { *self.entry(pt, virt >> 12 & 511) = phys | flags | P };
+        unsafe { *self.entry(pt, virt >> 12 & 511) = arch::page(phys, write, exec) };
     }
 }
 
@@ -218,7 +197,8 @@ const MAP_BYTES: u64 = 256 * 1024;
 // only the firmware calls it.
 #[unsafe(no_mangle)]
 pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable) -> efi::Status {
-    let loader_tsc = rdtsc();
+    let loader_tsc = arch::counter();
+    arch::console(st);
     // SAFETY: the firmware passes a valid system table; boot services are
     // usable until ExitBootServices below.
     let (bs, rt, cfg) =
@@ -237,6 +217,9 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     let (kfile, klen) = boot.read(root, "SILICA\\KERNEL.ELF", efi::MEM_LOADER_DATA).unwrap_or_else(|| fail("SILICA\\KERNEL.ELF not found"));
     let ramdisk = boot.read(root, "SILICA\\RAMDISK.IMG", efi::MEM_SILICA_RAMDISK).unwrap_or((0, 0));
     let cmdline = boot.read(root, "SILICA\\CMDLINE.TXT", efi::MEM_LOADER_DATA).unwrap_or((0, 0));
+    // SAFETY: the command line was read into `cmdline.1` bytes at `cmdline.0`.
+    let words = unsafe { core::slice::from_raw_parts(cmdline.0 as *const u8, cmdline.1 as usize) };
+    HARNESS.store(words.split(|b| b.is_ascii_whitespace()).any(|w| w == b"exit=semihosting"), Ordering::Relaxed);
 
     // Entropy and time, while the firmware can still be asked.
     let mut entropy = [0u8; 32];
@@ -249,12 +232,12 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     let mut time = efi::Time::default();
     // SAFETY: runtime services are valid; `time` outlives the call.
     let wall_secs = if unsafe { ((*rt).get_time)(&mut time, ptr::null_mut()) } == efi::SUCCESS { unix_seconds(&time) } else { 0 };
-    let wall_tsc = rdtsc();
+    let wall_tsc = arch::counter();
 
     // The kernel image.
     // SAFETY: `kfile` holds `klen` bytes read above and is not modified again.
     let file = unsafe { core::slice::from_raw_parts(kfile as *const u8, klen as usize) };
-    let elf = Elf::parse(file, EM_X86_64).unwrap_or_else(|_| fail("SILICA\\KERNEL.ELF is not an x86_64 ELF image"));
+    let elf = Elf::parse(file, arch::MACHINE).unwrap_or_else(|_| fail(arch::NOT_OURS));
     let (lo, hi) = elf.span().unwrap_or_else(|| fail("kernel image has no loadable segments"));
     if !elf.pie || lo != KERNEL_BASE || hi - lo > 64 << 20 {
         fail("kernel image is not position-independent at the kernel base, or is over 64 MiB");
@@ -277,6 +260,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         // SAFETY: checked to lie inside the loaded image.
         unsafe { ((kphys + (at - lo)) as *mut u64).write_unaligned(addend.wrapping_add(slide)) };
     }
+    arch::sync_code(kphys, hi - lo);
 
     // Framebuffer and ACPI.
     let mut fb = (0u64, 0u32, 0u32, 0u32, 0u32);
@@ -291,6 +275,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         }
     }
     let rsdp = cfg.iter().find(|c| c.guid == efi::ACPI2).map_or(0, |c| c.table as u64);
+    arch::console_from_acpi(rsdp);
 
     // Memory for the things that must exist before the final memory map.
     let info_page = boot.pages(efi::MEM_LOADER_DATA, PAGE, "out of memory for boot information");
@@ -312,21 +297,37 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         }
     }
     let top = (top + (1 << 30) - 1) & !((1 << 30) - 1);
-    let tables = Tables { boot: &boot, root: boot.pages(efi::MEM_SILICA_KERNEL, PAGE, "out of memory for page tables") };
-    // All physical memory at PHYS_MAP_BASE; and the same
-    // tables at address 0 so this loader keeps running after the switch.
-    // The kernel removes the low alias and makes the rest non-executable.
-    tables.map_huge(PHYS_MAP_BASE, 0, top, W | G);
-    // SAFETY: both entries are in the root table allocated above.
-    unsafe { *tables.entry(tables.root, 0) = *tables.entry(tables.root, 256) };
+    let root = boot.pages(efi::MEM_SILICA_KERNEL, PAGE, "out of memory for page tables");
+    let low = if arch::SPLIT_ROOTS { boot.pages(efi::MEM_SILICA_KERNEL, PAGE, "out of memory for page tables") } else { root };
+    let tables = Tables { boot: &boot, root, low };
+    // Physical memory at PHYS_MAP_BASE: everything below the top, or only
+    // the RAM where the architecture must not map device registers as
+    // memory. The same tables serve as an alias at address 0 so this loader
+    // keeps running after the switch; the kernel removes the alias and makes
+    // the rest non-executable.
+    if arch::MAP_ALL {
+        tables.map_huge(PHYS_MAP_BASE, 0, top, true, true);
+    } else {
+        for i in 0..size / dsize {
+            // SAFETY: as above.
+            let d = unsafe { &*((map as usize + i * dsize) as *const efi::MemoryDescriptor) };
+            if d.ty != efi::MEM_MMIO && d.ty != efi::MEM_MMIO_PORT && d.ty != efi::MEM_RESERVED {
+                let start = d.phys & !(HUGE - 1);
+                let end = (d.phys + d.pages * PAGE).div_ceil(HUGE) * HUGE;
+                tables.map_huge(PHYS_MAP_BASE + start, start, end - start, true, true);
+            }
+        }
+    }
+    // SAFETY: both entries are in root tables allocated above.
+    unsafe { *tables.entry(tables.low, 0) = *tables.entry(tables.root, 256) };
     for s in elf.segments() {
-        let flags = G | if s.flags & PF_W != 0 { W } else { 0 } | if s.flags & PF_X != 0 { 0 } else { NX };
-        if s.flags & PF_W != 0 && s.flags & PF_X != 0 {
+        let (write, exec) = (s.flags & PF_W != 0, s.flags & PF_X != 0);
+        if write && exec {
             fail("kernel image has a segment that is writable and executable");
         }
         let mut v = s.vaddr & !(PAGE - 1);
         while v < s.vaddr + s.memsz {
-            tables.map_page(v + slide, kphys + (v - lo), flags);
+            tables.map_page(v + slide, kphys + (v - lo), write, exec);
             v += PAGE;
         }
     }
@@ -343,6 +344,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         }
         // SAFETY: `image` is this image's handle and `key` is current.
         if unsafe { ((*bs).exit_boot_services)(image, key) } == efi::SUCCESS {
+            arch::console_after_exit();
             break;
         }
         tries += 1;
@@ -412,26 +414,11 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         wall_tsc,
         loader_tsc,
     };
-    // SAFETY: `info_page` is a page allocated above. Then: enable NX (the
-    // tables use it), switch to the new tables, which map this code at the
-    // address it is running at, and jump to the kernel with the BootInfo
-    // address in the first argument register. The kernel sets its own stack.
+    // SAFETY: `info_page` is a page allocated above; the tables map this
+    // code at its address through `low` and the kernel at its entry.
     unsafe {
         (info_page as *mut BootInfo).write(info);
-        asm!(
-            "cli",
-            "mov ecx, 0xC0000080",
-            "rdmsr",
-            "or eax, 0x800",
-            "wrmsr",
-            "mov cr3, r8",
-            "jmp r9",
-            // Fixed registers: RDMSR and WRMSR use rax, rcx and rdx.
-            in("r8") tables.root,
-            in("r9") elf.entry.wrapping_add(slide),
-            in("rdi") info_page,
-            options(noreturn)
-        )
+        arch::handover(tables.root, tables.low, elf.entry.wrapping_add(slide), info_page)
     }
 }
 

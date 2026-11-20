@@ -35,7 +35,8 @@ pub struct SystemTable {
     con_in_handle: Handle,
     con_in: *mut c_void,
     con_out_handle: Handle,
-    con_out: *mut c_void,
+    /// EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL of the console.
+    pub con_out: *mut TextOutput,
     std_err_handle: Handle,
     std_err: *mut c_void,
     /// EFI_RUNTIME_SERVICES.
@@ -220,3 +221,18 @@ pub const MEM_CONVENTIONAL: u32 = 7;
 pub const MEM_SILICA_KERNEL: u32 = 0x8000_0001;
 /// OS-defined memory type: the ramdisk.
 pub const MEM_SILICA_RAMDISK: u32 = 0x8000_0002;
+
+/// EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL (the part this loader uses).
+#[repr(C)]
+pub struct TextOutput {
+    reset: *const c_void,
+    /// Write a NUL-terminated UCS-2 string.
+    pub output_string: unsafe extern "efiapi" fn(*mut TextOutput, *const u16) -> Status,
+}
+
+/// EfiReservedMemoryType: not to be used (may not even be memory).
+pub const MEM_RESERVED: u32 = 0;
+/// EfiMemoryMappedIO: device registers.
+pub const MEM_MMIO: u32 = 11;
+/// EfiMemoryMappedIOPortSpace: device registers.
+pub const MEM_MMIO_PORT: u32 = 12;

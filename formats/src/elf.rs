@@ -51,6 +51,8 @@ pub struct Elf<'a> {
     phnum: usize,
     /// Whether the image is position-independent (`ET_DYN`).
     pub pie: bool,
+    /// The `R_*_RELATIVE` relocation number of the image's architecture.
+    relative: u32,
 }
 
 fn u16_at(b: &[u8], o: usize) -> Option<u16> {
@@ -91,7 +93,13 @@ impl<'a> Elf<'a> {
         if end > file.len() {
             return Err(ElfError::Truncated);
         }
-        let elf = Elf { file, entry, phoff, phnum, pie: ty == 3 };
+        let relative = match machine {
+            EM_X86_64 => 8,
+            EM_AARCH64 => 1027,
+            EM_RISCV => 3,
+            _ => 0, // none: a position-independent image cannot be relocated
+        };
+        let elf = Elf { file, entry, phoff, phnum, pie: ty == 3, relative };
         for s in elf.raw_segments() {
             s?;
         }
@@ -181,11 +189,63 @@ impl<'a> Elf<'a> {
             let at = u64_at(t, i * 24).ok_or(ElfError::Truncated)?;
             let info = u64_at(t, i * 24 + 8).ok_or(ElfError::Truncated)?;
             let addend = u64_at(t, i * 24 + 16).ok_or(ElfError::Truncated)?;
-            // R_X86_64_RELATIVE = 8, R_AARCH64_RELATIVE = 1027, R_RISCV_RELATIVE = 3.
-            match info & 0xFFFF_FFFF {
-                8 | 1027 | 3 => Ok((at, addend)),
-                _ => Err(ElfError::BadSegment),
-            }
+            // Only the image's own architecture's number: the same number
+            // means another relocation elsewhere (3 is R_X86_64_PC32).
+            if info & 0xFFFF_FFFF == self.relative as u64 { Ok((at, addend)) } else { Err(ElfError::BadSegment) }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A position-independent image for `machine` with one relocation of
+    /// type `ty`: one PT_LOAD over the whole file at 0x1000, a PT_DYNAMIC
+    /// naming the relocation table.
+    fn image(machine: u16, ty: u64) -> [u8; 256] {
+        let mut f = [0u8; 256];
+        let put = |f: &mut [u8; 256], o: usize, v: &[u8]| f[o..o + v.len()].copy_from_slice(v);
+        put(&mut f, 0, b"\x7fELF\x02\x01\x01");
+        put(&mut f, 16, &3u16.to_le_bytes()); // ET_DYN
+        put(&mut f, 18, &machine.to_le_bytes());
+        put(&mut f, 32, &64u64.to_le_bytes()); // program headers
+        put(&mut f, 54, &(PHENT as u16).to_le_bytes());
+        put(&mut f, 56, &2u16.to_le_bytes());
+        // PT_LOAD: offset 0, vaddr 0x1000, the whole file, readable.
+        put(&mut f, 64, &PT_LOAD.to_le_bytes());
+        put(&mut f, 68, &4u32.to_le_bytes());
+        put(&mut f, 64 + 16, &0x1000u64.to_le_bytes());
+        put(&mut f, 64 + 32, &256u64.to_le_bytes());
+        put(&mut f, 64 + 40, &256u64.to_le_bytes());
+        // PT_DYNAMIC at file offset 176: DT_RELA (vaddr of offset 224), DT_RELASZ, DT_NULL.
+        put(&mut f, 120, &PT_DYNAMIC.to_le_bytes());
+        put(&mut f, 120 + 8, &176u64.to_le_bytes());
+        put(&mut f, 120 + 32, &48u64.to_le_bytes());
+        put(&mut f, 176, &7u64.to_le_bytes());
+        put(&mut f, 184, &(0x1000u64 + 224).to_le_bytes());
+        put(&mut f, 192, &8u64.to_le_bytes());
+        put(&mut f, 200, &24u64.to_le_bytes());
+        // The relocation: patch 0x1008 with 0x42.
+        put(&mut f, 224, &0x1008u64.to_le_bytes());
+        put(&mut f, 232, &ty.to_le_bytes());
+        put(&mut f, 240, &0x42u64.to_le_bytes());
+        f
+    }
+
+    fn relocs(machine: u16, ty: u64) -> Vec<Result<(u64, u64), ElfError>> {
+        let f = image(machine, ty);
+        Elf::parse(&f, machine).unwrap().relative_relocs().collect()
+    }
+
+    #[test]
+    fn only_the_images_own_relative_relocation_is_accepted() {
+        assert_eq!(relocs(EM_X86_64, 8), [Ok((0x1008, 0x42))]);
+        assert_eq!(relocs(EM_AARCH64, 1027), [Ok((0x1008, 0x42))]);
+        assert_eq!(relocs(EM_RISCV, 3), [Ok((0x1008, 0x42))]);
+        // 3 is R_RISCV_RELATIVE but R_X86_64_PC32; 8 is R_X86_64_RELATIVE
+        // but something else on aarch64.
+        assert_eq!(relocs(EM_X86_64, 3), [Err(ElfError::BadSegment)]);
+        assert_eq!(relocs(EM_AARCH64, 8), [Err(ElfError::BadSegment)]);
     }
 }

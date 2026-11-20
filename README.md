@@ -6,8 +6,8 @@ The Silica microkernel and what must agree with it byte for byte.
 | --- | --- |
 | `abi` | The kernel ABI: syscall numbers, object types, rights, errors, the message descriptor and the root task's start-up record. Private to the kernel and `libsys`; applications use `libsys`. |
 | `kernel-core` | The kernel itself, free of architecture code: capabilities and the derivation tree, Untyped retype, threads, endpoints, notifications, address spaces, the root task. Builds and tests on the host. |
-| `kernel` | The architecture layer (`arch/x86_64`; `aarch64` and `riscv64` build but do not boot yet) and the kernel binary. |
-| `boot-uefi` | The UEFI loader: reads kernel, ramdisk and command line from the ESP, applies the KASLR slide, builds the first page tables, hands over a `BootInfo`. |
+| `kernel` | The architecture layer and the kernel binary. `arch/x86_64` runs everything; `arch/aarch64` boots through the loader (from EL1 or EL2) to the kernel's report and stops there: no interrupt controller, timer, user mode or root task yet; `riscv64` builds only. |
+| `boot-uefi` | The UEFI loader for x86_64 and aarch64: reads kernel, ramdisk and command line from the ESP, applies the KASLR slide, builds the first page tables, hands over a `BootInfo`. What differs per architecture is in `src/arch/`. |
 | `libsys` | The system library: one typed function per kernel operation, and the monotonic clock. |
 | `roottest` | The root task used by the in-OS tests. |
 
