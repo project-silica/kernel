@@ -341,7 +341,11 @@ extern "C" fn trap_user(vector: u64, err: u64) {
             let cr2: u64;
             // SAFETY: reading CR2 in ring 0 has no side effect.
             unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) }
-            k.fault(Fault::Page, cr2, err);
+            // The x86 error code's present, write and fetch bits as the
+            // ABI's architecture-neutral access bits.
+            let access =
+                (err & 1) * silica_abi::FAULT_PRESENT | (err >> 1 & 1) * silica_abi::FAULT_WRITE | (err >> 4 & 1) * silica_abi::FAULT_FETCH;
+            k.fault(Fault::Page, cr2, access);
         }
         6 => k.fault(Fault::Instruction, 0, 0),
         2 | 8 | 18 => panic!("fatal exception {vector} (error {err:#x}) in user mode"),

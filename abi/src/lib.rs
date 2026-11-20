@@ -377,7 +377,10 @@ pub const IPC_CAP_MOVE: u64 = 2;
 
 /// Label of a fault message, sent on behalf of a faulting thread to its
 /// fault endpoint as a call. Words: 0 instruction pointer, 1 fault address,
-/// 2 architecture error code, 3 stack pointer. Replying resumes the thread
+/// 2 for a [`Fault::Page`] the access ([`FAULT_PRESENT`], [`FAULT_WRITE`],
+/// [`FAULT_FETCH`]; the same on every architecture), for other faults the
+/// architecture's own detail (x86_64: vector in word 1, error code here;
+/// aarch64: the exception syndrome here), 3 stack pointer. Replying resumes the thread
 /// when reply word 0 is [`FAULT_RESUME`] or [`FAULT_MAP`]; otherwise it stays
 /// suspended.
 pub const FAULT_LABEL: u64 = 0xFFFF_0000_0000;
@@ -393,6 +396,14 @@ pub enum Fault {
     /// Any other processor exception (divide error, alignment, FP).
     Exception = 3,
 }
+
+/// Page fault access bit: a mapping exists but lacks the right needed (a
+/// protection fault); clear when nothing is mapped there.
+pub const FAULT_PRESENT: u64 = 1;
+/// Page fault access bit: the access was a write.
+pub const FAULT_WRITE: u64 = 2;
+/// Page fault access bit: the access was an instruction fetch.
+pub const FAULT_FETCH: u64 = 4;
 
 /// Reply word 0 that resumes a faulted thread.
 pub const FAULT_RESUME: u64 = 1;

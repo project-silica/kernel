@@ -184,8 +184,8 @@ fn t_fault_page() -> T {
     if kind(&m) != Fault::Page as u64 || m.words[1] != 0x10 {
         return Err("a write to address 0x10 was not reported as a page fault there");
     }
-    if m.words[2] & 0b111 != 0b110 {
-        return Err("the fault code does not say user-mode write to an unmapped page");
+    if m.words[2] != FAULT_WRITE {
+        return Err("the fault's access bits do not say write to an unmapped page");
     }
     if m.words[0] < 0x40_0000 || m.words[3] == 0 {
         return Err("the fault message lacks the instruction or stack pointer");
@@ -314,7 +314,7 @@ fn t_w_xor_x() -> T {
     // SAFETY: the thread is expected to fault on its first instruction.
     unsafe { thread_start(t, at, stack + 0xFFF8, 0, true) }.map_err(|_| "start")?;
     let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000)).map_err(|_| "executing a data page did not fault")?;
-    if kind(&m) != Fault::Page as u64 || m.words[1] != at as u64 || m.words[2] & 0x10 == 0 {
+    if kind(&m) != Fault::Page as u64 || m.words[1] != at as u64 || m.words[2] & FAULT_FETCH == 0 {
         return Err("executing a data page was not an instruction-fetch page fault");
     }
     // Remapped read-execute, the same bytes run; and writing them faults.
@@ -326,7 +326,9 @@ fn t_w_xor_x() -> T {
     DEMAND_AT.store(at as u64, SeqCst);
     let (_t2, _) = spawn(touch, 0, ep);
     let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000)).map_err(|_| "writing a read-only page did not fault")?;
-    (kind(&m) == Fault::Page as u64 && m.words[2] & 0b11 == 0b11).then_some(()).ok_or("writing a read-only page was not a protection fault")
+    (kind(&m) == Fault::Page as u64 && m.words[2] == FAULT_PRESENT | FAULT_WRITE)
+        .then_some(())
+        .ok_or("writing a read-only page was not a protection fault")
 }
 
 extern "C" fn echo_server(arg: u64) -> ! {

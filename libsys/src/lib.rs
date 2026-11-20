@@ -17,8 +17,8 @@ mod buffer;
 pub use buffer::{IpcBuffer, Pass};
 pub use silica_abi::root;
 pub use silica_abi::{
-    Error, FAULT_LABEL, FAULT_MAP, FAULT_RESUME, Fault, IRQ_ACTIVE_LOW, IRQ_LEVEL, KEEP, MsgInfo, ObjectType, Rights, THREAD_INACTIVE,
-    THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
+    Error, FAULT_FETCH, FAULT_LABEL, FAULT_MAP, FAULT_PRESENT, FAULT_RESUME, FAULT_WRITE, Fault, IRQ_ACTIVE_LOW, IRQ_LEVEL, KEEP, MsgInfo,
+    ObjectType, Rights, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
 };
 use silica_abi::{NONBLOCK, Syscall};
 
