@@ -7,6 +7,12 @@
 //! following slots with greater depth. All capabilities to one object are
 //! adjacent in that list, which makes "is this the last capability to the
 //! object" a look at the two neighbours.
+//!
+//! A capability never outlives what it was derived from: deleting one
+//! deletes its descendants first. That keeps every step O(1) and the tree
+//! exact (no descendant is ever re-parented). A holder who wants a second
+//! capability that does not depend on the first makes a duplicate, which is
+//! a sibling in the tree, or moves the capability.
 
 use crate::hal::Hal;
 use crate::kernel::Kernel;
@@ -146,6 +152,19 @@ impl<H: Hal> Kernel<H> {
         Ok(())
     }
 
+    /// Put `cap` into the empty slot `new` as a sibling of the capability in
+    /// `of`: same parent, same depth, placed just before it.
+    pub(crate) fn insert_sibling(&self, of: Paddr, new: Paddr, cap: &Cap) {
+        let (o, n) = (self.slot(of), self.slot(new));
+        n.set(cap, o.depth());
+        n.prev.set(o.prev.get());
+        n.next.set(of);
+        if o.prev.get() != 0 {
+            self.slot(o.prev.get()).next.set(new);
+        }
+        o.prev.set(new);
+    }
+
     /// Put `cap` into the empty slot `s` with no ancestor (boot only).
     pub(crate) fn insert_root(&self, s: Paddr, cap: &Cap) {
         self.slot(s).set(cap, 0);
@@ -224,16 +243,10 @@ impl<H: Hal> Kernel<H> {
         }
     }
 
-    /// Delete the capability in `s`, and for an Untyped everything made from it.
+    /// Delete the capability in `s` and everything derived from it.
     fn delete_shallow(&self, s: Paddr) {
-        if self
-            .slot(s)
-            .cap()
-            .is_some_and(|c| c.ty == ObjectType::Untyped)
-        {
-            while self.has_children(s) {
-                self.clear_slot(self.slot(s).next.get());
-            }
+        while self.has_children(s) {
+            self.clear_slot(self.slot(s).next.get());
         }
         self.clear_slot(s);
     }

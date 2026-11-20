@@ -132,7 +132,7 @@ fn retype_checks_and_untyped_balances() {
     let (a, b) = (m.cap(FREE).unwrap(), m.cap(FREE + 1).unwrap());
     assert_eq!((a.obj, b.obj), (d.base, d.base + (1 << (d.bits - 1))));
     // Objects are zeroed: the machine's memory starts as 0xA5.
-    assert!(m.mem(a.obj, 4096).iter().all(|&x| x == 0));
+    assert!(m.is_zero(a.obj, 4096));
     // Deleting one child does not free the Untyped; revoking does.
     m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
     assert_eq!(
@@ -170,7 +170,7 @@ fn large_retype_is_preempted_and_restarted_without_repeating_work() {
         "the retype polled for interrupts while zeroing"
     );
     let f = m.cap(FREE).unwrap();
-    assert!(m.mem(f.obj, 1 << 22).iter().all(|&x| x == 0));
+    assert!(m.is_zero(f.obj, 1 << 22));
 }
 
 #[test]
@@ -253,7 +253,7 @@ fn deleting_a_capspace_deletes_what_it_holds_without_recursion() {
     let (ut, _) = m.big_untyped();
     // A chain of 300 CapSpaces, each holding the only capability to the next.
     m.retype(ut, T::CapSpace, 1, FREE, 1);
-    for _ in 0..300 {
+    for _ in 0..if cfg!(miri) { 30 } else { 300 } {
         m.retype(ut, T::CapSpace, 1, FREE + 1, 1);
         m.ok(S::CapMove, [FREE + 1, 1, FREE, 0, 0, 0]);
         m.ok(S::CapMove, [SLOT_CAPSPACE, FREE, FREE + 1, 0, 0, 0]);
@@ -705,4 +705,31 @@ fn command_line_lookup() {
     assert_eq!(c.get("panic"), Some(&b"1"[..]));
     assert_eq!(c.get("tes"), None);
     assert_eq!(kernel_core::boot::Cmdline(b"").get("x"), None);
+}
+
+#[test]
+fn destroying_a_capspace_deletes_capabilities_derived_from_its_contents() {
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::CapSpace, 3, FREE, 1);
+    m.retype(ut, T::Notification, 0, FREE + 1, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2, FREE + 1, 1, 0, 0]);
+    m.ok(S::CapMove, [FREE, 1, FREE + 1, 0, 0, 0]);
+    m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
+    assert!(
+        m.cap(FREE + 2).is_none(),
+        "a capability outlived the one it was derived from"
+    );
+}
+
+/// The fuzzer's interpreter on fixed pseudo-random inputs, so every test run
+/// (and Miri) exercises it; `tools/fuzz.sh` runs it coverage-guided.
+#[test]
+fn random_syscall_sequences_keep_the_kernel_invariants() {
+    let mut r = Rng(0x5EED);
+    for _ in 0..if cfg!(miri) { 3 } else { 300 } {
+        let len = 16 + r.below(if cfg!(miri) { 200 } else { 3000 }) as usize;
+        let data: Vec<u8> = (0..len).map(|_| r.next() as u8).collect();
+        support::fuzz::run(&data);
+    }
 }

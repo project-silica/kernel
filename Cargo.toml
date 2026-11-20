@@ -22,6 +22,8 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+# Line tables for the symbolizer; the image carries stripped copies.
+debug = "line-tables-only"
 opt-level = "s"
 lto = true
 codegen-units = 1

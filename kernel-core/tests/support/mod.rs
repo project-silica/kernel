@@ -3,6 +3,8 @@
 //! the fuzz target.
 #![allow(dead_code)]
 
+pub mod fuzz;
+
 use kernel_core::Kernel;
 use kernel_core::boot::{Region, RegionKind};
 use kernel_core::cap::Cap;
@@ -140,9 +142,34 @@ pub fn tiny_elf(code: &[u8], bss: u64) -> Vec<u8> {
     f
 }
 
+/// Page-aligned memory for the machine, freed with it.
+struct Ram {
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
+}
+impl Ram {
+    fn new(bytes: usize) -> Ram {
+        let layout = std::alloc::Layout::from_size_align(bytes, 4096).unwrap();
+        // SAFETY: the layout has a non-zero size.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        assert!(!ptr.is_null());
+        // Not zero: the kernel must clear memory itself before using it.
+        // SAFETY: `ptr` is valid for `bytes` bytes.
+        unsafe { std::ptr::write_bytes(ptr, 0xA5, bytes) };
+        Ram { ptr, layout }
+    }
+}
+impl Drop for Ram {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this layout; the kernel using it
+        // is dropped with the Machine before this field.
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) }
+    }
+}
+
 pub struct Machine {
     pub k: Kernel<TestHal>,
-    _ram: Vec<u64>,
+    _ram: Ram,
     pub root: Paddr,
     /// The root CapSpace.
     pub cs: Cap,
@@ -153,7 +180,7 @@ pub struct Machine {
 impl Machine {
     /// A machine with `mib` MiB of memory and a root task.
     pub fn new(mib: u64) -> Machine {
-        let mut ram = vec![0xA5A5_A5A5_A5A5_A5A5u64; (mib << 20) as usize / 8];
+        let ram = Ram::new((mib << 20) as usize);
         let hal = TestHal {
             now: Cell::new(1000),
             timer: Cell::new(u64::MAX),
@@ -163,10 +190,7 @@ impl Machine {
             switches: Cell::new(0),
             left: Cell::new(0),
         };
-        let base = ram
-            .as_mut_ptr()
-            .cast::<u8>()
-            .wrapping_sub(RAM_BASE as usize);
+        let base = ram.ptr.wrapping_sub(RAM_BASE as usize);
         // SAFETY: every physical address the kernel is told about lies in
         // [RAM_BASE, RAM_BASE + len), which `base` maps onto `ram`; `ram`
         // lives as long as the kernel and is used by nothing else.
@@ -236,6 +260,12 @@ impl Machine {
         unsafe { self.k.phys.bytes(p, len) }
     }
 
+    /// Whether a range of the machine's memory is all zero. A slice
+    /// comparison, which Miri runs natively; a byte loop takes minutes there.
+    pub fn is_zero(&self, p: Paddr, len: u64) -> bool {
+        *self.mem(p, len) == vec![0u8; len as usize][..]
+    }
+
     pub fn untyped(&self) -> Vec<(u64, UntypedDesc)> {
         let i = self.info();
         (0..i.untyped_count)
@@ -284,14 +314,12 @@ impl Machine {
                 r[TestHal::ARG[i]].set(a[i]);
             }
             self.k.syscall();
-            if r[TestHal::IP].get() == 0x40_0002 {
+            // A preempted syscall has its instruction pointer moved back onto
+            // the syscall instruction; anything else means it is over (the
+            // call may have given this very thread a new instruction pointer).
+            if r[TestHal::IP].get() != 0x40_0000 || self.k.current() != t {
                 break;
             }
-            assert_eq!(
-                r[TestHal::IP].get(),
-                0x40_0000,
-                "a preempted syscall restarts at the instruction"
-            );
         }
         let out = SysResult {
             thread: t,

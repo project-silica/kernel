@@ -153,10 +153,13 @@ impl<H: Hal> Kernel<H> {
                 self.retype(us, ty, a[2], &dst, a[4], a[5])
             }
             Syscall::CapCopy => {
+                if a[5] > 1 {
+                    return Err(Error::BadArg);
+                }
                 let (_, dst) = self.ccap(t, a[0], ObjectType::CapSpace, Rights::WRITE)?;
                 let d = self.slot_in(&dst, a[1])?;
                 let s = self.cslot(t, a[2])?;
-                self.copy(s, d, Rights(a[3] as u8), a[4])?;
+                self.copy(s, d, Rights(a[3] as u8), a[4], a[5] == 1)?;
                 Ok(Exit::Done)
             }
             Syscall::CapMove => {
@@ -174,7 +177,7 @@ impl<H: Hal> Kernel<H> {
             }
             Syscall::CapDelete => {
                 let s = self.cslot(t, a[0])?;
-                if !self.revoke_if_untyped(s) {
+                if !self.revoke(s) {
                     return Ok(Exit::Preempted);
                 }
                 self.delete(s);
@@ -225,9 +228,6 @@ impl<H: Hal> Kernel<H> {
                     {
                         return Err(Error::BadArg);
                     }
-                    if self.slot(s).depth() == u16::MAX {
-                        return Err(Error::TooDeep);
-                    }
                     src[i] = s;
                 }
                 let slots = Thread::embedded_slots(th.obj);
@@ -236,15 +236,15 @@ impl<H: Hal> Kernel<H> {
                         continue;
                     }
                     self.delete(slots[i]);
-                    if src[i] != 0 {
-                        // The source may have been deleted by the line above
-                        // when it was the thread's own embedded capability.
-                        if let Some(mut cap) = self.slot(src[i]).cap() {
-                            if cap.ty == ObjectType::Frame {
-                                cap.badge = 0;
-                            }
-                            self.insert_child(src[i], slots[i], &cap)?;
+                    // The thread's capability is a sibling of the source: it
+                    // does not go away when the caller deletes its own.
+                    if src[i] != 0
+                        && let Some(mut cap) = self.slot(src[i]).cap()
+                    {
+                        if cap.ty == ObjectType::Frame {
+                            cap.badge = 0;
                         }
+                        self.insert_sibling(src[i], slots[i], &cap);
                     }
                 }
                 Ok(Exit::Done)
@@ -331,15 +331,16 @@ impl<H: Hal> Kernel<H> {
         }
     }
 
-    fn revoke_if_untyped(&self, s: Paddr) -> bool {
-        match self.slot(s).cap() {
-            Some(c) if c.ty == ObjectType::Untyped => self.revoke(s),
-            _ => true,
-        }
-    }
-
-    /// Derive a capability from slot `s` into the empty slot `d`.
-    pub(crate) fn copy(&self, s: Paddr, d: Paddr, mask: Rights, badge: u64) -> Result<(), Error> {
+    /// Copy the capability in slot `s` into the empty slot `d`: as a child of
+    /// `s`, or with `sibling` as an independent capability beside it.
+    pub(crate) fn copy(
+        &self,
+        s: Paddr,
+        d: Paddr,
+        mask: Rights,
+        badge: u64,
+        sibling: bool,
+    ) -> Result<(), Error> {
         let mut cap = self.slot(s).cap().ok_or(Error::BadCap)?;
         if !self.slot(d).is_empty() {
             return Err(Error::SlotFull);
@@ -366,6 +367,10 @@ impl<H: Hal> Kernel<H> {
             ObjectType::Frame => cap.badge = 0, // a copy starts unmapped
             _ if badge != 0 => return Err(Error::BadArg),
             _ => {}
+        }
+        if sibling {
+            self.insert_sibling(s, d, &cap);
+            return Ok(());
         }
         self.insert_child(s, d, &cap)
     }

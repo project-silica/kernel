@@ -144,11 +144,23 @@ pub fn retype(
 /// Derive a capability from `src` into slot `dst` of `space`, keeping only
 /// the rights in `rights`. A non-zero `badge` badges an unbadged endpoint or
 /// notification capability, or narrows a Hw range (start in the low 32
-/// bits, end in the high 32). Revoking `src` deletes the copy.
-pub fn cap_copy(space: Cap, dst: u64, src: Cap, rights: Rights, badge: u64) -> Result<()> {
+/// bits, end in the high 32). The new capability depends on `src`: revoking
+/// or deleting `src` deletes it. This is how to lend authority.
+pub fn cap_derive(space: Cap, dst: u64, src: Cap, rights: Rights, badge: u64) -> Result<()> {
     sys(
         Syscall::CapCopy,
         [space.0, dst, src.0, rights.0 as u64, badge, 0],
+    )
+    .map(|_| ())
+}
+
+/// Like [`cap_derive`], but the new capability is independent of `src`: it
+/// lives until it is deleted itself or whatever `src` was derived from is
+/// revoked. This is how to hand authority on for good.
+pub fn cap_duplicate(space: Cap, dst: u64, src: Cap, rights: Rights, badge: u64) -> Result<()> {
+    sys(
+        Syscall::CapCopy,
+        [space.0, dst, src.0, rights.0 as u64, badge, 1],
     )
     .map(|_| ())
 }
@@ -158,7 +170,8 @@ pub fn cap_move(space: Cap, dst: u64, src: Cap) -> Result<()> {
     sys(Syscall::CapMove, [space.0, dst, src.0, 0, 0, 0]).map(|_| ())
 }
 
-/// Delete a capability. The object is destroyed with its last capability.
+/// Delete a capability and everything derived from it. An object is
+/// destroyed with its last capability.
 ///
 /// # Safety
 /// Deleting the last capability to memory, an address space or a thread

@@ -361,7 +361,7 @@ extern "C" fn echo_server(arg: u64) -> ! {
 fn t_ipc() -> T {
     let ep = new(ObjectType::Endpoint, 0);
     let badged = slot();
-    cap_copy(SPACE, badged, ep, Rights(2), 1000).map_err(|_| "cannot badge an endpoint")?;
+    cap_derive(SPACE, badged, ep, Rights(2), 1000).map_err(|_| "cannot badge an endpoint")?;
     SHARED[3].store(ep.0, SeqCst);
     let _ = spawn(echo_server, 0, Cap::NONE);
     for i in 0..10_000u64 {
@@ -543,9 +543,9 @@ fn t_untyped() -> T {
 fn t_caps() -> T {
     let n = new(ObjectType::Notification, 0);
     let (a, b) = (slot(), slot());
-    cap_copy(SPACE, a, n, Rights::ALL, 1).map_err(|_| "copy")?;
-    cap_copy(SPACE, b, Cap(a), Rights::WRITE, 0).map_err(|_| "copy of a copy")?;
-    if cap_copy(SPACE, b, n, Rights::ALL, 0) != Err(Error::SlotFull) {
+    cap_derive(SPACE, a, n, Rights::ALL, 1).map_err(|_| "copy")?;
+    cap_derive(SPACE, b, Cap(a), Rights::WRITE, 0).map_err(|_| "copy of a copy")?;
+    if cap_derive(SPACE, b, n, Rights::ALL, 0) != Err(Error::SlotFull) {
         return Err("copying into a full slot was accepted");
     }
     signal(Cap(b)).map_err(|_| "signal through a derived capability")?;
@@ -558,11 +558,11 @@ fn t_caps() -> T {
         return Err("a revoked capability still works");
     }
     signal(n).map_err(|_| "the revoked-from capability itself must survive")?;
-    if cap_copy(SPACE, a, Cap(UNTYPED.load(SeqCst)), Rights::ALL, 0) != Err(Error::InUse) {
+    if cap_derive(SPACE, a, Cap(UNTYPED.load(SeqCst)), Rights::ALL, 0) != Err(Error::InUse) {
         return Err("an Untyped was copied");
     }
     // A narrowed port range reaches only its ports.
-    cap_copy(SPACE, a, PORTS, Rights::ALL, 0x3F8 | 0x400 << 32).map_err(|_| "narrow ports")?;
+    cap_derive(SPACE, a, PORTS, Rights::ALL, 0x3F8 | 0x400 << 32).map_err(|_| "narrow ports")?;
     if port_in(Cap(a), 0xF4, 1) != Err(Error::BadArg) || port_in(Cap(a), 0x3FD, 1).is_err() {
         return Err("a narrowed port capability did not confine port access");
     }

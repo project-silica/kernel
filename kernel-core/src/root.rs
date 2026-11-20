@@ -94,14 +94,19 @@ impl<H: Hal> Kernel<H> {
     /// Create the root task and make its thread runnable. Returns the thread.
     pub fn boot_root(&self, spec: &RootSpec<'_>) -> Result<Paddr, BootError> {
         let elf = Elf::parse(spec.elf, spec.machine).map_err(BootError::Image)?;
-        let (lo, hi) = elf.span().ok_or(BootError::Image(ElfError::BadSegment))?;
+        let (_, hi) = elf.span().ok_or(BootError::Image(ElfError::BadSegment))?;
         if hi > INFO_VADDR {
             return Err(BootError::Segment);
         }
         // An Untyped twice the size of what the task needs to start, at least 4 MiB.
+        let image: u64 = elf
+            .segments()
+            .map(|s| (s.vaddr + s.memsz).div_ceil(4096) - s.vaddr / 4096)
+            .sum::<u64>()
+            << PAGE_BITS;
         let need = (1u64 << (CS_BITS + SLOT_BITS))
             + (1 << AS_BITS)
-            + (hi - lo)
+            + image
             + (1 << STACK_BITS)
             + (1 << INFO_BITS)
             + (4 << PAGE_BITS);
@@ -314,7 +319,7 @@ impl<H: Hal> Kernel<H> {
             if cap.ty == ObjectType::Frame {
                 cap.badge = 0;
             }
-            self.insert_child(slot(src), dst, &cap)?;
+            self.insert_sibling(slot(src), dst, &cap);
         }
         let r = &self.thread(t).regs;
         r[H::IP].set(elf.entry);

@@ -41,14 +41,15 @@ pub enum Syscall {
     Retype = 5,
     /// `a0` destination CapSpace, `a1` destination slot, `a2` source slot
     /// (in the caller's CapSpace), `a3` rights mask, `a4` badge (0 keeps the
-    /// source's). The new capability is a child of the source: revoking the
-    /// source deletes it.
+    /// source's), `a5` 0 to derive, 1 to duplicate. A derived capability is
+    /// a child of the source: revoking or deleting the source deletes it. A
+    /// duplicate is independent of the source and shares the source's parent.
     CapCopy = 6,
     /// `a0` destination CapSpace, `a1` destination slot, `a2` source slot.
     /// The capability keeps its place in the derivation tree.
     CapMove = 7,
-    /// `a0` slot. Deletes the capability; the object is destroyed with its
-    /// last capability.
+    /// `a0` slot. Deletes the capability and every capability derived from
+    /// it; an object is destroyed with its last capability.
     CapDelete = 8,
     /// `a0` slot. Deletes every capability derived from this one.
     CapRevoke = 9,
