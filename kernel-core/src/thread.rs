@@ -1,12 +1,16 @@
-//! Threads, the run queue and timeouts.
+//! Threads, the per-processor run queues and timeouts.
 //!
-//! M1 scheduling is one FIFO run queue with a fixed time slice; scheduling
-//! contexts and the fair and deadline classes (component C06) replace it at M2.
+//! Every thread has a home processor and runs only there; its queue links,
+//! deadline and state are protected by that processor's lock (`smp.rs`).
+//! Scheduling is one FIFO run queue per processor with a fixed time slice;
+//! scheduling contexts and the fair and deadline classes (component C06)
+//! replace it later in M2.
 
 use crate::cap::Slot;
 use crate::hal::{Hal, NREGS};
 use crate::kernel::Kernel;
 use crate::mem::{KObj, Paddr};
+use crate::smp::Cpu;
 use core::cell::Cell;
 use core::mem::offset_of;
 use silica_abi::Error;
@@ -56,6 +60,8 @@ pub struct Thread {
     pub(crate) tprev: Cell<Paddr>,
     pub(crate) fault: [Cell<u64>; 3],
     pub(crate) reap_next: Cell<u64>,
+    /// The processor this thread runs on.
+    pub(crate) cpu: Cell<u64>,
 }
 impl KObj for Thread {}
 const _: () = assert!(core::mem::size_of::<Thread>() <= FPU_OFFSET);
@@ -84,6 +90,9 @@ pub struct Queue {
     pub(crate) kind: Cell<u64>,
     /// Notification: pending badge bits.
     pub(crate) word: Cell<u64>,
+    /// The processor whose lock alone protects this queue, plus one (0:
+    /// none yet). The processor of the thread that last waited to receive.
+    pub(crate) owner: Cell<u64>,
 }
 impl KObj for Queue {}
 
@@ -93,6 +102,10 @@ impl<H: Hal> Kernel<H> {
     }
     pub(crate) fn queue(&self, q: Paddr) -> &Queue {
         self.phys.obj(q)
+    }
+    /// The processor thread `t` runs on.
+    pub(crate) fn home(&self, t: Paddr) -> &Cpu {
+        &self.cpus[self.thread(t).cpu.get() as usize]
     }
 
     pub(crate) fn q_push(&self, head: &Cell<Paddr>, tail: &Cell<Paddr>, t: Paddr) {
@@ -141,7 +154,7 @@ impl<H: Hal> Kernel<H> {
         if p != 0 {
             self.thread(p).tnext.set(n);
         } else {
-            self.timers.set(n);
+            self.home(t).timers.set(n);
         }
         if n != 0 {
             self.thread(n).tprev.set(p);
@@ -153,8 +166,9 @@ impl<H: Hal> Kernel<H> {
 
     fn timer_insert(&self, t: Paddr, deadline: u64) {
         let th = self.thread(t);
+        let cpu = self.home(t);
         th.deadline.set(deadline);
-        let (mut prev, mut at) = (0, self.timers.get());
+        let (mut prev, mut at) = (0, cpu.timers.get());
         while at != 0 && self.thread(at).deadline.get() <= deadline {
             prev = at;
             at = self.thread(at).tnext.get();
@@ -164,34 +178,41 @@ impl<H: Hal> Kernel<H> {
         if prev != 0 {
             self.thread(prev).tnext.set(t);
         } else {
-            self.timers.set(t);
+            cpu.timers.set(t);
         }
         if at != 0 {
             self.thread(at).tprev.set(t);
         }
     }
 
-    /// Block the current thread `t` in `state` on `on`, with an optional
-    /// absolute deadline (0: none).
+    /// Block thread `t` (current on its processor) in `state` on `on`, with
+    /// an optional absolute deadline (0: none).
     pub(crate) fn block(&self, t: Paddr, state: u64, on: Paddr, deadline: u64) {
         let th = self.thread(t);
         th.state.set(state);
-        self.dirty.set(true);
         th.blocked_on.set(on);
+        self.home(t).dirty.set(true);
         if deadline != 0 {
             self.timer_insert(t, deadline);
         }
     }
 
-    /// Make a blocked or inactive thread runnable.
+    /// Make a blocked or inactive thread runnable, on its own processor.
+    /// The caller holds that processor's lock.
     pub(crate) fn make_runnable(&self, t: Paddr) {
         self.timer_remove(t);
         let th = self.thread(t);
+        let cpu = self.home(t);
         th.blocked_on.set(0);
         th.state.set(RUNNABLE);
-        self.dirty.set(true);
-        if t != self.cur.get() {
-            self.q_push(&self.rq_head, &self.rq_tail, t);
+        cpu.dirty.set(true);
+        if t != cpu.cur.get() {
+            self.q_push(&cpu.rq_head, &cpu.rq_tail, t);
+        }
+        let home = th.cpu.get() as usize;
+        if home != self.hal.cpu() {
+            // It may be idle, or running something that should now share.
+            self.hal.kick(home, false);
         }
     }
 
@@ -201,14 +222,20 @@ impl<H: Hal> Kernel<H> {
         self.make_runnable(t);
     }
 
-    /// Take `t` off whatever it is blocked on or queued in. With `restart`,
-    /// a syscall that had not yet taken effect is set up to run again.
+    /// Take `t` off whatever it is blocked on or queued in and leave it
+    /// inactive. With `restart`, a syscall that had not yet taken effect is
+    /// set up to run again. If `t` is running on another processor, that
+    /// processor is brought into the kernel first, so the thread's saved
+    /// registers are final when this returns.
     pub(crate) fn cancel(&self, t: Paddr, restart: bool) {
         let th = self.thread(t);
+        let cpu = self.home(t);
+        let home = th.cpu.get() as usize;
         self.timer_remove(t);
         let on = th.blocked_on.get();
         match th.state.get() {
-            RUNNABLE if t != self.cur.get() => self.q_remove(&self.rq_head, &self.rq_tail, t),
+            RUNNABLE if t != cpu.cur.get() => self.q_remove(&cpu.rq_head, &cpu.rq_tail, t),
+            RUNNABLE if home != self.hal.cpu() => self.hal.kick(home, true),
             SENDING | RECEIVING => {
                 let q = self.queue(on);
                 self.q_remove(&q.head, &q.tail, t);
@@ -232,7 +259,7 @@ impl<H: Hal> Kernel<H> {
         th.ipc_flags.set(0);
         th.blocked_on.set(0);
         th.state.set(INACTIVE);
-        self.dirty.set(true);
+        cpu.dirty.set(true);
     }
 
     /// Fail the thread waiting for `server`'s reply, if any.
@@ -245,7 +272,7 @@ impl<H: Hal> Kernel<H> {
         if ct.ipc_flags.replace(0) & IPC_FAULT != 0 {
             ct.blocked_on.set(0);
             ct.state.set(INACTIVE);
-            self.dirty.set(true);
+            self.home(c).dirty.set(true);
         } else {
             self.wake(c, Err(Error::Gone));
         }
@@ -255,8 +282,12 @@ impl<H: Hal> Kernel<H> {
     pub(crate) fn finalise_thread(&self, t: Paddr) {
         self.cancel(t, false);
         self.drop_caller(t);
-        if self.loaded.get() == t {
-            self.loaded.set(0);
+        let cpu = self.home(t);
+        if cpu.loaded.get() == t {
+            cpu.loaded.set(0);
+        }
+        if cpu.cur.get() == t {
+            cpu.cur.set(0);
         }
     }
 
@@ -274,7 +305,7 @@ impl<H: Hal> Kernel<H> {
                 self.timer_remove(t);
                 th.blocked_on.set(0);
                 th.state.set(INACTIVE);
-                self.dirty.set(true);
+                self.home(t).dirty.set(true);
             } else {
                 self.wake(t, Err(Error::Gone));
             }
@@ -282,131 +313,148 @@ impl<H: Hal> Kernel<H> {
         qu.kind.set(0);
     }
 
-    /// The timer interrupt. Deadlines and the time slice are looked at by
-    /// `schedule`, on the way out.
+    /// The timer interrupt on this processor. Deadlines and the time slice
+    /// are looked at by `schedule`, on the way out.
     pub fn on_timer(&self) {
+        let me = self.me();
         // The timer is one-shot: having fired, it is no longer armed. It may
         // have fired early: it is only ever reprogrammed to fire sooner.
-        self.timer_at.set(u64::MAX);
-        self.tick.set(true);
-        self.dirty.set(true);
+        me.timer_at.set(u64::MAX);
+        me.tick.set(true);
+        me.dirty.set(true);
     }
 
-    /// Wake every thread whose deadline has passed and note the end of the slice.
+    /// Wake every thread of this processor whose deadline has passed and
+    /// note the end of the slice.
     fn expire(&self) {
+        let me = self.me();
         let now = self.hal.now();
         loop {
-            let t = self.timers.get();
+            let t = me.timers.get();
             if t == 0 || self.thread(t).deadline.get() > now {
                 break;
             }
             self.cancel(t, false);
             self.wake(t, Err(Error::Timeout));
         }
-        if now >= self.slice_end.get() {
-            self.resched.set(true);
+        if now >= me.slice_end.get() {
+            me.resched.set(true);
         }
     }
 
-    /// Hand the processor to `t` on the way out of this kernel entry,
+    /// Hand this processor to `t` on the way out of this kernel entry,
     /// without a pass through the run queue: the receiver of a call, or the
-    /// caller a server has just answered.
+    /// caller a server has just answered. A thread of another processor is
+    /// simply made runnable there.
     pub(crate) fn hand_off(&self, t: Paddr) {
+        let me = self.me();
+        if self.thread(t).cpu.get() as usize != self.hal.cpu() || me.direct.get() != 0 || t == me.cur.get() {
+            return self.make_runnable(t);
+        }
         self.timer_remove(t);
         let th = self.thread(t);
         th.blocked_on.set(0);
         th.state.set(RUNNABLE);
-        self.dirty.set(true);
-        if self.direct.get() == 0 && t != self.cur.get() {
-            self.direct.set(t);
-        } else if t != self.cur.get() {
-            self.q_push(&self.rq_head, &self.rq_tail, t);
-        }
+        me.dirty.set(true);
+        me.direct.set(t);
     }
 
-    /// Choose the thread to return to. Called by the architecture on every
-    /// way out of the kernel; when it returns, [`Kernel::current`] is
-    /// runnable and loaded.
+    /// Choose the thread this processor returns to. Called by the
+    /// architecture on every way out of the kernel, holding this
+    /// processor's lock; when it returns, [`Kernel::current`] is runnable
+    /// and loaded.
     pub fn schedule(&self) {
+        let me = self.me();
         // Most kernel entries change nothing the scheduler cares about.
-        if !self.dirty.get() {
+        if !me.dirty.get() {
             debug_assert!(self.settled(), "scheduling state changed without `dirty` being set");
             return;
         }
         loop {
-            if self.tick.replace(false) {
+            if me.tick.replace(false) {
                 self.expire();
             }
-            let cur = self.cur.get();
+            let cur = me.cur.get();
             let cur_ok = cur != 0 && self.thread(cur).state.get() == RUNNABLE;
-            let direct = self.direct.replace(0);
+            let direct = me.direct.replace(0);
             if direct != 0 {
                 // A hand-off continues the giver's time slice.
                 if cur_ok {
-                    self.q_push(&self.rq_head, &self.rq_tail, cur);
+                    self.q_push(&me.rq_head, &me.rq_tail, cur);
                 }
-                self.cur.set(direct);
+                me.cur.set(direct);
                 break;
             }
-            if cur_ok && !(self.resched.get() && self.rq_head.get() != 0) {
+            if cur_ok && !(me.resched.get() && me.rq_head.get() != 0) {
                 break;
             }
-            let next = self.q_pop(&self.rq_head, &self.rq_tail);
+            let next = self.q_pop(&me.rq_head, &me.rq_tail);
             if next != 0 {
                 if cur_ok {
-                    self.q_push(&self.rq_head, &self.rq_tail, cur);
+                    self.q_push(&me.rq_head, &me.rq_tail, cur);
                 }
-                self.cur.set(next);
-                self.slice_end.set(self.hal.now() + SLICE_NS);
+                me.cur.set(next);
+                me.slice_end.set(self.hal.now() + SLICE_NS);
                 break;
             }
             // Nothing to run. The timer is set exactly (or switched off) so
-            // an idle processor wakes only when there is something to do.
-            self.cur.set(0);
+            // an idle processor wakes only when there is something to do,
+            // and the lock is released while it waits so other processors
+            // can hand it work.
+            me.cur.set(0);
             self.arm_timer(true);
+            self.hal.idle_begin();
+            self.unlock(self.hal.cpu());
             self.hal.idle();
-            self.tick.set(true);
+            self.enter();
+            // The interrupt may have been the timer: look at deadlines, and
+            // program the timer afresh when one is next needed.
+            me.tick.set(true);
+            me.timer_at.set(u64::MAX);
         }
-        self.resched.set(false);
+        me.resched.set(false);
         self.arm_timer(false);
-        let cur = self.cur.get();
+        let cur = me.cur.get();
         let root = self.thread(cur).aspace.cap().map_or(0, |c| c.obj + 4096);
-        if self.loaded.get() != cur || self.loaded_root.get() != root {
-            self.hal.switch_thread(&self.phys, self.loaded.get(), cur, root);
-            self.loaded.set(cur);
-            self.loaded_root.set(root);
+        if me.loaded.get() != cur || me.loaded_root.get() != root {
+            self.hal.switch_thread(&self.phys, me.loaded.get(), cur, root);
+            me.loaded.set(cur);
+            me.loaded_root.set(root);
         }
-        self.dirty.set(false);
+        me.dirty.set(false);
     }
 
     /// Whether the scheduler would decide what it decided last time: the
     /// claim `dirty == false` makes, checked in debug builds.
     fn settled(&self) -> bool {
-        let cur = self.cur.get();
+        let me = self.me();
+        let cur = me.cur.get();
         cur != 0
             && self.thread(cur).state.get() == RUNNABLE
-            && !self.tick.get()
-            && !self.resched.get()
-            && self.direct.get() == 0
-            && self.loaded.get() == cur
-            && self.loaded_root.get() == self.thread(cur).aspace.cap().map_or(0, |c| c.obj + 4096)
-            && (self.rq_head.get() == 0 || self.timer_at.get() <= self.slice_end.get())
-            && (self.timers.get() == 0 || self.timer_at.get() <= self.thread(self.timers.get()).deadline.get())
+            && !me.tick.get()
+            && !me.resched.get()
+            && me.direct.get() == 0
+            && me.loaded.get() == cur
+            && me.loaded_root.get() == self.thread(cur).aspace.cap().map_or(0, |c| c.obj + 4096)
+            && (me.rq_head.get() == 0 || me.timer_at.get() <= me.slice_end.get())
+            && (me.timers.get() == 0 || me.timer_at.get() <= self.thread(me.timers.get()).deadline.get())
     }
 
-    /// Make sure the timer fires no later than the next deadline or the end
-    /// of the slice. Programming the timer is expensive (on a virtual
-    /// machine it leaves the guest), so unless `exact` it is only ever moved
-    /// earlier; a timer left too early fires once and is then set right.
+    /// Make sure this processor's timer fires no later than the next
+    /// deadline or the end of the slice. Programming the timer is expensive
+    /// (on a virtual machine it leaves the guest), so unless `exact` it is
+    /// only ever moved earlier; a timer left too early fires once and is
+    /// then set right.
     fn arm_timer(&self, exact: bool) {
-        let t = self.timers.get();
+        let me = self.me();
+        let t = me.timers.get();
         let mut want = if t != 0 { self.thread(t).deadline.get() } else { u64::MAX };
-        if self.cur.get() != 0 && self.rq_head.get() != 0 {
-            want = want.min(self.slice_end.get());
+        if me.cur.get() != 0 && me.rq_head.get() != 0 {
+            want = want.min(me.slice_end.get());
         }
-        let armed = self.timer_at.get();
+        let armed = me.timer_at.get();
         if want < armed || (exact && want != armed) {
-            self.timer_at.set(want);
+            me.timer_at.set(want);
             self.hal.set_timer(want);
         }
     }

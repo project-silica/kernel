@@ -628,6 +628,236 @@ fn t_caps() -> T {
     Ok(())
 }
 
+// ---- more than one processor ---------------------------------------------
+
+static CPUS: AtomicU64 = AtomicU64::new(1);
+
+/// Like `spawn`, on processor `cpu`.
+fn spawn_on(cpu: usize, entry: extern "C" fn(u64) -> !, arg: u64, fault: Cap) -> (Cap, usize) {
+    let t = new(ObjectType::Thread, 0);
+    let (_, stack) = memory();
+    thread_configure(t, SPACE, ASPACE, fault, Cap::NONE).expect("configure");
+    // SAFETY: `entry` is a function of this program; the stack was just mapped.
+    unsafe { thread_start(t, entry as usize, stack + (1 << 16) - 8, arg | t.0 << 32, false) }.expect("start");
+    thread_set_cpu(t, cpu).expect("move to processor");
+    thread_resume(t).expect("resume");
+    (t, stack)
+}
+
+fn need_cpus(n: u64) -> T {
+    if CPUS.load(SeqCst) < n { Err("this test needs more processors than the machine has") } else { Ok(()) }
+}
+
+fn sleep_ms(ms: u64) {
+    static NAP: AtomicU64 = AtomicU64::new(0);
+    if NAP.load(SeqCst) == 0 {
+        NAP.store(new(ObjectType::Notification, 0).0, SeqCst);
+    }
+    let _ = recv(Cap(NAP.load(SeqCst)), Wait::Until(CLOCK.now() + ms * 1_000_000));
+}
+
+static RAN: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+extern "C" fn count_for_ever(arg: u64) -> ! {
+    let c = &RAN[(arg & 63) as usize];
+    loop {
+        c.fetch_add(1, SeqCst);
+    }
+}
+
+/// Every processor runs threads, and they run at the same time.
+fn t_smp_run() -> T {
+    need_cpus(2)?;
+    let n = CPUS.load(SeqCst).min(64) as usize;
+    let mut threads = [Cap::NONE; 64];
+    for (cpu, t) in threads.iter_mut().enumerate().take(n).skip(1) {
+        *t = spawn_on(cpu, count_for_ever, cpu as u64, Cap::NONE).0;
+    }
+    // This thread never yields its processor: the others advance only if
+    // their own processors run them.
+    let end = CLOCK.now() + 300_000_000;
+    while CLOCK.now() < end {
+        if (1..n).all(|c| RAN[c].load(SeqCst) > 1000) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    for c in 1..n {
+        if RAN[c].load(SeqCst) <= 1000 {
+            return Err("a thread placed on another processor did not run while this one was busy");
+        }
+    }
+    for t in &threads[1..n] {
+        thread_suspend(*t).map_err(|_| "cannot suspend a thread on another processor")?;
+    }
+    let before: [u64; 64] = core::array::from_fn(|c| RAN[c].load(SeqCst));
+    sleep_ms(20);
+    for c in 1..n {
+        if RAN[c].load(SeqCst) != before[c] {
+            return Err("a thread suspended from another processor kept running");
+        }
+    }
+    Ok(())
+}
+
+/// Calls to a server on another processor, then on the same one.
+fn t_smp_ipc() -> T {
+    need_cpus(2)?;
+    let ep = new(ObjectType::Endpoint, 0);
+    SHARED[3].store(ep.0, SeqCst);
+    let _ = spawn_on(1, echo_server, 0, Cap::NONE);
+    for i in 0..20_000u64 {
+        let r = call(ep, MsgInfo::new(7, 3), [i, i, i, 0]).map_err(|_| "a call to a server on another processor failed")?;
+        if r.words != [i * 2, i, !i, 3] {
+            return Err("the reply from another processor does not match the request");
+        }
+    }
+    call(ep, MsgInfo::new(99, 0), [0; 4]).map_err(|_| "cannot stop the server")?;
+    Ok(())
+}
+
+static VICTIM: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn read_for_ever(arg: u64) -> ! {
+    let p = VICTIM.load(SeqCst) as *const u64;
+    loop {
+        // SAFETY: the page is mapped at first; when it is unmapped under
+        // this thread, the fault is the test.
+        let v = unsafe { core::ptr::read_volatile(p) };
+        SHARED[0].store(v, SeqCst);
+        let _ = arg;
+    }
+}
+
+/// Unmapping a page takes it away from a thread using it on another processor at once.
+fn t_smp_shootdown() -> T {
+    need_cpus(2)?;
+    let (frame, at) = memory();
+    // SAFETY: just mapped read-write.
+    unsafe { core::ptr::write_volatile(at as *mut u64, 0xC0FFEE) };
+    VICTIM.store(at as u64, SeqCst);
+    SHARED[0].store(0, SeqCst);
+    let ep = new(ObjectType::Endpoint, 0);
+    let (t, _) = spawn_on(1, read_for_ever, 0, ep);
+    wait_for(&SHARED[0], 0xC0FFEE)?;
+    // SAFETY: only the reader thread uses the page, and losing it is the test.
+    unsafe { unmap(frame) }.map_err(|_| "unmap")?;
+    // From here on the other processor must not read the page again: the
+    // unmap returned only after it dropped its cached translation.
+    SHARED[0].store(1, SeqCst);
+    let m =
+        recv(ep, Wait::Until(CLOCK.now() + 1_000_000_000)).map_err(|_| "the reader on another processor never faulted after the unmap")?;
+    if kind(&m) != Fault::Page as u64 || m.words[1] != at as u64 {
+        return Err("the reader's fault is not a page fault at the unmapped address");
+    }
+    if SHARED[0].load(SeqCst) != 1 {
+        return Err("another processor read a page after unmap returned");
+    }
+    // SAFETY: the faulted reader is stopped and not used again.
+    unsafe { cap_delete(t) }.map_err(|_| "delete")?;
+    Ok(())
+}
+
+static ROUNDS: AtomicU64 = AtomicU64::new(0);
+static LOST: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn stress_client(arg: u64) -> ! {
+    let ep = Cap(SHARED[3].load(SeqCst));
+    let want = arg & 0xFFFF_FFFF;
+    let mut done = 0u64;
+    while done < want {
+        match call(ep, MsgInfo::new(7, 3), [done, 5, 6, 0]) {
+            Ok(r) if r.words[0] == done * 2 => done += 1,
+            Ok(_) => {
+                LOST.fetch_add(1, SeqCst);
+                done += 1;
+            }
+            // The endpoint capability is being revoked and granted again
+            // under us: the documented errors, then try again.
+            Err(Error::BadCap) | Err(Error::Gone) => yield_now(),
+            Err(_) => {
+                LOST.fetch_add(1 << 32, SeqCst);
+                done += 1;
+            }
+        }
+    }
+    ROUNDS.fetch_add(done, SeqCst);
+    finish(arg)
+}
+
+extern "C" fn stress_server(arg: u64) -> ! {
+    let ep = Cap(arg & 0xFFFF_FFFF);
+    let mut m = loop {
+        if let Ok(m) = recv(ep, Wait::Forever) {
+            break m;
+        }
+    };
+    loop {
+        let w = [m.words[0] * 2, 0, 0, 0];
+        m = loop {
+            match reply_recv(ep, MsgInfo::new(8, 1), w) {
+                Ok(m) => break m,
+                Err(_) => {
+                    if let Ok(m) = recv(ep, Wait::Forever) {
+                        break m;
+                    }
+                }
+            }
+        };
+    }
+}
+
+/// A million round trips between two threads on one processor while other
+/// processors are busy, with nothing lost; then the same while a thread on
+/// a third processor keeps revoking the clients' endpoint capability and
+/// granting it again.
+fn smp_stress(rounds: u64, revoke: bool) -> T {
+    need_cpus(4)?;
+    let master = new(ObjectType::Endpoint, 0);
+    let lent = slot();
+    cap_derive(SPACE, lent, master, Rights::ALL, 0).map_err(|_| "derive")?;
+    SHARED[3].store(lent, SeqCst);
+    ROUNDS.store(0, SeqCst);
+    LOST.store(0, SeqCst);
+    // Server and client share processor 1 (the fast, local path); a second
+    // client calls from processor 2 (the cross-processor path).
+    let _ = spawn_on(1, stress_server, master.0, Cap::NONE);
+    let _ = spawn_on(1, stress_client, rounds, Cap::NONE);
+    let _ = spawn_on(2, stress_client, rounds / 10, Cap::NONE);
+    let _ = spawn_on(3, count_for_ever, 3, Cap::NONE);
+    let total = rounds + rounds / 10;
+    let end = CLOCK.now() + 120_000_000_000;
+    let mut revokes = 0u64;
+    while ROUNDS.load(SeqCst) < total {
+        if CLOCK.now() > end {
+            return Err("the round trips did not finish in two minutes");
+        }
+        if revoke {
+            // SAFETY: only the stress clients use the lent capability.
+            unsafe { cap_delete(Cap(lent)) }.map_err(|_| "revoke")?;
+            cap_derive(SPACE, lent, master, Rights::ALL, 0).map_err(|_| "grant again")?;
+            revokes += 1;
+        } else {
+            sleep_ms(5);
+        }
+    }
+    if LOST.load(SeqCst) != 0 {
+        return Err("a call returned a wrong reply or an undocumented error");
+    }
+    if revoke && revokes < 100 {
+        return Err("the capability was revoked fewer than 100 times during the run");
+    }
+    Ok(())
+}
+
+fn t_smp_stress() -> T {
+    smp_stress(1_000_000, false)
+}
+
+fn t_smp_revoke() -> T {
+    smp_stress(1_000_000, true)
+}
+
 static CLOCK_CELL: [AtomicU64; 3] = [const { AtomicU64::new(1) }; 3];
 struct LazyClock;
 static CLOCK: LazyClock = LazyClock;
@@ -712,6 +942,11 @@ fn stub(start: *const u8, end: *const u8) -> &'static [u8] {
 /// A thread in its own address space running `code` (position-independent
 /// machine code that needs no stack and no data).
 fn foreign_thread(code: &[u8], arg: u64) -> Cap {
+    foreign_thread_on(0, code, arg)
+}
+
+/// Like `foreign_thread`, on processor `cpu`.
+fn foreign_thread_on(cpu: usize, code: &[u8], arg: u64) -> Cap {
     let aspace = new(ObjectType::AddressSpace, 16);
     let frame = new(ObjectType::Frame, 12);
     let at = region(1 << 12);
@@ -725,7 +960,11 @@ fn foreign_thread(code: &[u8], arg: u64) -> Cap {
     let t = new(ObjectType::Thread, 0);
     thread_configure(t, SPACE, aspace, Cap::NONE, Cap::NONE).expect("configure");
     // SAFETY: the code was written for exactly this: it runs at any address without a stack.
-    unsafe { thread_start(t, 0x10_0000, 0, arg, true) }.expect("start");
+    unsafe { thread_start(t, 0x10_0000, 0, arg, false) }.expect("start");
+    if cpu != 0 {
+        thread_set_cpu(t, cpu).expect("move to processor");
+    }
+    thread_resume(t).expect("resume");
     t
 }
 
@@ -845,12 +1084,73 @@ fn bench_timer() {
     println!("BENCH timer_overshoot_p99 {} ns", s[count - count / 100 - 1]);
 }
 
+static GO: AtomicU64 = AtomicU64::new(0);
+static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+extern "C" fn pair_client(arg: u64) -> ! {
+    let (pair, ep) = ((arg & 0xFF) as usize, Cap((arg >> 8) & 0xFF_FFFF));
+    while GO.load(SeqCst) == 0 {
+        core::hint::spin_loop();
+    }
+    let mut n = 0u64;
+    while GO.load(SeqCst) == 1 {
+        for _ in 0..64 {
+            let _ = call(ep, MsgInfo::new(1, 4), [n, 2, 3, 4]);
+        }
+        n += 64;
+    }
+    COUNTS[pair].store(n, SeqCst);
+    finish(arg)
+}
+
+/// Round trips per second of `pairs` independent client and server pairs,
+/// each pair on its own processor, each server in its own address space.
+fn bench_pairs(pairs: usize) -> u64 {
+    GO.store(0, SeqCst);
+    let mut threads = [Cap::NONE; 16];
+    for p in 0..pairs {
+        COUNTS[p].store(0, SeqCst);
+        let ep = new(ObjectType::Endpoint, 0);
+        threads[2 * p] = foreign_thread_on(p, stub(&raw const stub_echo, &raw const stub_echo_end), ep.0);
+        threads[2 * p + 1] = spawn_on(p, pair_client, p as u64 | ep.0 << 8, Cap::NONE).0;
+    }
+    // Processor 0 hosts a pair too, so this thread sleeps while they run.
+    sleep_ms(20);
+    let start = CLOCK.now();
+    GO.store(1, SeqCst);
+    sleep_ms(300);
+    GO.store(2, SeqCst);
+    let took = CLOCK.now() - start;
+    let mut total = 0;
+    for p in 0..pairs {
+        for _ in 0..1000 {
+            if COUNTS[p].load(SeqCst) != 0 {
+                break;
+            }
+            sleep_ms(1);
+        }
+        total += COUNTS[p].load(SeqCst);
+    }
+    for t in &threads[..2 * pairs] {
+        // SAFETY: the benchmark's own threads, finished or blocked.
+        let _ = unsafe { cap_delete(*t) };
+    }
+    (total as u128 * 1_000_000_000 / took as u128) as u64
+}
+
 fn bench() -> ! {
     bench_null_syscall();
     bench_ipc();
     bench_ctx_switch();
     bench_page_fault();
     bench_timer();
+    let one = bench_pairs(1);
+    println!("BENCH ipc_pairs1 {one} ops/s");
+    if CPUS.load(SeqCst) >= 8 {
+        let eight = bench_pairs(8);
+        println!("BENCH ipc_pairs8 {eight} ops/s");
+        println!("BENCH ipc_scaling {}.{:02} x", eight / one, eight * 100 / one % 100);
+    }
     println!("BENCH DONE");
     exit(true)
 }
@@ -870,6 +1170,11 @@ const TESTS: &[(&str, fn() -> T)] = &[
     ("fpu", t_fpu),
     ("untyped", t_untyped),
     ("caps", t_caps),
+    ("smp_run", t_smp_run),
+    ("smp_ipc", t_smp_ipc),
+    ("smp_shootdown", t_smp_shootdown),
+    ("smp_stress", t_smp_stress),
+    ("smp_revoke", t_smp_revoke),
 ];
 
 /// Program entry, called by libsys's `_start`.
@@ -883,6 +1188,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         CLOCK_CELL[i].store(info.clock[i], SeqCst);
     }
     NEXT_SLOT.store(info.first_free_slot, SeqCst);
+    CPUS.store(info.cpus, SeqCst);
     let big = (0..info.untyped_count as usize).filter(|&i| info.untyped[i].kind == KIND_RAM).max_by_key(|&i| info.untyped[i].bits);
     let Some(big) = big else {
         println!("ERROR: roottest: the kernel handed over no ordinary memory");

@@ -217,6 +217,12 @@ pub fn thread_suspend(thread: Cap) -> Result<()> {
     sys(Syscall::ThreadControl, [thread.0, 0, 0, 0, 0, 0]).map(|_| ())
 }
 
+/// Move a thread to processor `cpu` (an index below `RootInfo::cpus`). The
+/// thread is suspended first and stays suspended; resume it to run there.
+pub fn thread_set_cpu(thread: Cap, cpu: usize) -> Result<()> {
+    sys(Syscall::ThreadControl, [thread.0, 2, cpu as u64, 0, 0, 0]).map(|_| ())
+}
+
 /// Make a suspended thread runnable.
 pub fn thread_resume(thread: Cap) -> Result<()> {
     sys(Syscall::ThreadControl, [thread.0, 1, 0, 0, 0, 0]).map(|_| ())

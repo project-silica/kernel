@@ -68,7 +68,8 @@ pub enum Syscall {
     /// `a0` thread, `a1` instruction pointer, `a2` stack pointer, `a3`
     /// first argument, `a4` not 0: make the thread runnable.
     ThreadStart = 13,
-    /// `a0` thread, `a1` 0 suspend, 1 resume.
+    /// `a0` thread, `a1` 0 suspend, 1 resume, 2 move to processor `a2`
+    /// (the thread is suspended first and stays suspended).
     ThreadControl = 14,
     /// `a0` port capability, `a1` port, `a2` width in bytes (1, 2, 4) with
     /// bit 8 set for a write, `a3` value. Returns `a0` value read.

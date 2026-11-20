@@ -17,7 +17,7 @@
 use crate::hal::Hal;
 use crate::kernel::Kernel;
 use crate::mem::{KObj, Paddr};
-use core::cell::Cell;
+use crate::smp::Word;
 use silica_abi::{Error, ObjectType, Rights, SLOT_BITS};
 
 /// Capability flag: device memory (not zeroed, mapped uncached).
@@ -35,16 +35,16 @@ pub const FLAG_IRQS: u8 = 4;
 /// Untyped or the address space a Frame is mapped in.
 #[repr(C, align(64))]
 pub struct Slot {
-    pub(crate) obj: Cell<u64>,
+    pub(crate) obj: Word,
     /// Bits 0..8 type (0: empty), 8..16 rights, 16..24 size bits, 24..32 flags, 32..48 depth.
-    pub(crate) meta: Cell<u64>,
-    pub(crate) badge: Cell<u64>,
-    pub(crate) aux: Cell<u64>,
-    pub(crate) prev: Cell<Paddr>,
-    pub(crate) next: Cell<Paddr>,
+    pub(crate) meta: Word,
+    pub(crate) badge: Word,
+    pub(crate) aux: Word,
+    pub(crate) prev: Word,
+    pub(crate) next: Word,
     /// Links in the list of frames mapped into one address space.
-    pub(crate) mprev: Cell<Paddr>,
-    pub(crate) mnext: Cell<Paddr>,
+    pub(crate) mprev: Word,
+    pub(crate) mnext: Word,
 }
 impl KObj for Slot {}
 
@@ -170,8 +170,15 @@ impl<H: Hal> Kernel<H> {
             self.unmap_slot(s);
         }
         if cap.ty == ObjectType::AddressSpace {
-            // It may be the running thread's own: the scheduler reloads.
-            self.dirty.set(true);
+            // It may be a running thread's own, on any processor: each
+            // looks again at what it should have loaded.
+            self.me().dirty.set(true);
+            if self.ncpu.get() > 1 {
+                for (i, cpu) in self.others() {
+                    cpu.dirty.set(true);
+                    self.hal.kick(i, true);
+                }
+            }
         }
         let last = !self.same_obj(slot.prev.get(), &cap) && !self.same_obj(slot.next.get(), &cap);
         let (p, n) = (slot.prev.get(), slot.next.get());

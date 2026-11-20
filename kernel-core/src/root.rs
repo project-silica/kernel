@@ -56,6 +56,8 @@ pub struct RootSpec<'a> {
     pub entropy: [u8; 32],
     /// Kernel command line.
     pub cmdline: &'a [u8],
+    /// Number of processors.
+    pub cpus: u64,
 }
 
 /// Why the root task could not be created.
@@ -231,6 +233,7 @@ impl<H: Hal> Kernel<H> {
         self.phys.write_bytes(info + offset_of!(RootInfo, entropy) as u64, &spec.entropy);
         let cmd = &spec.cmdline[..spec.cmdline.len().min(256)];
         put(offset_of!(RootInfo, cmdline_len), &[cmd.len() as u64]);
+        put(offset_of!(RootInfo, cpus), &[spec.cpus]);
         self.phys.write_bytes(info + offset_of!(RootInfo, cmdline) as u64, cmd);
 
         // The thread: its CapSpace, address space and IPC buffer, then go.

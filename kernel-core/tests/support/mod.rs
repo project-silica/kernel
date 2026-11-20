@@ -27,6 +27,12 @@ pub struct TestHal {
     pub flushes: Cell<u64>,
     pub switches: Cell<u64>,
     pub left: Cell<u64>,
+    /// The simulated processor the test is currently acting as.
+    pub cpu: Cell<usize>,
+    /// (processor, waited) for every kick, in order.
+    pub kicks: RefCell<Vec<(usize, bool)>>,
+    pub resets: Cell<u64>,
+    pub forgets: Cell<u64>,
 }
 
 const ADDR: u64 = 0x000F_FFFF_FFFF_F000;
@@ -84,6 +90,20 @@ impl Hal for TestHal {
     fn tlb_flush(&self, _root: Paddr, _vaddr: u64, _len: u64) {
         self.flushes.set(self.flushes.get() + 1);
     }
+    fn cpu(&self) -> usize {
+        self.cpu.get()
+    }
+    fn kick(&self, cpu: usize, wait: bool) {
+        // Simulated processors take turns: none is in user mode while
+        // another is in the kernel, so there is nothing to wait for.
+        self.kicks.borrow_mut().push((cpu, wait));
+    }
+    fn tlb_reset(&self) {
+        self.resets.set(self.resets.get() + 1);
+    }
+    fn tlb_forget(&self, _root: Paddr, _cpu: usize) {
+        self.forgets.set(self.forgets.get() + 1);
+    }
     fn now(&self) -> u64 {
         self.now.get()
     }
@@ -97,6 +117,7 @@ impl Hal for TestHal {
         }
         n > 0
     }
+    fn idle_begin(&self) {}
     fn idle(&self) {
         assert!(self.timer.get() != u64::MAX, "idle with no timer armed: every thread is blocked for ever");
         self.now.set(self.now.get().max(self.timer.get()));
@@ -164,6 +185,38 @@ impl Drop for Ram {
     }
 }
 
+impl Machine {
+    /// As processor `cpu`: let its scheduler run (as on any kernel exit).
+    pub fn settle(&self, cpu: usize) {
+        self.on(cpu);
+        if self.k.can_run() {
+            self.k.enter();
+            self.k.schedule();
+            self.k.leave();
+        }
+    }
+
+    /// The fault path as the architecture drives it.
+    pub fn fault(&self, kind: silica_abi::Fault, addr: u64, code: u64) {
+        self.k.enter();
+        self.k.fault(kind, addr, code);
+        if self.k.can_run() {
+            self.k.schedule();
+        }
+        self.k.leave();
+    }
+
+    /// A timer interrupt on the current processor.
+    pub fn tick(&self) {
+        self.k.enter();
+        self.k.on_timer();
+        if self.k.can_run() {
+            self.k.schedule();
+        }
+        self.k.leave();
+    }
+}
+
 pub struct Machine {
     pub k: Kernel<TestHal>,
     _ram: Ram,
@@ -175,8 +228,19 @@ pub struct Machine {
 }
 
 impl Machine {
-    /// A machine with `mib` MiB of memory and a root task.
+    /// A machine with `mib` MiB of memory, one processor and a root task.
     pub fn new(mib: u64) -> Machine {
+        Machine::with_cpus(mib, 1)
+    }
+
+    /// Act as processor `cpu` from now on. The simulated processors take
+    /// turns: each kernel entry runs to completion before the next.
+    pub fn on(&self, cpu: usize) {
+        self.k.hal.cpu.set(cpu);
+    }
+
+    /// A machine with `cpus` processors; the root task runs on processor 0.
+    pub fn with_cpus(mib: u64, cpus: usize) -> Machine {
         let ram = Ram::new((mib << 20) as usize);
         let hal = TestHal {
             now: Cell::new(1000),
@@ -186,6 +250,10 @@ impl Machine {
             flushes: Cell::new(0),
             switches: Cell::new(0),
             left: Cell::new(0),
+            cpu: Cell::new(0),
+            kicks: RefCell::new(Vec::new()),
+            resets: Cell::new(0),
+            forgets: Cell::new(0),
         };
         let base = ram.ptr.wrapping_sub(RAM_BASE as usize);
         // SAFETY: every physical address the kernel is told about lies in
@@ -211,13 +279,17 @@ impl Machine {
             wall_clock: [0; 2],
             entropy: [7; 32],
             cmdline: b"test=host",
+            cpus: cpus as u64,
         };
+        k.set_cpu_count(cpus);
+        k.enter();
         let root = k.boot_root(&spec).expect("root task");
         let tv = k.thread_view(root);
         let cs = k.view(tv.slots[0]).expect("root cspace").cap;
         let asp = k.view(k.slot_addr(&cs, SLOT_ASPACE).unwrap()).unwrap().cap.obj;
         let info = k.translate(asp, INFO_VADDR).expect("root info mapped");
         k.schedule();
+        k.leave();
         assert_eq!(k.current(), root);
         Machine { k, _ram: ram, root, cs, info, mib }
     }
@@ -260,8 +332,10 @@ impl Machine {
             let c = self.k.current();
             // Everyone else yields until `t` gets its turn.
             self.k.regs(c)[TestHal::SYS].set(Syscall::Yield as u64);
+            self.k.enter();
             self.k.syscall();
             self.k.schedule();
+            self.k.leave();
             spins += 1;
             assert!(spins < 1000, "thread {t:#x} never became current");
         }
@@ -278,7 +352,9 @@ impl Machine {
             for i in 0..6 {
                 r[TestHal::ARG[i]].set(a[i]);
             }
+            self.k.enter();
             self.k.syscall();
+            self.k.leave();
             // A preempted syscall has its instruction pointer moved back onto
             // the syscall instruction; anything else means it is over (the
             // call may have given this very thread a new instruction pointer).
@@ -288,7 +364,9 @@ impl Machine {
         }
         let out = SysResult { thread: t, status: r[TestHal::SYS].get(), blocked: self.k.thread_view(t).state != 1 };
         if self.k.can_run() {
+            self.k.enter();
             self.k.schedule();
+            self.k.leave();
         }
         out
     }

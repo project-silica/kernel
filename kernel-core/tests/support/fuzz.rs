@@ -1,7 +1,7 @@
 //! The syscall fuzzer's interpreter (`spec/TESTING.md` section 3): turns a
 //! byte string into syscalls, faults, timer ticks and pending interrupts
-//! made by four threads that share the root task's CapSpace and address
-//! space, then checks what must hold whatever they did:
+//! made by four threads on two processors that share the root task's
+//! CapSpace and address space, then checks what must hold whatever they did:
 //!
 //! - the kernel did not panic and every syscall returned or blocked;
 //! - the derivation list around every capability is consistent;
@@ -55,28 +55,43 @@ impl Src<'_> {
 
 /// Run one fuzz input.
 pub fn run(data: &[u8]) {
-    let m = Machine::new(8);
+    let m = Machine::with_cpus(8, 2);
     let (ut, d) = m.big_untyped();
     for i in 0..3 {
         m.spawn(ut, THREADS + i);
     }
+    // One of them starts out on the second processor.
+    m.ok(S::ThreadControl, [THREADS + 2, 2, 1, 0, 0, 0]);
+    m.ok(S::ThreadControl, [THREADS + 2, 1, 0, 0, 0, 0]);
     let ut_addr = m.k.slot_addr(&m.cs, ut).unwrap();
     let mut src = Src(data);
     let mut steps = 0;
-    while m.k.can_run() && steps < 4096 {
+    while steps < 4096 {
         steps += 1;
-        m.k.schedule();
+        // Which processor makes the next kernel entry.
+        let Some(sel) = src.byte() else { break };
+        m.on((sel & 1) as usize);
+        if !m.k.can_run() {
+            m.on(1 - (sel & 1) as usize);
+            if !m.k.can_run() {
+                break;
+            }
+        }
+        m.settle(m.k.hal.cpu.get());
         let t = m.k.current();
+        if t == 0 {
+            continue;
+        }
         let Some(op) = src.byte() else { break };
         match op {
             // The architecture's other ways into the kernel.
             240..=243 => {
-                m.k.fault([Fault::Page, Fault::Instruction, Fault::Exception][op as usize % 3], 0xdead_0000, op as u64);
+                m.fault([Fault::Page, Fault::Instruction, Fault::Exception][op as usize % 3], 0xdead_0000, op as u64);
                 continue;
             }
             244..=247 => {
                 m.k.hal.now.set(m.k.hal.now.get() + 3_000_000 * (op as u64 - 243));
-                m.k.on_timer();
+                m.tick();
                 continue;
             }
             248..=251 => {
@@ -108,6 +123,8 @@ pub fn run(data: &[u8]) {
         m.raw(n, a);
     }
 
+    m.settle(1);
+    m.settle(0);
     // The root task may have destroyed itself (it holds the capabilities to
     // do so); then there is nobody left to ask and the run ends here.
     let rv = m.k.thread_view(m.root);
@@ -157,4 +174,7 @@ pub fn run(data: &[u8]) {
     let free = (1..4096).find(|&i| m.cap(i).is_none()).expect("a free slot");
     m.retype(ut, T::Frame, d.bits as u64, free, 1);
     assert!(m.k.can_run());
+    // Nothing is left on the other processor: its threads came from the Untyped.
+    m.on(1);
+    assert_eq!(m.k.current(), 0, "a thread from the revoked Untyped still runs on processor 1");
 }

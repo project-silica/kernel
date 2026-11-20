@@ -57,6 +57,21 @@ pub trait Hal {
     /// Drop cached translations for `[vaddr, vaddr + len)` in `root`.
     fn tlb_flush(&self, root: Paddr, vaddr: u64, len: u64);
 
+    /// Index of the processor running this code.
+    fn cpu(&self) -> usize;
+    /// Interrupt processor `cpu` so that it enters the kernel. With `wait`,
+    /// return only when it is no longer running user code: it is in the
+    /// kernel, has saved its thread's registers, and will take its lock
+    /// (which the caller holds) before doing anything else.
+    fn kick(&self, cpu: usize, wait: bool);
+    /// On this processor, drop every cached user translation and load the
+    /// kernel-only address space. Another processor changed or destroyed
+    /// mappings this one may have cached.
+    fn tlb_reset(&self);
+    /// Processor `cpu` (whose lock the caller holds) does not have `root`
+    /// loaded: make its next load of `root` start with nothing cached.
+    fn tlb_forget(&self, root: Paddr, cpu: usize);
+
     /// Monotonic nanoseconds since boot.
     fn now(&self) -> u64;
     /// Ask for a timer interrupt at `deadline` (`u64::MAX`: none).
@@ -64,8 +79,13 @@ pub trait Hal {
     /// Whether an interrupt is waiting to be taken. Long operations poll this
     /// and restart later when it is true.
     fn irq_pending(&self) -> bool;
+    /// This processor is about to wait for an interrupt and let go of its
+    /// lock: from now until `idle` returns it counts as idle, not as in the
+    /// kernel, so a `kick` interrupts it.
+    fn idle_begin(&self);
     /// Wait for an interrupt with interrupts enabled; returns after its
-    /// handler has run.
+    /// handler has run. Called without this processor's lock, so the
+    /// handler must not touch kernel state.
     fn idle(&self);
     /// Port I/O (x86_64). `width` is 1, 2 or 4.
     fn port_io(&self, port: u16, width: u8, write: bool, value: u32) -> u32;

@@ -85,7 +85,11 @@ impl<H: Hal> Kernel<H> {
             let obj = ut.obj + start + (i << obits);
             let mut cap = Cap { ty, rights: Rights::ALL, bits: cbits as u8, flags: ut.flags, obj, badge: 0 };
             match ty {
-                ObjectType::Thread => self.hal.init_thread(&self.phys, obj),
+                ObjectType::Thread => {
+                    self.hal.init_thread(&self.phys, obj);
+                    // A thread starts on the processor that made it.
+                    self.thread(obj).cpu.set(self.hal.cpu() as u64);
+                }
                 ObjectType::AddressSpace => {
                     self.phys.obj::<AsHeader>(obj).bits.set(obits);
                     self.hal.init_root(&self.phys, obj + (1 << PAGE_BITS));

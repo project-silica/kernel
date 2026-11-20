@@ -77,6 +77,9 @@ pub struct RootInfo {
     pub wall_clock: [u64; 2],
     /// 32 bytes from the firmware's random source (all zero when absent).
     pub entropy: [u8; 32],
+    /// Number of processors. Threads start on the processor that created
+    /// them and can be moved to any index below this.
+    pub cpus: u64,
     /// Length of the kernel command line in `cmdline`.
     pub cmdline_len: u64,
     /// The kernel command line.

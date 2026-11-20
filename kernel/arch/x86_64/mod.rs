@@ -9,12 +9,15 @@
 
 mod cpu;
 mod serial;
+mod smp;
 
 use core::arch::asm;
 use core::cell::Cell;
 use core::fmt::Write;
+use core::sync::atomic::Ordering;
+use cpu::percpu;
 use cpu::{cpuid, rdmsr, rdtsc, wrmsr};
-use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, Cmdline, PHYS_MAP_BASE, Region};
+use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, Cmdline, PHYS_MAP_BASE, Region, RegionKind};
 use kernel_core::hal::Hal;
 use kernel_core::mem::{Paddr, Phys};
 use kernel_core::root::RootSpec;
@@ -40,15 +43,17 @@ const REG_BY_SYSCALL: usize = 20;
 /// inside a system call.
 const REG_FPCTL: usize = 21;
 
-const PTE_P: u64 = 1;
-const PTE_W: u64 = 2;
+pub(super) const PTE_P: u64 = 1;
+pub(super) const PTE_W: u64 = 2;
 const PTE_U: u64 = 4;
 const PTE_PCD: u64 = 0x10;
 const PTE_PS: u64 = 0x80;
 const PTE_NX: u64 = 1 << 63;
-const PTE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
+pub(super) const PTE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
 
 const TIMER_VECTOR: u64 = 0x20;
+/// Another processor wants this one in the kernel.
+const KICK_VECTOR: u64 = 0xF1;
 const SPURIOUS_VECTOR: u64 = 0xFF;
 const MSR_APIC_BASE: u32 = 0x1B;
 const MSR_TSC_DEADLINE: u32 = 0x6E0;
@@ -62,7 +67,9 @@ const MSR_X2APIC_TIMER_DIVIDE: u32 = 0x83E;
 const MSR_FS_BASE: u32 = 0xC000_0100;
 const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
-/// The x86_64 architecture state of the one processor running kernel code.
+/// What the x86_64 layer knows about the machine. Set by the boot processor
+/// before any other starts, then only read; per-processor state is in
+/// `cpu::PerCpu`.
 pub struct X86 {
     tsc_hz: Cell<u64>,
     /// Timestamp counter at monotonic time 0.
@@ -70,35 +77,29 @@ pub struct X86 {
     /// Nanoseconds per tick, and ticks per nanosecond, as 32.32 fixed point.
     ns_per_tick: Cell<u64>,
     ticks_per_ns: Cell<u64>,
-    /// Timestamp counter value of the armed timer (`u64::MAX`: none).
-    deadline: Cell<u64>,
     /// The page table with only the kernel's mappings.
     kernel_root: Cell<u64>,
     /// Local APIC timer counts per nanosecond as 32.32 fixed point; 0 when
     /// the TSC-deadline timer is in use.
     apic_per_ns: Cell<u64>,
     slide: Cell<u64>,
-    polls: Cell<u32>,
     /// How extended state is saved: 0 XSAVE, 1 XSAVEOPT, 2 XSAVES (compacted).
     xsave_kind: Cell<u8>,
     xcr0: Cell<u64>,
     /// XGETBV with ECX = 1 reports which state components are in use.
     xgetbv1: Cell<bool>,
     fsgsbase: Cell<bool>,
-    /// Process-context identifiers: the generation and the next free one.
-    /// 0 in `pcid_gen` means the processor has none.
-    pcid_gen: Cell<u64>,
-    pcid_next: Cell<u64>,
+    /// The processors have process-context identifiers.
+    pcid: Cell<bool>,
     /// Bits: 1 enhanced IBRS on, 2 BHI_DIS_S on, 4 VERW on exit, 8 no
     /// enhanced IBRS (indirect branches unprotected), 16 Meltdown-affected.
     mitigations: Cell<u8>,
-    stray_irqs: Cell<u64>,
 }
 
 struct Global(Kernel<X86>);
-// SAFETY: at M1 exactly one processor runs kernel code, with interrupts off
-// except inside `idle`, whose interrupt handlers only use `Cell`s between
-// whole operations.
+// SAFETY: every processor enters the kernel through `Kernel::enter`, and
+// kernel-core's lock protocol (`smp.rs` there) decides what each may touch.
+// The `X86` fields are written by the boot processor before any other starts.
 unsafe impl Sync for Global {}
 
 static KERNEL: Global = Global(Kernel::new(
@@ -107,19 +108,15 @@ static KERNEL: Global = Global(Kernel::new(
         tsc0: Cell::new(0),
         ns_per_tick: Cell::new(0),
         ticks_per_ns: Cell::new(0),
-        deadline: Cell::new(u64::MAX),
         kernel_root: Cell::new(0),
         apic_per_ns: Cell::new(0),
         slide: Cell::new(0),
-        polls: Cell::new(0),
         xsave_kind: Cell::new(0),
         xcr0: Cell::new(0),
         xgetbv1: Cell::new(false),
         fsgsbase: Cell::new(false),
-        pcid_gen: Cell::new(0),
-        pcid_next: Cell::new(1),
+        pcid: Cell::new(false),
         mitigations: Cell::new(0),
-        stray_irqs: Cell::new(0),
     },
     // SAFETY: the loader maps all physical memory at PHYS_MAP_BASE and the
     // kernel only uses addresses from the boot regions through it.
@@ -280,11 +277,7 @@ impl Hal for X86 {
         if cpu::read_cr3() & PTE_ADDR != root {
             // Not loaded. Without PCIDs nothing of it is cached; with them,
             // forget its identifier so its next load starts clean.
-            if self.pcid_gen.get() != 0 {
-                // SAFETY: the word at offset 2048 of a live address space's
-                // header page belongs to this module (see `cr3_for`).
-                unsafe { *kernel().phys.ptr(root - 4096 + 2048).cast::<u64>() = 0 }
-            }
+            self.tlb_forget(root, percpu().index);
             return;
         }
         if len > 32 * 4096 {
@@ -312,7 +305,7 @@ impl Hal for X86 {
             // 0 disarms the timer, so a deadline at tick 0 is moved to tick 1.
             (self.tsc0.get() as u128 + ticks).clamp(1, u64::MAX as u128 - 1) as u64
         };
-        self.deadline.set(tsc);
+        percpu().deadline.set(tsc);
         let per_ns = self.apic_per_ns.get();
         // SAFETY: the timer MSRs exist (x2APIC and, for the first branch,
         // TSC-deadline were checked at boot). A zero count or deadline disarms.
@@ -332,22 +325,72 @@ impl Hal for X86 {
     }
 
     fn irq_pending(&self) -> bool {
-        if rdtsc() >= self.deadline.get() {
+        let me = percpu();
+        if rdtsc() >= me.deadline.get() {
             return true;
         }
         // Any request for a vector from 32 up in the local APIC. Reading
         // the APIC can cost a trip to the hypervisor, so look only every
         // sixteenth time: callers poll once per small step of a long loop.
-        let n = self.polls.get().wrapping_add(1);
-        self.polls.set(n);
+        let n = me.polls.get().wrapping_add(1);
+        me.polls.set(n);
         n % 16 == 0 && (1..8).any(|i| rdmsr(MSR_X2APIC_IRR0 + i) != 0)
+    }
+
+    fn idle_begin(&self) {
+        percpu().mode.idle();
     }
 
     fn idle(&self) {
         // SAFETY: STI takes effect after the next instruction, so no
-        // interrupt can arrive between the decision to wait and HLT. The
-        // handler runs on this stack and returns here.
+        // interrupt can arrive between the decision to wait and HLT (one
+        // that is already pending ends the HLT at once). The handler runs
+        // on this stack and returns here.
         unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) }
+        percpu().mode.enter_kernel();
+    }
+
+    fn cpu(&self) -> usize {
+        let i: usize;
+        // SAFETY: reads this processor's index from its `PerCpu` (offset 40
+        // in `cpu::PerCpu`); it never changes, so the read is pure.
+        unsafe { asm!("mov {}, gs:[40]", out(reg) i, options(nostack, pure, readonly, preserves_flags)) }
+        i
+    }
+
+    fn kick(&self, cpu: usize, wait: bool) {
+        let Some(them) = cpu::percpu_of(cpu) else { return };
+        // A processor in the kernel looks at what changed before it leaves
+        // (the caller holds its lock, so it has not passed that point).
+        if !them.online.load(Ordering::Acquire) || them.mode.in_kernel() {
+            return;
+        }
+        // SAFETY: the x2APIC interrupt command register: a fixed interrupt
+        // to one processor by its identifier.
+        unsafe { wrmsr(0x830, (them.apic_id as u64) << 32 | KICK_VECTOR) };
+        while wait && them.mode.is_user() {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn tlb_reset(&self) {
+        // A new generation makes every address space's identifier on this
+        // processor stale, so each starts clean when next loaded.
+        let me = percpu();
+        if self.pcid.get() {
+            me.pcid_gen.set(me.pcid_gen.get() + 1);
+            me.pcid_next.set(1);
+        }
+        // SAFETY: the kernel root maps the kernel as every root does.
+        unsafe { cpu::write_cr3(self.kernel_root.get()) }
+    }
+
+    fn tlb_forget(&self, root: Paddr, cpu: usize) {
+        if self.pcid.get() {
+            // SAFETY: that processor's word in the header page of a live
+            // address space (see `cr3_for`); the caller holds its lock.
+            unsafe { *kernel().phys.ptr(root - 4096 + 2048 + cpu as u64 * 8).cast::<u64>() = 0 }
+        }
     }
 
     fn port_io(&self, port: u16, width: u8, write: bool, value: u32) -> u32 {
@@ -413,31 +456,33 @@ impl X86 {
 
     /// The CR3 value that loads `root`. With process-context identifiers a
     /// switch keeps the translations cached for the address space: each has
-    /// an identifier for the current generation, kept in its header page (a
-    /// word owned by this module at offset 2048); when the 4095 identifiers
-    /// run out a new generation starts and every address space gets a fresh
-    /// one, flushed on first use. Identifier 0 is the kernel-only root.
+    /// an identifier per processor for that processor's current generation,
+    /// kept in its header page (words owned by this module from offset
+    /// 2048); when a processor's 4095 identifiers run out it starts a new
+    /// generation and every address space gets a fresh one there, flushed
+    /// on first use. Identifier 0 is the kernel-only root.
     fn cr3_for(&self, phys: &Phys, root: Paddr) -> u64 {
-        let generation = self.pcid_gen.get();
-        if generation == 0 {
+        if !self.pcid.get() {
             return root;
         }
         if root == self.kernel_root.get() {
             return root | 1 << 63;
         }
+        let me = percpu();
+        let generation = me.pcid_gen.get();
         // SAFETY: `root` is the root table of a live AddressSpace object,
-        // whose header page precedes it; kernel-core uses only the first
-        // bytes of that page.
-        let slot = unsafe { &mut *phys.ptr(root - 4096 + 2048).cast::<u64>() };
+        // whose header page precedes it; kernel-core uses only its first
+        // bytes, and the second half holds one word per processor.
+        let slot = unsafe { &mut *phys.ptr(root - 4096 + 2048 + me.index as u64 * 8).cast::<u64>() };
         if *slot >> 12 == generation {
             return root | (*slot & 0xFFF) | 1 << 63;
         }
-        let id = self.pcid_next.get();
+        let id = me.pcid_next.get();
         if id == 4095 {
-            self.pcid_next.set(1);
-            self.pcid_gen.set(generation + 1);
+            me.pcid_next.set(1);
+            me.pcid_gen.set(generation + 1);
         } else {
-            self.pcid_next.set(id + 1);
+            me.pcid_next.set(id + 1);
         }
         *slot = generation << 12 | id;
         root | id
@@ -449,23 +494,91 @@ fn canonical(v: u64) -> u64 {
     if v < 1 << 47 || v >= !0 << 47 { v } else { 0 }
 }
 
-/// An interrupt from the local APIC or a device.
-pub fn irq(vector: u64) {
+/// An interrupt from the local APIC or a device. `locked`: it interrupted
+/// user code and this processor holds its lock; otherwise it interrupted
+/// the idle wait, which looks at everything again when it has the lock.
+pub fn irq(vector: u64, locked: bool) {
     let k = kernel();
     match vector {
-        TIMER_VECTOR => k.on_timer(),
+        TIMER_VECTOR if locked => k.on_timer(),
+        TIMER_VECTOR | KICK_VECTOR => {}
         SPURIOUS_VECTOR => return,
         v => {
-            // Device interrupts are bound to Notifications at M2 (C12).
-            // Until then nothing is unmasked, so this is a stray.
-            if k.hal.stray_irqs.replace(k.hal.stray_irqs.get() + 1) == 0 {
-                klog!(k, "kernel: unexpected interrupt vector {v}");
-            }
+            // Device interrupts are bound to Notifications later in M2
+            // (C12). Until then nothing is unmasked, so this is a stray.
+            let _ = write!(Out, "kernel: unexpected interrupt vector {v} on processor {}\r\n", percpu().index);
         }
     }
     // SAFETY: writing 0 to the x2APIC EOI register ends the interrupt in service.
     unsafe { wrmsr(MSR_X2APIC_EOI, 0) }
 }
+
+/// The copy of the loader's memory map the kernel takes its own memory from
+/// before handing the rest to the root task.
+pub struct RegionTable {
+    r: [Region; 1100],
+    n: usize,
+}
+
+impl RegionTable {
+    fn as_slice(&self) -> &[Region] {
+        &self.r[..self.n]
+    }
+
+    /// Take `len` bytes aligned to `align` from free memory inside
+    /// `[min, max)`, as high as possible, and mark them the kernel's.
+    pub fn carve(&mut self, len: u64, align: u64, min: u64, max: u64) -> Option<u64> {
+        for i in (0..self.n).rev() {
+            let r = self.r[i];
+            if r.kind != RegionKind::Usable as u32 {
+                continue;
+            }
+            let (lo, hi) = (r.base.max(min), (r.base + r.len).min(max));
+            if hi < lo + len {
+                continue;
+            }
+            let at = (hi - len) & !(align - 1);
+            if at < lo || self.n + 2 > self.r.len() {
+                continue;
+            }
+            // Replace region i by up to three: before, the carved part, after.
+            let parts =
+                [(r.base, at - r.base, r.kind), (at, len, RegionKind::Kernel as u32), (at + len, r.base + r.len - at - len, r.kind)];
+            let keep = parts.iter().filter(|p| p.1 != 0).count();
+            self.r.copy_within(i + 1..self.n, i + keep);
+            let mut j = i;
+            for (base, len, kind) in parts {
+                if len != 0 {
+                    self.r[j] = Region { base, len, kind, reserved: 0 };
+                    j += 1;
+                }
+            }
+            self.n = self.n + keep - 1;
+            return Some(at);
+        }
+        None
+    }
+}
+
+struct RegionCell(core::cell::UnsafeCell<RegionTable>);
+// SAFETY: used by the boot processor alone, during boot.
+unsafe impl Sync for RegionCell {}
+static REGIONS: RegionCell =
+    RegionCell(core::cell::UnsafeCell::new(RegionTable { r: [Region { base: 0, len: 0, kind: 0, reserved: 0 }; 1100], n: 0 }));
+
+/// Drop every cached translation on this processor, global ones too.
+fn flush_all() {
+    // SAFETY: toggling CR4.PGE only empties the TLB.
+    unsafe {
+        let cr4: u64;
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        asm!("mov cr4, {}", in(reg) cr4 & !(1 << 7), options(nostack, preserves_flags));
+        asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
+    }
+}
+
+/// The boot processor has its per-processor data (GS is valid).
+static STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 struct Out;
 impl Write for Out {
@@ -488,7 +601,9 @@ fn die() -> ! {
 fn backtrace(first: u64, mut rbp: u64) {
     let slide = kernel().hal.slide.get();
     let _ = write!(Out, "#0 {:#018x}\r\n", first.wrapping_sub(slide));
-    let on_stack = |a: u64| a % 8 == 0 && [&cpu::KSTACK].iter().any(|s| a >= s.base() + 4096 && a + 16 <= s.top());
+    // The boot processor's stack until per-processor data exists.
+    let (lo, hi) = if STARTED.load(Ordering::Relaxed) { percpu().stack } else { (cpu::KSTACK.base() + 4096, cpu::KSTACK.top()) };
+    let on_stack = |a: u64| a.is_multiple_of(8) && a >= lo && a + 16 <= hi;
     for n in 1..32 {
         if !on_stack(rbp) {
             break;
@@ -542,8 +657,10 @@ fn require(ok: bool, what: &str) {
     }
 }
 
-/// Control registers, extended state, the local APIC.
-fn init_processor() {
+/// Control registers, extended state, the local APIC, mitigations: on
+/// every processor. The boot processor (`first`) also records what the
+/// machine has, for all of them.
+pub(super) fn init_processor(first: bool) {
     let k = kernel();
     let f1 = cpuid(1, 0);
     let f7 = cpuid(7, 0);
@@ -561,11 +678,14 @@ fn init_processor() {
         cr4 |= 1 << 7 | 1 << 9 | 1 << 10 | 1 << 18; // PGE, OSFXSR, OSXMMEXCPT, OSXSAVE
         if f7[1] & 1 != 0 {
             cr4 |= 1 << 16; // FSGSBASE
-            k.hal.fsgsbase.set(true);
         }
         if f1[2] & 1 << 17 != 0 {
             cr4 |= 1 << 17; // PCIDE (CR3 holds identifier 0 here, as required)
-            k.hal.pcid_gen.set(1);
+            percpu().pcid_gen.set(1);
+        }
+        if first {
+            k.hal.fsgsbase.set(f7[1] & 1 != 0);
+            k.hal.pcid.set(f1[2] & 1 << 17 != 0);
         }
         if f7[1] & 1 << 7 != 0 {
             cr4 |= 1 << 20; // SMEP
@@ -592,25 +712,28 @@ fn init_processor() {
             require(xcr0 & 0xE0 != 0, "an extended state small enough for a Thread object");
             xcr0 &= !0xE0;
         }
-        k.hal.xcr0.set(xcr0);
         // The cheapest save the processor has: XSAVES skips components that
         // are in their initial state or unchanged since they were restored.
         let xs = cpuid(0xD, 1)[0];
-        if xs & 1 << 3 != 0 {
+        let kind = if xs & 1 << 3 != 0 {
             wrmsr(0xDA0, 0); // IA32_XSS: no supervisor components
-            k.hal.xsave_kind.set(2);
-        } else if xs & 1 != 0 {
-            k.hal.xsave_kind.set(1);
+            2
+        } else {
+            (xs & 1) as u8
+        };
+        if first {
+            k.hal.xcr0.set(xcr0);
+            k.hal.xsave_kind.set(kind);
+            k.hal.xgetbv1.set(xs & 1 << 2 != 0);
+            // The initial image: default control words, nothing in use.
+            let init = INIT_STATE.0.get().cast::<u8>();
+            init.cast::<u16>().write(0x037F);
+            init.add(24).cast::<u32>().write(0x1F80);
+            if kind == 2 {
+                init.add(520).cast::<u64>().write(1 << 63 | xcr0);
+            }
         }
-        k.hal.xgetbv1.set(xs & 1 << 2 != 0);
-        // The initial image: default control words, nothing in use.
-        let init = INIT_STATE.0.get().cast::<u8>();
-        init.cast::<u16>().write(0x037F);
-        init.add(24).cast::<u32>().write(0x1F80);
-        if k.hal.xsave_kind.get() == 2 {
-            init.add(520).cast::<u64>().write(1 << 63 | xcr0);
-        }
-        init_mitigations();
+        init_mitigations(first);
         // Legacy interrupt controllers off: remap out of the exception
         // vectors, then mask every line.
         for (port, v) in
@@ -629,7 +752,8 @@ fn init_processor() {
             wrmsr(MSR_TSC_DEADLINE, 0);
         } else {
             wrmsr(MSR_X2APIC_TIMER_DIVIDE, 0b1011); // divide by 1
-            wrmsr(MSR_X2APIC_LVT_TIMER, 1 << 16); // masked until calibrated
+            // One-shot; masked on the boot processor until it has calibrated.
+            wrmsr(MSR_X2APIC_LVT_TIMER, if first { 1 << 16 } else { TIMER_VECTOR });
         }
     }
 }
@@ -641,7 +765,7 @@ fn init_processor() {
 ///
 /// # Safety
 /// Called once during processor setup.
-unsafe fn init_mitigations() {
+unsafe fn init_mitigations(first: bool) {
     let k = kernel();
     let f7 = cpuid(7, 0);
     let caps = if f7[3] & 1 << 29 != 0 { rdmsr(0x10A) } else { 0 };
@@ -676,7 +800,9 @@ unsafe fn init_mitigations() {
     if intel && caps & 1 == 0 {
         done |= 16;
     }
-    k.hal.mitigations.set(done);
+    if first {
+        k.hal.mitigations.set(done);
+    }
 }
 
 /// Without a TSC-deadline timer: measure the local APIC timer against the
@@ -749,8 +875,9 @@ fn tsc_frequency(bi: &BootInfo, phys: &Phys) -> u64 {
     panic!("no way to measure the timestamp counter: no CPUID leaf 0x15, no KVM clock, no ACPI PM timer")
 }
 
-/// The I/O port of the ACPI PM timer, from the FADT.
-fn acpi_pm_timer(bi: &BootInfo, phys: &Phys) -> Option<u16> {
+/// The ACPI table with signature `sig`, whole. `None` when the firmware has
+/// none or its tables lie outside the memory the kernel can reach.
+pub(super) fn acpi_table<'a>(bi: &BootInfo, phys: &'a Phys, sig: &[u8; 4]) -> Option<&'a [u8]> {
     let limit = bi.phys_map_len;
     let table = |p: u64, len: u64| {
         // SAFETY: the range is checked to be inside the physical map; ACPI
@@ -765,22 +892,28 @@ fn acpi_pm_timer(bi: &BootInfo, phys: &Phys) -> Option<u16> {
     let xsdt = table(xsdt_addr, len)?;
     for i in 0..(len as usize).saturating_sub(36) / 8 {
         let t = u64_at(xsdt, 36 + i * 8)?;
-        let Some(h) = table(t, 80) else { continue };
-        if &h[..4] == b"FACP" {
-            let port = u32_at(h, 76)?;
-            return (port != 0 && port < 0xFFFC).then_some(port as u16);
+        let Some(h) = table(t, 36) else { continue };
+        if &h[..4] == sig {
+            return table(t, u32_at(h, 4)? as u64);
         }
     }
     None
 }
 
-/// The entry of the kernel's own page table that maps `vaddr`, at the
-/// 4 KiB level.
-fn kernel_pte(phys: &Phys, vaddr: u64) -> Option<*mut u64> {
+/// The I/O port of the ACPI PM timer, from the FADT.
+fn acpi_pm_timer(bi: &BootInfo, phys: &Phys) -> Option<u16> {
+    let fadt = acpi_table(bi, phys, b"FACP")?;
+    let port = u32::from_le_bytes(fadt.get(76..80)?.try_into().ok()?);
+    (port != 0 && port < 0xFFFC).then_some(port as u16)
+}
+
+/// The entry of the kernel's own page table that maps `vaddr` at `level`
+/// (0: a 4 KiB page, 1: a 2 MiB page or the table for it).
+pub(super) fn kernel_pte(phys: &Phys, vaddr: u64, level: u64) -> Option<*mut u64> {
     let mut table = cpu::read_cr3() & PTE_ADDR;
-    for level in (0..4).rev() {
-        let e = phys.ptr(table + (vaddr >> (12 + 9 * level) & 511) * 8).cast::<u64>();
-        if level == 0 {
+    for l in (0..4).rev() {
+        let e = phys.ptr(table + (vaddr >> (12 + 9 * l) & 511) * 8).cast::<u64>();
+        if l == level {
             return Some(e);
         }
         // SAFETY: `table` is a page-table page of the tables the loader
@@ -811,16 +944,27 @@ pub extern "C" fn kmain(info: u64) -> ! {
         die();
     }
     k.hal.slide.set(bi.kernel_slide);
-    // SAFETY: first thing after the console, once, on the boot stack.
-    unsafe { cpu::init() };
-    init_processor();
+    // SAFETY: first thing after the console, once, on the boot stack, which
+    // with the boot tables lives for ever.
+    unsafe {
+        cpu::init_idt();
+        let (base, top, ist) = cpu::boot_stacks();
+        cpu::init(cpu::boot_tables(), 0, 0, (base, top), ist);
+    }
+    STARTED.store(true, Ordering::Release);
+    init_processor(true);
+    let apic_id = rdmsr(0x802) as u32;
+    // SAFETY: the boot processor's own tables; no other processor runs yet.
+    unsafe { (*cpu::boot_tables()).percpu.apic_id = apic_id };
+    percpu().online.store(true, Ordering::Release);
+    k.enter();
 
     // The kernel's own address space: drop the loader's low alias of
     // physical memory, make the physical map non-executable, and unmap the
     // page below the stack so an overflow faults instead of corrupting data.
     let root = cpu::read_cr3() & PTE_ADDR;
     k.hal.kernel_root.set(root);
-    let guard = kernel_pte(&k.phys, cpu::KSTACK.base());
+    let guard = kernel_pte(&k.phys, cpu::KSTACK.base(), 0);
     // SAFETY: edits the live kernel page table in ways that keep every
     // address the kernel uses mapped: it runs from the image mapping and
     // reaches memory through the physical map, neither of which changes
@@ -832,12 +976,8 @@ pub extern "C" fn kmain(info: u64) -> ! {
         if let Some(g) = guard {
             *g = 0;
         }
-        // Toggling CR4.PGE drops every cached translation, global ones too.
-        let cr4: u64;
-        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
-        asm!("mov cr4, {}", in(reg) cr4 & !(1 << 7), options(nostack, preserves_flags));
-        asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
     }
+    flush_all();
 
     let hz = tsc_frequency(&bi, &k.phys);
     k.hal.tsc_hz.set(hz);
@@ -846,16 +986,25 @@ pub extern "C" fn kmain(info: u64) -> ! {
     k.hal.ticks_per_ns.set((((hz as u128) << 32) / 1_000_000_000) as u64);
     init_oneshot_timer(hz);
 
-    // SAFETY: loader memory, read-only until the root task owns it.
-    let (regions, cmdline, ramdisk) = unsafe {
-        (
-            core::slice::from_raw_parts(k.phys.ptr(bi.regions).cast::<Region>(), bi.region_count as usize),
-            k.phys.bytes(bi.cmdline, bi.cmdline_len),
-            k.phys.bytes(bi.ramdisk, bi.ramdisk_len),
-        )
+    // SAFETY: loader memory, read-only until the root task owns it; the
+    // region table is the boot processor's alone during boot.
+    let (table, cmdline, ramdisk) = unsafe {
+        let table = &mut *REGIONS.0.get();
+        let from = core::slice::from_raw_parts(k.phys.ptr(bi.regions).cast::<Region>(), bi.region_count as usize);
+        table.n = from.len().min(table.r.len() - 64);
+        table.r[..table.n].copy_from_slice(&from[..table.n]);
+        (table, k.phys.bytes(bi.cmdline, bi.cmdline_len), k.phys.bytes(bi.ramdisk, bi.ramdisk_len))
     };
+    // The other processors: memory for each, taken before the root task is
+    // given the rest. `cpus=1` on the command line keeps them asleep.
+    let cpus = match Cmdline(cmdline).get("cpus") {
+        Some(b"1") => 1,
+        _ => smp::prepare(&bi, &k.phys, table, root, apic_id),
+    };
+    k.set_cpu_count(cpus);
+    let regions = table.as_slice();
     let usable: u64 = regions.iter().filter(|r| r.kind == 1).map(|r| r.len).sum();
-    klog!(k, "silica: {} MiB free, clock {} Hz, kernel slide {:#x}", usable >> 20, hz, bi.kernel_slide);
+    klog!(k, "silica: {} MiB free, {} processors, clock {} Hz, kernel slide {:#x}", usable >> 20, cpus, hz, bi.kernel_slide);
     let m = k.hal.mitigations.get();
     if m & 8 != 0 {
         klog!(
@@ -893,12 +1042,14 @@ pub extern "C" fn kmain(info: u64) -> ! {
         wall_clock: [bi.wall_secs, ((bi.wall_tsc.wrapping_sub(k.hal.tsc0.get()) as i64 as i128 * 1_000_000_000) / hz as i128) as u64],
         entropy: bi.entropy,
         cmdline,
+        cpus: cpus as u64,
     };
     if let Err(e) = k.boot_root(&spec) {
         klog!(k, "ERROR: kernel: cannot start the root task: {e:?}");
         die();
     }
-    // SAFETY: the tables, the processor and the root thread are set up;
-    // this is the first exit to user mode.
+    smp::start(hz);
+    // SAFETY: the tables, the processor and the root thread are set up and
+    // the kernel is entered; this is the first exit to user mode.
     unsafe { cpu::exit_to_user() }
 }

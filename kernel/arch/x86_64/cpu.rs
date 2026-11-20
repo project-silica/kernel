@@ -8,14 +8,19 @@
 //! inside the idle wait.
 
 use core::arch::{asm, global_asm};
-use core::cell::UnsafeCell;
+use core::cell::{Cell, UnsafeCell};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use kernel_core::lock::Presence;
+use kernel_core::smp::MAX_CPUS;
 use silica_abi::Fault;
 
-/// Size of the kernel stack and of the stack for NMI, double fault and
-/// machine check.
+/// Size of the boot processor's kernel stack and of its stack for NMI,
+/// double fault and machine check. The other processors' stacks come from
+/// `smp.rs`.
 pub const STACK_SIZE: usize = 64 * 1024;
 
-/// What `gs` points to in kernel mode. Offsets are used by the assembly below.
+/// What `gs` points to in kernel mode: one per processor. The offsets of
+/// the first five fields are used by the assembly below.
 #[repr(C)]
 pub struct PerCpu {
     /// 0: top of the kernel stack.
@@ -27,6 +32,24 @@ pub struct PerCpu {
     /// 24: not 0 when the processor needs its buffers cleared (VERW) on
     /// the way back to user mode.
     pub verw: u64,
+    /// 32: the address of this structure.
+    pub this: u64,
+    /// The processor's index in the kernel.
+    pub index: usize,
+    /// Its x2APIC identifier.
+    pub apic_id: u32,
+    /// Where the processor is; read by other processors.
+    pub mode: Presence,
+    /// Whether the processor has entered the kernel's scheduler.
+    pub online: AtomicBool,
+    /// Lowest and highest address of its kernel stack, for backtraces.
+    pub stack: (u64, u64),
+    /// Timestamp counter value of the armed timer (`u64::MAX`: none).
+    pub deadline: Cell<u64>,
+    pub polls: Cell<u32>,
+    /// Process-context identifiers: the generation and the next free one.
+    pub pcid_gen: Cell<u64>,
+    pub pcid_next: Cell<u64>,
 }
 
 #[repr(C, packed)]
@@ -45,35 +68,59 @@ struct Tss {
 #[repr(C, align(4096))]
 pub struct Stack(pub [u8; STACK_SIZE + 4096]);
 
+/// One processor's descriptor tables and data.
 #[repr(C, align(64))]
-struct Tables {
+pub struct Tables {
     gdt: [u64; 7],
     tss: Tss,
-    percpu: PerCpu,
-    idt: [[u64; 2]; 256],
+    pub percpu: PerCpu,
+}
+
+impl Tables {
+    pub const fn new() -> Tables {
+        Tables {
+            gdt: [
+                0,
+                0x00AF_9A00_0000_FFFF, // 0x08 kernel code
+                0x00CF_9200_0000_FFFF, // 0x10 kernel data
+                0x00CF_F200_0000_FFFF, // 0x18 user data
+                0x00AF_FA00_0000_FFFF, // 0x20 user code
+                0,                     // 0x28 TSS (two entries)
+                0,
+            ],
+            tss: Tss { reserved0: 0, rsp0: 0, rsp1: 0, rsp2: 0, reserved1: 0, ist: [0; 7], reserved2: 0, reserved3: 0, iomap: 104 },
+            percpu: PerCpu {
+                kstack: 0,
+                regs: 0,
+                scratch: 0,
+                verw: 0,
+                this: 0,
+                index: 0,
+                apic_id: 0,
+                mode: Presence::new(),
+                online: AtomicBool::new(false),
+                stack: (0, 0),
+                deadline: Cell::new(u64::MAX),
+                polls: Cell::new(0),
+                pcid_gen: Cell::new(0),
+                pcid_next: Cell::new(1),
+            },
+        }
+    }
 }
 
 struct Racy<T>(UnsafeCell<T>);
-// SAFETY: these are per-processor tables of the single processor that runs
-// kernel code at M1, written during boot and by `set_regs` with interrupts off.
+// SAFETY: the boot processor's tables and the shared IDT are written during
+// boot before any other processor runs; afterwards each processor touches
+// only its own `PerCpu` except for the atomics in it.
 unsafe impl<T> Sync for Racy<T> {}
 
-static TABLES: Racy<Tables> = Racy(UnsafeCell::new(Tables {
-    gdt: [
-        0,
-        0x00AF_9A00_0000_FFFF, // 0x08 kernel code
-        0x00CF_9200_0000_FFFF, // 0x10 kernel data
-        0x00CF_F200_0000_FFFF, // 0x18 user data
-        0x00AF_FA00_0000_FFFF, // 0x20 user code
-        0,                     // 0x28 TSS (two entries)
-        0,
-    ],
-    tss: Tss { reserved0: 0, rsp0: 0, rsp1: 0, rsp2: 0, reserved1: 0, ist: [0; 7], reserved2: 0, reserved3: 0, iomap: 104 },
-    percpu: PerCpu { kstack: 0, regs: 0, scratch: 0, verw: 0 },
-    idt: [[0; 2]; 256],
-}));
+static BOOT_TABLES: Racy<Tables> = Racy(UnsafeCell::new(Tables::new()));
+static IDT: Racy<[[u64; 2]; 256]> = Racy(UnsafeCell::new([[0; 2]; 256]));
+/// Every processor's tables, by index (null: no such processor).
+static CPUS: [AtomicPtr<Tables>; MAX_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
 
-/// The kernel stack; its lowest page is unmapped as a guard.
+/// The boot processor's kernel stack; its lowest page is unmapped as a guard.
 pub static KSTACK: Racy2 = Racy2(UnsafeCell::new(Stack([0; STACK_SIZE + 4096])));
 static ISTACK: Racy2 = Racy2(UnsafeCell::new(Stack([0; STACK_SIZE + 4096])));
 
@@ -89,6 +136,24 @@ impl Racy2 {
     pub fn top(&self) -> u64 {
         self.base() + (STACK_SIZE + 4096) as u64
     }
+}
+
+/// This processor's data.
+pub fn percpu() -> &'static PerCpu {
+    let p: u64;
+    // SAFETY: in the kernel GS points at this processor's `PerCpu`, whose
+    // field at offset 32 is its own address; it lives for ever.
+    unsafe {
+        asm!("mov {}, gs:[32]", out(reg) p, options(nostack, readonly, preserves_flags));
+        &*(p as *const PerCpu)
+    }
+}
+
+/// Processor `index`'s data, once its tables exist.
+pub fn percpu_of(index: usize) -> Option<&'static PerCpu> {
+    let t = CPUS.get(index)?.load(Ordering::Acquire);
+    // SAFETY: a registered table is never freed.
+    (!t.is_null()).then(|| unsafe { &(*t).percpu })
 }
 
 pub fn rdmsr(msr: u32) -> u64 {
@@ -138,47 +203,72 @@ pub unsafe fn write_cr3(root: u64) {
     unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) }
 }
 
-/// Clear processor buffers on every return to user mode from now on.
+/// Clear processor buffers on every return to user mode from now on (this processor).
 pub fn enable_verw() {
-    // SAFETY: as for `set_regs`.
-    unsafe { (*TABLES.0.get()).percpu.verw = 1 }
+    // SAFETY: writes this processor's own flag, read only by its exit path.
+    unsafe { asm!("mov qword ptr gs:[24], 1", options(nostack, preserves_flags)) }
 }
 
 /// A data segment selector for VERW to verify; the instruction's side
 /// effect of overwriting the processor's internal buffers is the point.
 static VERW_SELECTOR: u16 = 0x10;
 
-/// Point the entry stubs at the register frame of the thread to run.
+/// Point this processor's entry stubs at the register frame of the thread to run.
 pub fn set_regs(frame: u64) {
-    // SAFETY: one processor, interrupts off; the assembly reads this field
-    // only on kernel entry and exit.
-    unsafe { (*TABLES.0.get()).percpu.regs = frame }
+    // SAFETY: writes this processor's own field, read by its entry and
+    // exit stubs; interrupts are off.
+    unsafe { asm!("mov gs:[8], {}", in(reg) frame, options(nostack, preserves_flags)) }
 }
 
-/// Load the tables and set up `syscall`. Called once on the boot processor.
+/// The boot processor's tables (before any other is registered).
+pub fn boot_tables() -> *mut Tables {
+    BOOT_TABLES.0.get()
+}
+
+/// The boot processor's stacks: (kernel lowest, kernel top, interrupt-stack top).
+pub fn boot_stacks() -> (u64, u64, u64) {
+    (KSTACK.base() + 4096, KSTACK.top(), ISTACK.top())
+}
+
+/// Fill the interrupt descriptor table every processor shares. Boot processor, once.
 ///
 /// # Safety
-/// Must run once, early, on the kernel's initial stack with interrupts off.
-pub unsafe fn init() {
-    let t = TABLES.0.get();
-    // SAFETY: boot-time exclusive access to the tables; the descriptors
-    // built here describe memory that lives for ever (statics).
+/// Before any processor loads the table.
+pub unsafe fn init_idt() {
+    let stubs = &raw const trap_stubs as u64;
+    for v in 0..256u64 {
+        let h = stubs + v * 16;
+        // NMI, double fault and machine check run on their own stack.
+        let ist = if matches!(v, 2 | 8 | 18) { 1 } else { 0 };
+        // SAFETY: guaranteed by the caller.
+        unsafe { (*IDT.0.get())[v as usize] = [(h & 0xFFFF) | 0x08 << 16 | ist << 32 | 0x8E << 40 | (h >> 16 & 0xFFFF) << 48, h >> 32] };
+    }
+}
+
+/// Make `t` this processor's tables: load them and set up `syscall`.
+/// `stack` is (lowest address, top) of its kernel stack, `ist` the top of
+/// its stack for NMI, double fault and machine check.
+///
+/// # Safety
+/// Once per processor, early, with interrupts off; `t` and the stacks must
+/// live for ever and belong to this processor alone.
+pub unsafe fn init(t: *mut Tables, index: usize, apic_id: u32, stack: (u64, u64), ist: u64) {
+    // SAFETY: exclusive access to this processor's tables during its boot;
+    // the descriptors built here describe memory that lives for ever.
     unsafe {
         let tss = &raw const (*t).tss as u64;
         (*t).gdt[5] = 0x0000_8900_0000_0067 | (tss & 0xFF_FFFF) << 16 | (tss >> 24 & 0xFF) << 56;
         (*t).gdt[6] = tss >> 32;
-        (*t).tss.rsp0 = KSTACK.top();
-        (*t).tss.ist[0] = ISTACK.top();
-        (*t).percpu.kstack = KSTACK.top();
-        let stubs = &raw const trap_stubs as u64;
-        for v in 0..256u64 {
-            let h = stubs + v * 16;
-            // NMI, double fault and machine check run on their own stack.
-            let ist = if matches!(v, 2 | 8 | 18) { 1 } else { 0 };
-            (*t).idt[v as usize] = [(h & 0xFFFF) | 0x08 << 16 | ist << 32 | 0x8E << 40 | (h >> 16 & 0xFFFF) << 48, h >> 32];
-        }
+        (*t).tss.rsp0 = stack.1;
+        (*t).tss.ist[0] = ist;
+        (*t).percpu.kstack = stack.1;
+        (*t).percpu.stack = stack;
+        (*t).percpu.this = &raw const (*t).percpu as u64;
+        (*t).percpu.index = index;
+        (*t).percpu.apic_id = apic_id;
+        CPUS[index].store(t, Ordering::Release);
         let gdtr: [u16; 5] = pseudo(&raw const (*t).gdt as u64, 7 * 8 - 1);
-        let idtr: [u16; 5] = pseudo(&raw const (*t).idt as u64, 256 * 16 - 1);
+        let idtr: [u16; 5] = pseudo(IDT.0.get() as u64, 256 * 16 - 1);
         asm!(
             "lgdt [{gdtr}]",
             "lidt [{idtr}]",
@@ -217,20 +307,35 @@ fn pseudo(base: u64, limit: u16) -> [u16; 5] {
 unsafe extern "C" {
     static trap_stubs: u8;
     static syscall_entry: u8;
-    /// Leave the kernel for the thread the scheduler picks.
+    /// Leave the kernel for the thread the scheduler picks. The caller has
+    /// entered the kernel (`Kernel::enter`).
     pub fn exit_to_user() -> !;
 }
 
+// Each way in marks the processor as in the kernel and takes its lock; the
+// one way out picks the thread, marks it as in user mode while still
+// holding the lock, and lets go. Another processor holding this one's lock
+// therefore sees either "in the kernel" (it will look at what changed when
+// it gets the lock) or "in user mode" (it must be interrupted first).
+
 extern "C" fn syscall_rust() {
-    super::kernel().syscall();
+    let k = super::kernel();
+    percpu().mode.enter_kernel();
+    k.enter();
+    k.syscall();
 }
 
 extern "C" fn schedule_rust() {
-    super::kernel().schedule();
+    let k = super::kernel();
+    k.schedule();
+    percpu().mode.leave_to_user();
+    k.leave();
 }
 
 extern "C" fn trap_user(vector: u64, err: u64) {
     let k = super::kernel();
+    percpu().mode.enter_kernel();
+    k.enter();
     match vector {
         14 => {
             let cr2: u64;
@@ -240,7 +345,7 @@ extern "C" fn trap_user(vector: u64, err: u64) {
         }
         6 => k.fault(Fault::Instruction, 0, 0),
         2 | 8 | 18 => panic!("fatal exception {vector} (error {err:#x}) in user mode"),
-        32.. => super::irq(vector),
+        32.. => super::irq(vector, true),
         v => k.fault(Fault::Exception, v, err),
     }
 }
@@ -260,7 +365,9 @@ pub struct KernelFrame {
 
 extern "C" fn trap_kernel(f: &KernelFrame) {
     if f.vector >= 32 {
-        super::irq(f.vector);
+        // Only the idle wait takes interrupts in kernel mode, and it does
+        // not hold the processor's lock.
+        super::irq(f.vector, false);
         return;
     }
     super::kernel_fault(f);

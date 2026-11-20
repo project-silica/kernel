@@ -1,4 +1,6 @@
-# In-OS tests of the x86_64 kernel (roottest/src/main.rs), one name per line.
+# In-OS tests of the x86_64 kernel (roottest/src/main.rs): one name per line,
+# then optionally the machine the test needs (smp=<processors> mem=<MiB>).
+# A test that names none runs twice: on one processor and on four.
 syscall
 fault_page
 fault_instruction
@@ -13,3 +15,8 @@ preempt
 fpu
 untyped
 caps
+smp_run smp=8
+smp_ipc smp=2
+smp_shootdown smp=2
+smp_stress smp=8
+smp_revoke smp=8

@@ -61,7 +61,21 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// Map the frame in slot `fs` at `vaddr` in address space `a`.
+    /// Holds the structure lock unless the caller holds every lock or
+    /// there is one processor (see `smp.rs`).
     pub(crate) fn map(&self, a: Paddr, fs: Paddr, vaddr: u64, rights: Rights) -> Result<(), Error> {
+        let shared = self.ncpu.get() > 1 && !self.global.get();
+        if shared {
+            self.structure.lock();
+        }
+        let r = self.map_locked(a, fs, vaddr, rights);
+        if shared {
+            self.structure.unlock();
+        }
+        r
+    }
+
+    fn map_locked(&self, a: Paddr, fs: Paddr, vaddr: u64, rights: Rights) -> Result<(), Error> {
         let slot = self.slot(fs);
         let cap = slot.cap().ok_or(Error::BadCap)?;
         if slot.badge.get() & MAPPED != 0 {
@@ -117,6 +131,7 @@ impl<H: Hal> Kernel<H> {
             }
         }
         self.hal.tlb_flush(a + PAGE, vaddr, size);
+        self.shoot_down(a + PAGE);
         let (p, n) = (slot.mprev.get(), slot.mnext.get());
         if p != 0 {
             self.slot(p).mnext.set(n);
@@ -146,8 +161,30 @@ impl<H: Hal> Kernel<H> {
             s = n;
         }
         self.hal.leave_aspace(a + PAGE);
-        if self.loaded_root.get() == a + PAGE {
-            self.loaded_root.set(0);
+        let me = self.me();
+        if me.loaded_root.get() == a + PAGE {
+            me.loaded_root.set(0);
+            me.dirty.set(true);
+        }
+        self.shoot_down(a + PAGE);
+    }
+
+    /// Mappings of address space `root` were removed: no other processor
+    /// may go on using a cached translation. One that has it loaded is
+    /// brought into the kernel and starts over with nothing cached; the
+    /// others forget what they had.
+    fn shoot_down(&self, root: Paddr) {
+        if self.ncpu.get() == 1 {
+            return;
+        }
+        for (i, cpu) in self.others() {
+            if cpu.loaded_root.get() == root {
+                cpu.flush.set(true);
+                cpu.dirty.set(true);
+                self.hal.kick(i, true);
+            } else {
+                self.hal.tlb_forget(root, i);
+            }
         }
     }
 

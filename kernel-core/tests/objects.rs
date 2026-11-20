@@ -2,6 +2,7 @@
 mod support;
 
 use kernel_core::elf::Elf;
+use kernel_core::hal::Hal as _;
 use kernel_core::thread::{INACTIVE, RECEIVING, REPLY, RUNNABLE, SENDING};
 use silica_abi::root::*;
 use silica_abi::{Error, FAULT_LABEL, FAULT_RESUME, Fault, KEEP, MsgInfo, NONBLOCK, ObjectType as T, Rights, Syscall as S};
@@ -365,7 +366,8 @@ fn time_slices_rotate_runnable_threads() {
     assert_eq!(m.k.thread_view(t).state, INACTIVE);
     m.ok(S::ThreadControl, [FREE, 1, 0, 0, 0, 0]);
     assert_eq!(m.k.thread_view(t).state, RUNNABLE);
-    assert_eq!(m.err(S::ThreadControl, [FREE, 2, 0, 0, 0, 0]), Error::BadArg);
+    assert_eq!(m.err(S::ThreadControl, [FREE, 9, 0, 0, 0, 0]), Error::BadArg);
+    assert_eq!(m.err(S::ThreadControl, [FREE, 2, 1, 0, 0, 0]), Error::BadArg, "there is no processor 1");
     assert_eq!(m.err(S::ThreadStart, [FREE, 0xFFFF_8000_0000_0000, 0, 0, 1, 0]), Error::BadArg);
 }
 
@@ -585,4 +587,132 @@ fn a_fault_reply_can_map_the_missing_page_and_resume_in_one_call() {
     assert_eq!(m.k.thread_view(t).state, RUNNABLE);
     assert_eq!(m.k.translate(asp, 0x5000_0123), Some(m.cap(FREE + 1).unwrap().obj + 0x123));
     assert_eq!(m.err(S::ReplyRecv, [0; 6]), Error::NoCaller);
+}
+
+// ---- more than one processor ------------------------------------------------
+//
+// The host machine's processors take turns (`Machine::on`), so these tests
+// check what each processor does and asks of the others; that the locks make
+// real concurrency equivalent to some such order is checked by the loom
+// model of the lock protocol and by the in-OS tests.
+
+/// Root on processor 0; a thread `t` moved to processor 1 and running
+/// there; an endpoint at FREE with a badged copy at FREE + 1.
+fn two_processors() -> (Machine, u64) {
+    let m = Machine::with_cpus(16, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Endpoint, 0, FREE, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 15, 77, 0]);
+    let t = m.spawn(ut, FREE + 2);
+    m.ok(S::ThreadControl, [FREE + 2, 2, 1, 0, 0, 0]);
+    assert_eq!(m.k.thread_view(t).state, INACTIVE, "a moved thread stays stopped");
+    m.ok(S::ThreadControl, [FREE + 2, 1, 0, 0, 0, 0]);
+    assert_eq!(m.k.hal.kicks.borrow().last(), Some(&(1, false)), "the other processor is told it has work");
+    m.settle(1);
+    assert_eq!(m.k.current(), t, "the thread runs on processor 1");
+    m.on(0);
+    assert_eq!(m.k.current(), m.root);
+    (m, t)
+}
+
+#[test]
+fn a_call_across_processors_wakes_the_server_there_and_the_reply_comes_back() {
+    let (m, t) = two_processors();
+    m.on(1);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(0);
+    let kicks = m.k.hal.kicks.borrow().len();
+    assert!(m.raw(S::Call as u64, [FREE + 1, MsgInfo::new(3, 2).0, 10, 20, 0, 0]).blocked);
+    assert_eq!(m.k.hal.kicks.borrow()[kicks..], [(1, false)], "processor 1 is kicked to run the server");
+    assert_eq!(m.k.thread_view(m.root).state, REPLY);
+    m.settle(1);
+    assert_eq!(m.k.current(), t);
+    assert_eq!((m.arg(t, 0), m.arg(t, 2), m.arg(t, 3)), (77, 10, 20));
+    assert!(m.raw(S::ReplyRecv as u64, [FREE, MsgInfo::new(4, 1).0, 30, 0, 0, 0]).blocked);
+    m.settle(0);
+    assert_eq!(m.k.current(), m.root);
+    assert_eq!((m.status(m.root), m.arg(m.root, 2)), (0, 30));
+}
+
+#[test]
+fn calls_between_threads_of_one_processor_take_only_that_processors_lock() {
+    let (m, t) = two_processors();
+    let (ut, _) = m.big_untyped();
+    // A second endpoint served and called on processor 1 only.
+    m.retype(ut, T::Endpoint, 0, FREE + 5, 1);
+    let c = m.spawn(ut, FREE + 6);
+    m.ok(S::ThreadControl, [FREE + 6, 2, 1, 0, 0, 0]);
+    m.ok(S::ThreadControl, [FREE + 6, 1, 0, 0, 0, 0]);
+    m.on(1);
+    // The first wait gives the endpoint to processor 1 (a global step).
+    assert!(m.sys_as(t, S::Recv, [FREE + 5, 0, 0, 0, 0, 0]).blocked);
+    let before = m.k.global_entries();
+    for i in 0..100 {
+        assert!(m.sys_as(c, S::Call, [FREE + 5, 0, i, 0, 0, 0]).blocked);
+        assert_eq!(m.k.current(), t);
+        assert!(m.raw(S::ReplyRecv as u64, [FREE + 5, 0, i + 1, 0, 0, 0]).blocked);
+        assert_eq!((m.k.current(), m.arg(c, 2)), (c, i + 1));
+    }
+    assert_eq!(m.k.global_entries(), before, "a call and its reply on one processor never take every lock");
+    // The same call from processor 0 must take them all.
+    m.on(0);
+    assert!(m.raw(S::Call as u64, [FREE + 5, 0, 5, 0, 0, 0]).blocked);
+    assert_eq!(m.k.global_entries(), before + 1);
+}
+
+#[test]
+fn unmapping_brings_a_processor_running_in_that_address_space_into_the_kernel() {
+    let (m, _t) = two_processors();
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Frame, 12, FREE + 5, 1);
+    m.ok(S::Map, [SLOT_ASPACE, FREE + 5, 0x3000_0000, 3, 0, 0]);
+    let kicks = m.k.hal.kicks.borrow().len();
+    m.ok(S::Unmap, [FREE + 5, 0, 0, 0, 0, 0]);
+    assert_eq!(m.k.hal.kicks.borrow()[kicks..], [(1, true)], "processor 1 runs a thread in the root address space");
+    assert_eq!(m.k.hal.resets.get(), 0);
+    m.settle(1);
+    assert_eq!(m.k.hal.resets.get(), 1, "it drops its cached translations before running user code again");
+    // An address space loaded nowhere else needs no interrupt, only forgetting.
+    m.on(0);
+    m.retype(ut, T::AddressSpace, 15, FREE + 6, 1);
+    m.ok(S::Map, [FREE + 6, FREE + 5, 0x3000_0000, 3, 0, 0]);
+    let (kicks, forgets) = (m.k.hal.kicks.borrow().len(), m.k.hal.forgets.get());
+    m.ok(S::Unmap, [FREE + 5, 0, 0, 0, 0, 0]);
+    assert_eq!(m.k.hal.kicks.borrow().len(), kicks);
+    assert_eq!(m.k.hal.forgets.get(), forgets + 1);
+}
+
+#[test]
+fn destroying_or_stopping_a_thread_running_on_another_processor_waits_for_it() {
+    let (m, t) = two_processors();
+    let kicks = m.k.hal.kicks.borrow().len();
+    m.ok(S::ThreadControl, [FREE + 2, 0, 0, 0, 0, 0]);
+    assert_eq!(m.k.hal.kicks.borrow()[kicks..], [(1, true)], "its registers must be final before the call returns");
+    assert_eq!(m.k.thread_view(t).state, INACTIVE);
+    m.ok(S::ThreadControl, [FREE + 2, 1, 0, 0, 0, 0]);
+    m.settle(1);
+    assert_eq!(m.k.current(), t);
+    m.on(0);
+    m.ok(S::CapDelete, [FREE + 2, 0, 0, 0, 0, 0]);
+    assert!(m.k.hal.kicks.borrow()[kicks..].contains(&(1, true)));
+    // Processor 1 enters the kernel (the kick) and finds its thread gone:
+    // the syscall it might have been about to make is dropped, not run.
+    m.on(1);
+    assert_eq!(m.k.current(), 0);
+    assert!(!m.k.can_run());
+}
+
+#[test]
+fn a_thread_stopped_while_its_processor_waited_for_the_lock_does_not_run_its_syscall() {
+    let (m, t) = two_processors();
+    // Processor 1's thread has "made" a syscall (registers saved), but
+    // processor 0 gets in first and stops it.
+    m.k.regs(t)[TestHal::SYS].set(S::CapDelete as u64);
+    m.k.regs(t)[TestHal::ARG[0]].set(FREE);
+    m.ok(S::ThreadControl, [FREE + 2, 0, 0, 0, 0, 0]);
+    m.on(1);
+    m.k.enter();
+    m.k.syscall();
+    m.k.leave();
+    assert!(m.cap(FREE).is_some(), "the stopped thread's syscall must not take effect");
 }

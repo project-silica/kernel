@@ -9,5 +9,11 @@ publish.workspace = true
 [dependencies]
 silica-abi = { path = "../abi" }
 
+
+# The lock protocol is model-checked with loom (tests/loom_models.rs), built
+# only with RUSTFLAGS="--cfg loom".
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [lints]
 workspace = true

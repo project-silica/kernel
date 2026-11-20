@@ -3,6 +3,7 @@
 use crate::cap::{Cap, FLAG_DEVICE, FLAG_PORTS};
 use crate::hal::Hal;
 use crate::mem::{Paddr, Phys};
+use crate::smp::{Cpu, MAX_CPUS};
 use crate::thread::{INACTIVE, IPC_CALL, RUNNABLE, Thread};
 use core::cell::Cell;
 use silica_abi::{Error, KEEP, NONBLOCK, ObjectType, PAGE_BITS, Rights, Syscall};
@@ -18,56 +19,42 @@ pub enum Exit {
     Preempted,
 }
 
-/// The kernel. One per machine at M1 (one processor runs kernel code).
+/// The kernel: one instance for the machine, entered by every processor.
 pub struct Kernel<H: Hal> {
     /// The architecture.
     pub hal: H,
     /// Physical memory.
     pub phys: Phys,
-    pub(crate) cur: Cell<Paddr>,
-    pub(crate) loaded: Cell<Paddr>,
-    pub(crate) loaded_root: Cell<Paddr>,
-    pub(crate) rq_head: Cell<Paddr>,
-    pub(crate) rq_tail: Cell<Paddr>,
-    pub(crate) timers: Cell<Paddr>,
-    pub(crate) timer_at: Cell<u64>,
-    pub(crate) slice_end: Cell<u64>,
-    pub(crate) resched: Cell<bool>,
-    /// The timer fired since the scheduler last looked at deadlines.
-    pub(crate) tick: Cell<bool>,
-    /// The thread to switch to directly at the end of this kernel entry.
-    pub(crate) direct: Cell<Paddr>,
-    /// Something changed that the scheduler must look at on the way out.
-    /// While it is false the current thread simply continues.
-    pub(crate) dirty: Cell<bool>,
+    pub(crate) cpus: [Cpu; MAX_CPUS],
+    pub(crate) ncpu: Cell<usize>,
+    /// This processor holds every lock (see `smp.rs`).
+    pub(crate) global: Cell<bool>,
+    /// Held, with the holder's own processor lock, while mapping.
+    pub(crate) structure: crate::lock::Lock,
+    pub(crate) globals: Cell<u64>,
+    /// Objects waiting to be emptied (only used holding every lock).
     pub(crate) reap: Cell<u64>,
 }
 
 impl<H: Hal> Kernel<H> {
-    /// A kernel with no threads.
+    /// A kernel with no threads, for a machine with one processor until
+    /// [`Kernel::set_cpu_count`] says otherwise.
     pub const fn new(hal: H, phys: Phys) -> Kernel<H> {
         Kernel {
             hal,
             phys,
-            cur: Cell::new(0),
-            loaded: Cell::new(0),
-            loaded_root: Cell::new(0),
-            rq_head: Cell::new(0),
-            rq_tail: Cell::new(0),
-            timers: Cell::new(0),
-            timer_at: Cell::new(u64::MAX),
-            slice_end: Cell::new(0),
-            resched: Cell::new(false),
-            tick: Cell::new(false),
-            direct: Cell::new(0),
-            dirty: Cell::new(true),
+            cpus: [const { Cpu::new() }; MAX_CPUS],
+            ncpu: Cell::new(1),
+            global: Cell::new(false),
+            structure: crate::lock::Lock::new(),
+            globals: Cell::new(0),
             reap: Cell::new(0),
         }
     }
 
     /// The thread this processor is running (0 while idle).
     pub fn current(&self) -> Paddr {
-        self.cur.get()
+        self.me().cur.get()
     }
 
     /// The saved registers of thread `t`.
@@ -94,21 +81,78 @@ impl<H: Hal> Kernel<H> {
         Ok((s, cap))
     }
 
+    /// Whether thread `x` and the thread waiting for its reply, if any,
+    /// belong to this processor. `x` itself must be readable under this
+    /// processor's lock: one of its own, or one found in a queue it owns.
+    fn here(&self, x: Paddr) -> bool {
+        let me = self.hal.cpu() as u64;
+        let th = self.thread(x);
+        th.cpu.get() == me && (th.caller.get() == 0 || self.thread(th.caller.get()).cpu.get() == me)
+    }
+
+    /// Whether an IPC operation of thread `t` on the queue behind `cap`
+    /// touches only what this processor's lock protects.
+    pub(crate) fn queue_is_local(&self, t: Paddr, cap: &Cap) -> bool {
+        if !matches!(cap.ty, ObjectType::Endpoint | ObjectType::Notification) {
+            return true; // an error, reported without touching anything
+        }
+        let q = self.queue(cap.obj);
+        q.owner.get() == self.hal.cpu() as u64 + 1 && (q.head.get() == 0 || self.here(q.head.get())) && self.here(t)
+    }
+
+    /// Whether syscall `s` can run holding only this processor's lock.
+    fn is_local(&self, s: Syscall, t: Paddr, a: &[u64; 6]) -> bool {
+        if self.ncpu.get() == 1 {
+            return true;
+        }
+        let queue = |index: u64| match self.cslot(t, index).ok().and_then(|slot| self.slot(slot).cap()) {
+            Some(cap) => self.queue_is_local(t, &cap),
+            None => true, // BadCap, reported without touching anything
+        };
+        match s {
+            // `Map` takes the structure lock itself.
+            Syscall::Yield | Syscall::PortIo | Syscall::Map => true,
+            Syscall::Call | Syscall::Send => queue(a[0] & !NONBLOCK),
+            Syscall::Recv => queue(a[0]),
+            Syscall::ReplyRecv => self.here(t) && (a[0] == 0 || queue(a[0])),
+            _ => false,
+        }
+    }
+
     /// Handle the syscall the current thread just made.
     pub fn syscall(&self) {
-        let t = self.cur.get();
+        let me = self.me();
+        let t = me.cur.get();
+        // While this processor waited for its lock another one may have
+        // stopped or destroyed the thread that made the call.
+        if t == 0 || self.thread(t).state.get() != RUNNABLE {
+            me.dirty.set(true);
+            return;
+        }
         let r = &self.thread(t).regs;
         let g = |i: usize| r[H::ARG[i]].get();
         let a = [g(0), g(1), g(2), g(3), g(4), g(5)];
-        let res = match Syscall::from_u64(r[H::SYS].get()) {
-            Some(s) => self.dispatch(s, t, a),
-            None => Err(Error::BadSyscall),
+        let Some(s) = Syscall::from_u64(r[H::SYS].get()) else {
+            r[H::SYS].set(Error::BadSyscall as u64);
+            return;
         };
-        match res {
+        let global = !self.is_local(s, t, &a);
+        if global {
+            self.go_global();
+            if me.cur.get() != t || self.thread(t).state.get() != RUNNABLE {
+                me.dirty.set(true);
+                self.go_local();
+                return;
+            }
+        }
+        match self.dispatch(s, t, a) {
             Ok(Exit::Done) => r[H::SYS].set(0),
             Ok(Exit::Blocked) => {}
             Ok(Exit::Preempted) => r[H::IP].set(r[H::IP].get().wrapping_sub(H::SYSCALL_LEN)),
             Err(e) => r[H::SYS].set(e as u64),
+        }
+        if global {
+            self.go_local();
         }
     }
 
@@ -143,15 +187,21 @@ impl<H: Hal> Kernel<H> {
                 }
                 let r = self.recv_any(t, a[0], 0);
                 // The server now waits: the caller it answered runs next.
-                if replied && r == Ok(Exit::Blocked) && caller != t && self.thread(caller).state.get() == RUNNABLE {
-                    self.q_remove(&self.rq_head, &self.rq_tail, caller);
+                let me = self.me();
+                if replied
+                    && r == Ok(Exit::Blocked)
+                    && caller != t
+                    && self.thread(caller).state.get() == RUNNABLE
+                    && self.thread(caller).cpu.get() as usize == self.hal.cpu()
+                {
+                    self.q_remove(&me.rq_head, &me.rq_tail, caller);
                     self.hand_off(caller);
                 }
                 r
             }
             Syscall::Yield => {
-                self.resched.set(true);
-                self.dirty.set(true);
+                self.me().resched.set(true);
+                self.me().dirty.set(true);
                 Ok(Exit::Done)
             }
             Syscall::Retype => {
@@ -225,7 +275,13 @@ impl<H: Hal> Kernel<H> {
                     }
                     src[i] = s;
                 }
-                self.dirty.set(true);
+                // The thread may be running on another processor with the
+                // CapSpace and address space it is about to lose.
+                let home = self.thread(th.obj).cpu.get() as usize;
+                self.cpus[home].dirty.set(true);
+                if home != self.hal.cpu() && self.cpus[home].cur.get() == th.obj {
+                    self.hal.kick(home, true);
+                }
                 let slots = Thread::embedded_slots(th.obj);
                 for i in 0..4 {
                     if a[i + 1] == KEEP {
@@ -280,6 +336,26 @@ impl<H: Hal> Kernel<H> {
                             self.make_runnable(th.obj);
                         }
                         Ok(Exit::Done)
+                    }
+                    2 => {
+                        // Move the thread to processor `a2`. It is stopped
+                        // first and stays stopped.
+                        if a[2] >= self.ncpu.get() as u64 {
+                            return Err(Error::BadArg);
+                        }
+                        if th.obj == t {
+                            self.thread(t).regs[H::SYS].set(0);
+                        }
+                        self.cancel(th.obj, true);
+                        let old = self.home(th.obj);
+                        if old.loaded.get() == th.obj {
+                            old.loaded.set(0);
+                        }
+                        if old.cur.get() == th.obj {
+                            old.cur.set(0);
+                        }
+                        self.thread(th.obj).cpu.set(a[2]);
+                        Ok(if th.obj == t { Exit::Blocked } else { Exit::Done })
                     }
                     _ => Err(Error::BadArg),
                 }
@@ -404,12 +480,10 @@ impl<H: Hal> Kernel<H> {
         ThreadView { state: th.state.get(), slots: Thread::embedded_slots(t), blocked_on: th.blocked_on.get(), caller: th.caller.get() }
     }
 
-    /// Whether any thread can run now or will be woken by a deadline.
+    /// Whether any thread of this processor can run now or will be woken by a deadline.
     pub fn can_run(&self) -> bool {
-        let c = self.cur.get();
-        (c != 0 && self.thread(c).state.get() == crate::thread::RUNNABLE)
-            || self.rq_head.get() != 0
-            || self.direct.get() != 0
-            || self.timers.get() != 0
+        let me = self.me();
+        let c = me.cur.get();
+        (c != 0 && self.thread(c).state.get() == RUNNABLE) || me.rq_head.get() != 0 || me.direct.get() != 0 || me.timers.get() != 0
     }
 }

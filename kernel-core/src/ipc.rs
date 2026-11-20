@@ -115,6 +115,11 @@ impl<H: Hal> Kernel<H> {
             return Err(Error::Timeout);
         }
         let qu = self.queue(q);
+        // The queue belongs to the processor of whoever waits to receive
+        // on it; only a holder of every lock may move it.
+        if self.global.get() {
+            qu.owner.set(self.thread(t).cpu.get() + 1);
+        }
         qu.kind.set(RECEIVERS);
         self.q_push(&qu.head, &qu.tail, t);
         self.block(t, RECEIVING, q, deadline);
@@ -180,7 +185,7 @@ impl<H: Hal> Kernel<H> {
             } else {
                 ct.blocked_on.set(0);
                 ct.state.set(INACTIVE);
-                self.dirty.set(true);
+                self.home(c).dirty.set(true);
             }
             return Ok(true);
         }
@@ -192,8 +197,24 @@ impl<H: Hal> Kernel<H> {
     /// The current thread took a fault it cannot continue from. The fault is
     /// sent to its fault endpoint as a call; with no endpoint the thread stops.
     pub fn fault(&self, kind: Fault, addr: u64, code: u64) {
-        let t = self.cur.get();
+        let me = self.me();
+        let t = me.cur.get();
+        // The thread may have been stopped or destroyed by another
+        // processor while this one waited for its lock.
+        if t == 0 || self.thread(t).state.get() != crate::thread::RUNNABLE {
+            me.dirty.set(true);
+            return;
+        }
         let th = self.thread(t);
+        let global = self.ncpu.get() > 1 && !th.fault_ep.cap().is_some_and(|c| self.queue_is_local(t, &c));
+        if global {
+            self.go_global();
+            if me.cur.get() != t || th.state.get() != crate::thread::RUNNABLE {
+                me.dirty.set(true);
+                self.go_local();
+                return;
+            }
+        }
         th.fault[0].set(kind as u64);
         th.fault[1].set(addr);
         th.fault[2].set(code);
@@ -213,6 +234,9 @@ impl<H: Hal> Kernel<H> {
                     code
                 );
             }
+        }
+        if global {
+            self.go_local();
         }
     }
 }

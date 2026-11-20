@@ -6,21 +6,36 @@
 #![no_std]
 #![deny(unsafe_code)]
 
+/// Defines a constructor for `lock.rs`: a `const fn` here.
+macro_rules! ctor {
+    ($(#[$m:meta])* $v:vis fn $name:ident() -> $t:ty $body:block) => {
+        $(#[$m])* $v const fn $name() -> $t $body
+    };
+}
+
 pub mod boot;
 pub mod cap;
 pub mod elf;
 pub mod hal;
 pub mod ipc;
 pub mod kernel;
+pub mod lock;
 pub mod log;
 pub mod mem;
 pub mod ramdisk;
 pub mod root;
+pub mod smp;
 pub mod thread;
 pub mod untyped;
 pub mod vm;
 
 pub use kernel::Kernel;
+
+/// The atomics `lock.rs` is written against (the loom model substitutes its own).
+mod sync {
+    pub(crate) use core::hint::spin_loop as spin;
+    pub(crate) use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+}
 
 /// The line the kernel writes to the serial console once the root task runs.
 pub const BOOT_BANNER: &str = "BOOT OK";
