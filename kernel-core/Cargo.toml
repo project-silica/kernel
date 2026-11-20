@@ -1,10 +1,13 @@
 [package]
 name = "kernel-core"
-description = "Arch-free kernel logic; builds and tests on the host."
+description = "Arch-free kernel logic: objects, capabilities, IPC, memory. Builds and tests on the host."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[dependencies]
+silica-abi = { path = "../abi" }
 
 [lints]
 workspace = true

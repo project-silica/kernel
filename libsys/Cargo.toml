@@ -1,10 +1,13 @@
 [package]
 name = "libsys"
-description = "The Silica system library mapped into every process (vDSO style)."
+description = "Silica system library: the only way programs reach the kernel."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[dependencies]
+silica-abi = { path = "../abi" }
 
 [lints]
 workspace = true

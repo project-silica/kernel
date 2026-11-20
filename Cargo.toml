@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["kernel-core", "kernel", "libsys", "boot-uefi"]
+members = ["abi", "kernel-core", "kernel", "libsys", "boot-uefi", "roottest"]
 # Host-buildable crates; `kernel` and `boot-uefi` build only for their targets.
-default-members = ["kernel-core", "libsys"]
+default-members = ["abi", "kernel-core", "libsys"]
 
 [workspace.package]
 version = "0.0.0"
@@ -12,6 +12,7 @@ publish = false
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("silica"))'] }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"

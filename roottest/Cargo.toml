@@ -1,0 +1,19 @@
+[package]
+name = "roottest"
+description = "The root task used by the kernel's in-OS tests: exercises the kernel through libsys and reports on the serial port."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "roottest"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libsys = { path = "../libsys" }
+
+[lints]
+workspace = true

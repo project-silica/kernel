@@ -1,0 +1,74 @@
+//! What the arch-free kernel needs from an architecture
+//! (`spec/ARCHITECTURE.md` section 6, HAL). Implemented once per
+//! architecture in `kernel/arch/` and once for the host tests.
+
+use crate::mem::{Paddr, Phys};
+use silica_abi::Rights;
+
+/// Number of words in a thread's saved register frame.
+pub const NREGS: usize = 40;
+
+/// Architecture operations and constants.
+pub trait Hal {
+    /// Frame index of the instruction pointer.
+    const IP: usize;
+    /// Frame index of the stack pointer.
+    const SP: usize;
+    /// Frame index of the flags register.
+    const FLAGS: usize;
+    /// Frame index of the syscall number, and of the status on return.
+    const SYS: usize;
+    /// Frame indices of the six syscall argument registers.
+    const ARG: [usize; 6];
+    /// Flags a new user thread starts with.
+    const FLAGS_INIT: u64;
+    /// Length of the syscall instruction, to restart a preempted syscall.
+    const SYSCALL_LEN: u64;
+    /// One past the highest user virtual address.
+    const USER_TOP: u64;
+
+    /// Make a user-supplied instruction pointer safe to return to.
+    fn user_ip_ok(ip: u64) -> bool {
+        ip < Self::USER_TOP
+    }
+
+    /// A page-table entry pointing to the next-level table at `table`.
+    fn pte_table(table: Paddr) -> u64;
+    /// A leaf entry mapping `frame` at `level` (0: 4 KiB, 1: 2 MiB).
+    fn pte_leaf(frame: Paddr, rights: Rights, level: u8, device: bool) -> u64;
+    /// Whether the entry maps or points to anything.
+    fn pte_present(pte: u64) -> bool;
+    /// Whether a present entry at `level` is a leaf.
+    fn pte_is_leaf(pte: u64, level: u8) -> bool;
+    /// The physical address in a present entry.
+    fn pte_addr(pte: u64) -> Paddr;
+
+    /// Fill a new root table with the kernel's half of the address space.
+    fn init_root(&self, phys: &Phys, root: Paddr);
+    /// Give a new thread's extended-state area its initial contents. The
+    /// area is the part of the Thread object from [`crate::thread::FPU_OFFSET`].
+    fn init_thread(&self, phys: &Phys, thread: Paddr);
+    /// Make `to` the thread this processor returns to: save `from`'s extended
+    /// state (when not 0), load `to`'s, and switch to address-space root
+    /// `root` (0: kernel mappings only).
+    fn switch_thread(&self, phys: &Phys, from: Paddr, to: Paddr, root: Paddr);
+    /// Leave address-space root `root` if this processor has it loaded.
+    fn leave_aspace(&self, root: Paddr);
+    /// Drop cached translations for `[vaddr, vaddr + len)` in `root`.
+    fn tlb_flush(&self, root: Paddr, vaddr: u64, len: u64);
+
+    /// Monotonic nanoseconds since boot.
+    fn now(&self) -> u64;
+    /// Ask for a timer interrupt at `deadline` (`u64::MAX`: none).
+    fn set_timer(&self, deadline: u64);
+    /// Whether an interrupt is waiting to be taken. Long operations poll this
+    /// and restart later when it is true.
+    fn irq_pending(&self) -> bool;
+    /// Wait for an interrupt with interrupts enabled; returns after its
+    /// handler has run.
+    fn idle(&self);
+    /// Port I/O (x86_64). `width` is 1, 2 or 4.
+    fn port_io(&self, port: u16, width: u8, write: bool, value: u32) -> u32;
+    /// Write to the kernel's console.
+    fn console(&self, bytes: &[u8]);
+}

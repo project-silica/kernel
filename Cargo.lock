@@ -14,12 +14,30 @@ name = "kernel"
 version = "0.0.0"
 dependencies = [
  "kernel-core",
+ "silica-abi",
 ]
 
 [[package]]
 name = "kernel-core"
 version = "0.0.0"
+dependencies = [
+ "silica-abi",
+]
 
 [[package]]
 name = "libsys"
+version = "0.0.0"
+dependencies = [
+ "silica-abi",
+]
+
+[[package]]
+name = "roottest"
+version = "0.0.0"
+dependencies = [
+ "libsys",
+]
+
+[[package]]
+name = "silica-abi"
 version = "0.0.0"

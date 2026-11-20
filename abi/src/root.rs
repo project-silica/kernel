@@ -1,0 +1,86 @@
+//! What the root task finds when it starts.
+//!
+//! The kernel creates one thread from the ramdisk entry named `root` and
+//! gives it every capability there is. Its CapSpace is laid out as below, and
+//! its first argument register holds the address of a read-only [`RootInfo`].
+
+/// Slot of the root thread's own Thread capability.
+pub const SLOT_THREAD: u64 = 1;
+/// Slot of the root CapSpace capability.
+pub const SLOT_CAPSPACE: u64 = 2;
+/// Slot of the root AddressSpace capability.
+pub const SLOT_ASPACE: u64 = 3;
+/// Slot of the Hw capability for every I/O port (x86_64; empty elsewhere).
+pub const SLOT_PORTS: u64 = 4;
+/// Slot of the Hw capability for every interrupt line.
+pub const SLOT_IRQS: u64 = 5;
+/// Slot of the root thread's IPC buffer frame.
+pub const SLOT_IPCBUF: u64 = 6;
+/// Slot of the Untyped the root task's own objects were made from; what is
+/// left of it is the root task's to use.
+pub const SLOT_BOOT_UNTYPED: u64 = 7;
+/// First slot of the Untyped capabilities listed in [`RootInfo::untyped`].
+pub const SLOT_FIRST_UNTYPED: u64 = 16;
+
+/// `RootInfo::magic`.
+pub const ROOT_MAGIC: u64 = 0x4F46_4E49_544F_4F52; // "ROOTINFO"
+/// Most Untyped descriptors in a [`RootInfo`].
+pub const MAX_UNTYPED: usize = 1000;
+
+/// One Untyped capability handed to the root task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct UntypedDesc {
+    /// Physical address.
+    pub base: u64,
+    /// Size in bits.
+    pub bits: u8,
+    /// One of the `KIND_` constants.
+    pub kind: u8,
+    /// Zero.
+    pub reserved: [u8; 6],
+}
+
+/// Ordinary memory.
+pub const KIND_RAM: u8 = 0;
+/// Device or firmware memory: not zeroed, only retyped into frames or
+/// smaller untyped.
+pub const KIND_DEVICE: u8 = 1;
+/// Device-kind memory holding the ramdisk archive.
+pub const KIND_RAMDISK: u8 = 2;
+
+/// The root task's start-up record. Read-only, mapped by the kernel.
+#[repr(C)]
+pub struct RootInfo {
+    /// [`ROOT_MAGIC`].
+    pub magic: u64,
+    /// Number of slots in the root CapSpace.
+    pub capspace_slots: u64,
+    /// First slot the kernel left empty.
+    pub first_free_slot: u64,
+    /// Number of entries used in `untyped`.
+    pub untyped_count: u64,
+    /// Virtual address of the IPC buffer.
+    pub ipc_buffer: u64,
+    /// Physical address and length of the ramdisk archive (0 when absent).
+    pub ramdisk: [u64; 2],
+    /// Physical address of the ACPI RSDP (0 when absent).
+    pub rsdp: u64,
+    /// Framebuffer: physical base, width, height, pixels per line, format
+    /// (0 none, 1 RGBX, 2 BGRX).
+    pub framebuffer: [u64; 5],
+    /// The processor's timestamp counter: ticks per second, its value when
+    /// the boot loader started, and its value at monotonic time 0.
+    pub clock: [u64; 3],
+    /// Wall-clock time from the firmware, in seconds since 1970, and the
+    /// monotonic nanoseconds at which it was read (both 0 when unknown).
+    pub wall_clock: [u64; 2],
+    /// 32 bytes from the firmware's random source (all zero when absent).
+    pub entropy: [u8; 32],
+    /// Length of the kernel command line in `cmdline`.
+    pub cmdline_len: u64,
+    /// The kernel command line.
+    pub cmdline: [u8; 256],
+    /// The Untyped capabilities, in slot order from `SLOT_FIRST_UNTYPED`.
+    pub untyped: [UntypedDesc; MAX_UNTYPED],
+}

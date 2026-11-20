@@ -1,0 +1,15 @@
+# In-OS tests of the x86_64 kernel (roottest/src/main.rs), one name per line.
+syscall
+fault_page
+fault_instruction
+fault_privileged
+fault_kernel_memory
+fault_stack
+fault_resume
+w_xor_x
+ipc
+timer
+preempt
+fpu
+untyped
+caps

@@ -25,5 +25,6 @@
     "kind": "inline"
   },
   "static-position-independent-executables": true,
-  "target-pointer-width": 64
+  "target-pointer-width": 64,
+  "frame-pointer": "always"
 }

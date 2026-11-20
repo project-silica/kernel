@@ -1,0 +1,10 @@
+[package]
+name = "silica-abi"
+description = "Kernel ABI shared by the kernel and libsys: syscall numbers, errors, rights, object types, the root task's start-up record."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
