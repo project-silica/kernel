@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["kernel-core", "kernel", "libsys", "boot-uefi"]
+# Host-buildable crates; `kernel` and `boot-uefi` build only for their targets.
+default-members = ["kernel-core", "libsys"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1

@@ -1,0 +1,10 @@
+[package]
+name = "libsys"
+description = "The Silica system library mapped into every process (vDSO style)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
