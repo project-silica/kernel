@@ -48,6 +48,15 @@ pub(super) const PTE_P: u64 = 1;
 pub(super) const PTE_W: u64 = 2;
 const PTE_U: u64 = 4;
 const PTE_PCD: u64 = 0x10;
+/// Accessed and dirty. The kernel sets them in every entry it writes: the
+/// processor sets a clear one itself on first use, with a microcode assist
+/// that costs more than the rest of a page fault (measured in a virtual
+/// machine: the first write to a mapped page 620 timestamp ticks with them
+/// clear, against 6 for the next cache line). Nothing in the kernel reads
+/// them; which pages were used is a pager's question, to be asked
+/// explicitly when a pager needs it.
+const PTE_A: u64 = 0x20;
+const PTE_D: u64 = 0x40;
 const PTE_PS: u64 = 0x80;
 const PTE_NX: u64 = 1 << 63;
 pub(super) const PTE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
@@ -144,12 +153,14 @@ impl Hal for X86 {
     const USER_TOP: u64 = 0x0000_7FFF_FFFF_F000;
 
     fn pte_table(table: Paddr) -> u64 {
-        table | PTE_P | PTE_W | PTE_U
+        table | PTE_P | PTE_W | PTE_U | PTE_A
     }
     fn pte_leaf(frame: Paddr, rights: Rights, level: u8, device: bool) -> u64 {
-        let mut e = frame | PTE_P | PTE_U;
+        let mut e = frame | PTE_P | PTE_U | PTE_A;
         if rights.has(Rights::WRITE) {
-            e |= PTE_W;
+            // Dirty only with write: a read-only entry marked dirty means a
+            // shadow stack to the processor.
+            e |= PTE_W | PTE_D;
         }
         if !rights.has(Rights::EXEC) {
             e |= PTE_NX;

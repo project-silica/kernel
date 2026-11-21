@@ -106,6 +106,10 @@ pub fn stop(code: u8, _harness: bool) -> ! {
 // Page-table entries.
 const P: u64 = 1;
 const W: u64 = 2;
+/// Accessed and dirty, set in advance so the processor never has to (a
+/// microcode assist on the first use of each entry).
+const A: u64 = 0x20;
+const D: u64 = 0x40;
 const PS: u64 = 0x80;
 const G: u64 = 0x100;
 const NX: u64 = 1 << 63;
@@ -117,7 +121,7 @@ pub fn present(e: u64) -> bool {
 }
 /// An entry pointing to a next-level table.
 pub fn table(addr: u64) -> u64 {
-    addr | P | W
+    addr | P | W | A
 }
 /// A 2 MiB mapping of normal memory.
 pub fn block(phys: u64, write: bool, exec: bool) -> u64 {
@@ -125,7 +129,7 @@ pub fn block(phys: u64, write: bool, exec: bool) -> u64 {
 }
 /// A 4 KiB mapping of normal memory.
 pub fn page(phys: u64, write: bool, exec: bool) -> u64 {
-    phys | P | G | if write { W } else { 0 } | if exec { 0 } else { NX }
+    phys | P | G | A | if write { W | D } else { 0 } | if exec { 0 } else { NX }
 }
 
 /// Code written to memory is executed as written: nothing to do on x86.
