@@ -206,13 +206,15 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// Block thread `t` (current on its processor) in `state` on `on`, with
-    /// an optional absolute deadline (0: none).
+    /// an optional absolute deadline (0 or `u64::MAX`: none). `u64::MAX` is
+    /// the timer's "off" (`arm_timer`), so a thread with that deadline would
+    /// be on a timer list the timer never fires for: it waits for ever.
     pub(crate) fn block(&self, t: Paddr, state: u64, on: Paddr, deadline: u64) {
         let th = self.thread(t);
         th.state.set(state);
         th.blocked_on.set(on);
         self.home(t).dirty.set(true);
-        if deadline != 0 {
+        if deadline != 0 && deadline != u64::MAX {
             self.timer_insert(t, deadline);
         }
     }

@@ -121,8 +121,15 @@ impl Hal for TestHal {
     }
     fn idle_begin(&self) {}
     fn idle(&self) {
+        // As hardware: a timer fires once, at its deadline, and not again
+        // until it is set anew. Idling with none still to fire would sleep
+        // for ever (here: the kernel would spin).
         assert!(self.timer.get() != u64::MAX, "idle with no timer armed: every thread is blocked for ever");
-        self.now.set(self.now.get().max(self.timer.get()));
+        assert!(
+            self.timer.get() > self.now.get(),
+            "idle with the timer already fired and not set again: the processor would sleep for ever"
+        );
+        self.now.set(self.timer.get());
     }
     fn irq_route(&self, line: usize, cpu: usize, level: bool, active_low: bool) -> bool {
         self.irq_log.borrow_mut().push(format!("route {line} cpu{cpu} level={level} low={active_low}"));

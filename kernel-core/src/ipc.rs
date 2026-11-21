@@ -172,7 +172,7 @@ impl<H: Hal> Kernel<H> {
         Ok(Exit::Blocked)
     }
 
-    /// Receive on endpoint `ep`. `deadline`: 0 for ever, 1 do not block.
+    /// Receive on endpoint `ep`. `deadline`: 0 or `u64::MAX` for ever, 1 do not block.
     /// `park`: a notification of the receiver's on which the next call is
     /// parked (0: none).
     pub(crate) fn recv(&self, t: Paddr, ep: Paddr, deadline: u64, park: u64) -> Result<Exit, Error> {

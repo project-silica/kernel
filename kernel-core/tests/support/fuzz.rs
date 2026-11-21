@@ -4,6 +4,7 @@
 //! CapSpace and address space, then checks what must hold whatever they did:
 //!
 //! - the kernel did not panic and every syscall returned or blocked;
+//! - after every step, each processor's timer list is well formed;
 //! - the derivation list around every capability is consistent;
 //! - after the root task revokes the Untyped everything was made from, no
 //!   capability to memory inside it is left anywhere (nothing leaks), and
@@ -75,6 +76,9 @@ pub fn run(data: &[u8]) {
     let mut steps = 0;
     while steps < 4096 {
         steps += 1;
+        if let Err(what) = m.k.check_timers() {
+            panic!("before step {steps}: {what}");
+        }
         // Which processor makes the next kernel entry.
         let Some(sel) = src.byte() else { break };
         m.on((sel & 1) as usize);
@@ -139,6 +143,9 @@ pub fn run(data: &[u8]) {
             }
         }
         m.raw(n, a);
+        if let Err(what) = m.k.check_timers() {
+            panic!("after step {steps} (syscall {n} {a:x?}): {what}");
+        }
     }
 
     // The root task finishes on whichever processor it was last moved to.

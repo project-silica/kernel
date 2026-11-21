@@ -32,7 +32,7 @@ pub enum Syscall {
     /// or answers the call parked there (see `Recv`).
     Send = 1,
     /// `a0` endpoint or notification, `a1` deadline in monotonic nanoseconds
-    /// (0: wait for ever, 1: do not block), `a2` for an endpoint: a
+    /// (0 or `u64::MAX`: wait for ever, 1: do not block), `a2` for an endpoint: a
     /// notification to park the next call on (0: none). Returns `a0` badge,
     /// `a1` [`MsgInfo`], `a2..a5` words. For a notification `a0` is the
     /// pending word, cleared by the read.

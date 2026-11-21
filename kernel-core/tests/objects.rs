@@ -1107,3 +1107,12 @@ fn revoking_a_capability_fails_what_waits_through_it_and_nothing_else() {
 fn syscall_sequences_the_fuzzer_found_keep_the_kernel_invariants() {
     support::fuzz::run(include_bytes!("../fuzz/corpus/syscalls/root-moved-to-the-other-processor"));
 }
+
+/// Found by the syscall fuzzer: a receive with the deadline `u64::MAX` put
+/// its thread on the timer list with the value that means "timer off", so
+/// the timer was never set for it and an idle processor spun in the
+/// scheduler for ever. That deadline now means "wait for ever", like 0.
+#[test]
+fn deadline_max_waits_for_ever() {
+    support::fuzz::run(include_bytes!("../fuzz/corpus/syscalls/recv-deadline-max-spins-idle"));
+}

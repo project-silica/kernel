@@ -682,6 +682,34 @@ impl<H: Hal> Kernel<H> {
         }
     }
 
+    /// Whether every processor's timer list is well formed: linked both
+    /// ways, in deadline order, ending, and holding only threads of that
+    /// processor that have a deadline. For tests and fuzzing.
+    pub fn check_timers(&self) -> Result<(), &'static str> {
+        for (i, cpu) in self.cpus.iter().enumerate().take(self.ncpu.get()) {
+            let (mut t, mut prev, mut last, mut n) = (cpu.timers.get(), 0, 0, 0usize);
+            while t != 0 {
+                let th = self.thread(t);
+                if th.tprev.get() != prev {
+                    return Err("a timer list's back link is wrong");
+                }
+                if th.cpu.get() as usize != i {
+                    return Err("a thread waits on the timer list of a processor that is not its home");
+                }
+                let d = th.deadline.get();
+                if d == 0 || d < last {
+                    return Err("a timer list holds a thread with no deadline, or is out of order");
+                }
+                n += 1;
+                if n > 1 << 20 {
+                    return Err("a timer list does not end");
+                }
+                (prev, last, t) = (t, d, th.tnext.get());
+            }
+        }
+        Ok(())
+    }
+
     /// Check the waiting lists of the endpoint or notification at `q`
     /// (from a capability to it) for consistency: every thread queued
     /// there waits on it, every delivered call is linked to it, and each
