@@ -272,7 +272,7 @@ extern "C" fn ap_main(index: usize) -> ! {
     if index == 1 && PANIC_SECONDARY.load(Ordering::Acquire) {
         super::deliberate_panic(index);
     }
-    super::load_ttbr0(kernel().hal.empty_root());
+    super::reset_ttbr0(kernel().hal.empty_root());
     let region = (GICR_REGION[0].load(Ordering::Relaxed), GICR_REGION[1].load(Ordering::Relaxed));
     match gic::find_redistributor(region.0, region.1, gic::my_affinity()) {
         Some(r) => gic::init_processor(index, r),

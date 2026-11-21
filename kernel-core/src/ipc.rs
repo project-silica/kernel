@@ -35,6 +35,11 @@ impl<H: Hal> Kernel<H> {
         for i in 2..6 {
             t.regs[H::ARG[i]].set(f.regs[H::ARG[i]].get());
         }
+        // A message of registers only (the common case) needs no buffer.
+        if words <= MsgInfo::REG_WORDS && (info.caps() == 0 || !grant) {
+            t.regs[H::ARG[1]].set(MsgInfo::with_caps(info.label(), words, 0).0);
+            return;
+        }
         let buffers = match (self.ipc_buffer(from), self.ipc_buffer(to)) {
             (Some(src), Some(dst)) => Some((src, dst)),
             _ => None,
@@ -94,9 +99,10 @@ impl<H: Hal> Kernel<H> {
         let ct = self.thread(caller);
         ct.via.set(ep);
         // A caller that gave away the very capability it called through
-        // (in this message) is tied to no slot any more.
+        // (in this message: only a message with capabilities can) is tied
+        // to no slot any more.
         let vs = ct.via_slot.get();
-        if vs != 0 && !self.slot(vs).cap().is_some_and(|c| c.obj == ep) {
+        if vs != 0 && MsgInfo(ct.regs[H::ARG[1]].get()).caps() != 0 && !self.slot(vs).cap().is_some_and(|c| c.obj == ep) {
             ct.via_slot.set(0);
         }
         let park = self.thread(server).park.replace(0);

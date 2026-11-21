@@ -1437,6 +1437,13 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     UNTYPED.store(SLOT_FIRST_UNTYPED + big as u64, SeqCst);
 
     let cmdline = &info.cmdline[..info.cmdline_len as usize];
+    // `bench=ipc`: only the IPC round trip, for instruction-level profiles
+    // of that one path (os/tools/profile.sh).
+    if cmdline.split(|&b| b == b' ' || b == b'\n').any(|w| w.trim_ascii() == b"bench=ipc") {
+        bench_ipc();
+        println!("BENCH DONE");
+        exit(true);
+    }
     if cmdline.split(|&b| b == b' ' || b == b'\n').any(|w| w.trim_ascii() == b"bench") {
         println!("BENCH MARK userspace");
         bench()
