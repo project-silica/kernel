@@ -44,6 +44,62 @@ use core::cell::Cell;
 pub const MAX_CPUS: usize = 256;
 const _: () = assert!(MAX_CPUS.is_power_of_two());
 
+/// Every processor's [`Cpu`], laid out so that no processor's state shares
+/// page offsets with the busy part of a thread object.
+///
+/// A thread object is page aligned and its first `size_of::<Thread>()`
+/// bytes (registers, embedded capability slots, scheduling links) are
+/// written on every kernel entry; per-processor state is read and written
+/// on every entry too. On x86 a load whose address matches an earlier
+/// store's in its low 12 bits waits for that store ("4K aliasing"): when a
+/// processor's state sat at the page offsets of the register frame, every
+/// system call on that one processor stalled (measured: one processor of
+/// eight ran IPC 30% slower, with 5.6 million aliased loads where the others
+/// had none). So each page of this table holds processors' state only in
+/// its upper half, above the thread object's size.
+#[repr(C, align(4096))]
+pub struct CpuTable([Cpu; CPU_SLOTS]);
+
+const PER_PAGE: usize = 4096 / core::mem::size_of::<Cpu>();
+/// The upper half of each page: a power of two, so finding a processor's
+/// state (on every kernel entry, many times) is shifts and masks.
+const USED: usize = PER_PAGE / 2;
+const SKIP: usize = PER_PAGE - USED;
+const CPU_SLOTS: usize = MAX_CPUS.div_ceil(USED) * PER_PAGE;
+const _: () = assert!(
+    CPU_SLOTS.is_power_of_two()
+        && 4096 % core::mem::size_of::<Cpu>() == 0
+        && USED.is_power_of_two()
+        && SKIP * core::mem::size_of::<Cpu>() >= core::mem::size_of::<crate::thread::Thread>()
+);
+
+/// Where processor `i`'s state is in the table: what an architecture
+/// keeps in its per-processor data for [`Hal::cpu_slot`](crate::hal::Hal::cpu_slot).
+pub const fn cpu_slot(i: usize) -> usize {
+    i / USED * PER_PAGE + SKIP + i % USED
+}
+
+impl CpuTable {
+    pub(crate) const fn new() -> CpuTable {
+        CpuTable([const { Cpu::new() }; CPU_SLOTS])
+    }
+    /// Processor `i`'s state.
+    #[inline]
+    pub(crate) fn get(&self, i: usize) -> &Cpu {
+        &self.0[cpu_slot(i)]
+    }
+    /// The state at slot `s` (from [`cpu_slot`]); the slot count is a power
+    /// of two, so masking replaces the bounds check.
+    #[inline]
+    pub(crate) fn at_slot(&self, s: usize) -> &Cpu {
+        &self.0[s & (CPU_SLOTS - 1)]
+    }
+    /// The first `n` processors' states, in order.
+    pub(crate) fn iter(&self, n: usize) -> impl Iterator<Item = &Cpu> {
+        (0..n).map(move |i| self.get(i))
+    }
+}
+
 /// One processor's lock and scheduling state (protected by the lock). Each
 /// has its own cache lines: processors working independently must not make
 /// each other's memory bounce.
@@ -62,7 +118,24 @@ pub struct Cpu {
     pub(crate) timers: Cell<Paddr>,
     /// When the timer is set to fire (`u64::MAX`: not armed).
     pub(crate) timer_at: Cell<u64>,
-    pub(crate) slice_end: Cell<u64>,
+    /// When the running thread must next be looked at again (its share or
+    /// budget used up; `u64::MAX`: never), see `sched.rs`.
+    pub(crate) preempt_at: Cell<u64>,
+    /// Runnable threads bound to deadline contexts.
+    pub(crate) dl_head: Cell<Paddr>,
+    pub(crate) dl_tail: Cell<Paddr>,
+    /// The least virtual runtime among this processor's fair threads (only grows).
+    pub(crate) min_vr: Cell<u64>,
+    /// When time was last charged, and to which thread (0: none).
+    pub(crate) since: Cell<u64>,
+    pub(crate) account: Cell<Paddr>,
+    /// Deadline reservations on this processor, in parts of 2^20.
+    pub(crate) reserved: Cell<u64>,
+    /// The running thread yielded: it goes behind its equals.
+    pub(crate) yielded: Cell<bool>,
+    /// Another processor made a thread of this one runnable: whether it
+    /// should take the processor is decided here, on the way out.
+    pub(crate) woken: Cell<bool>,
     pub(crate) resched: Cell<bool>,
     /// The timer fired since the scheduler last looked at deadlines.
     pub(crate) tick: Cell<bool>,
@@ -107,7 +180,15 @@ impl Cpu {
             rq_tail: Cell::new(0),
             timers: Cell::new(0),
             timer_at: Cell::new(u64::MAX),
-            slice_end: Cell::new(0),
+            preempt_at: Cell::new(u64::MAX),
+            dl_head: Cell::new(0),
+            dl_tail: Cell::new(0),
+            min_vr: Cell::new(0),
+            since: Cell::new(0),
+            account: Cell::new(0),
+            reserved: Cell::new(0),
+            yielded: Cell::new(false),
+            woken: Cell::new(false),
             resched: Cell::new(false),
             tick: Cell::new(false),
             direct: Cell::new(0),
@@ -125,9 +206,9 @@ impl<H: Hal> Kernel<H> {
         // Masked rather than bounds-checked: this is on every path through
         // the kernel, and a processor's index is below MAX_CPUS (a power of
         // two) by construction.
-        let i = self.hal.cpu();
-        debug_assert!(i < MAX_CPUS);
-        &self.cpus[i & (MAX_CPUS - 1)]
+        let s = self.hal.cpu_slot();
+        debug_assert!(s == cpu_slot(self.hal.cpu()));
+        self.cpus.at_slot(s)
     }
 
     /// Number of processors the machine has (set once at boot).
@@ -142,7 +223,7 @@ impl<H: Hal> Kernel<H> {
     }
 
     pub(crate) fn unlock(&self, cpu: usize) {
-        self.cpus[cpu].lock.unlock();
+        self.cpus.get(cpu).lock.unlock();
     }
 
     /// Enter the kernel on this processor: take its lock and act on what
@@ -162,7 +243,7 @@ impl<H: Hal> Kernel<H> {
     /// Processor `cpu`'s lock, for an architecture's entry code to take
     /// before it saves anything (then calling [`Kernel::entered`]).
     pub fn cpu_lock(&self, cpu: usize) -> &Lock {
-        &self.cpus[cpu].lock
+        &self.cpus.get(cpu).lock
     }
 
     fn caught_up(&self) {
@@ -176,14 +257,14 @@ impl<H: Hal> Kernel<H> {
 
     /// Leave the kernel on this processor.
     pub fn leave(&self) {
-        self.unlock(self.hal.cpu());
+        self.me().lock.unlock();
     }
 
     /// From holding this processor's lock to holding every processor's.
     /// Other global operations may run in between: the caller re-examines
     /// everything it looked at before.
     pub(crate) fn go_global(&self) {
-        crate::lock::go_global(&self.me().lock, self.cpus[..self.ncpu.get()].iter().map(|c| &c.lock));
+        crate::lock::go_global(&self.me().lock, self.cpus.iter(self.ncpu.get()).map(|c| &c.lock));
         self.global.set(true);
         self.globals.set(self.globals.get() + 1);
         self.caught_up();
@@ -200,7 +281,7 @@ impl<H: Hal> Kernel<H> {
     /// re-examines everything it looked at before.
     pub(crate) fn go_pair(&self, other: usize) {
         let me = self.hal.cpu();
-        crate::lock::go_pair(&self.cpus[me].lock, &self.cpus[other].lock, other < me);
+        crate::lock::go_pair(&self.cpus.get(me).lock, &self.cpus.get(other).lock, other < me);
         let cpu = self.me();
         cpu.pair.set(other as u64 + 1);
         cpu.pairs.set(cpu.pairs.get() + 1);
@@ -229,14 +310,14 @@ impl<H: Hal> Kernel<H> {
     /// (a statistic for tests and the debug console).
     /// Only for tests: call it while no processor is in the kernel.
     pub fn pair_entries(&self) -> u64 {
-        self.cpus[..self.ncpu.get()].iter().map(|c| c.pairs.get()).sum()
+        self.cpus.iter(self.ncpu.get()).map(|c| c.pairs.get()).sum()
     }
 
     /// Back to holding only this processor's lock.
     pub(crate) fn go_local(&self) {
         let cpu = self.hal.cpu();
         self.global.set(false);
-        crate::lock::go_local(cpu, self.cpus[..self.ncpu.get()].iter().map(|c| &c.lock));
+        crate::lock::go_local(cpu, self.cpus.iter(self.ncpu.get()).map(|c| &c.lock));
     }
 
     /// Every processor other than this one, with its index. Only for code
@@ -244,6 +325,6 @@ impl<H: Hal> Kernel<H> {
     pub(crate) fn others(&self) -> impl Iterator<Item = (usize, &Cpu)> {
         let me = self.hal.cpu();
         debug_assert!(self.global.get() || self.ncpu.get() == 1);
-        self.cpus[..self.ncpu.get()].iter().enumerate().filter(move |(i, _)| *i != me)
+        self.cpus.iter(self.ncpu.get()).enumerate().filter(move |(i, _)| *i != me)
     }
 }

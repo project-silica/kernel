@@ -76,6 +76,9 @@ pub fn run(data: &[u8]) {
     let mut steps = 0;
     while steps < 4096 {
         steps += 1;
+        if let Err(what) = m.k.check_runqueues() {
+            panic!("run queues: {what}");
+        }
         if let Err(what) = m.k.check_timers() {
             panic!("before step {steps}: {what}");
         }
@@ -143,6 +146,9 @@ pub fn run(data: &[u8]) {
             }
         }
         m.raw(n, a);
+        if let Err(what) = m.k.check_runqueues() {
+            panic!("run queues: {what}");
+        }
         if let Err(what) = m.k.check_timers() {
             panic!("after step {steps} (syscall {n} {a:x?}): {what}");
         }

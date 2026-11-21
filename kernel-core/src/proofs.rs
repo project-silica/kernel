@@ -55,6 +55,7 @@ impl Hal for ProofHal {
     const FLAGS: usize = 2;
     const SYS: usize = 3;
     const ARG: [usize; 6] = [4, 5, 6, 7, 8, 9];
+    const BY_SYSCALL: usize = 10;
     const FLAGS_INIT: u64 = 0;
     const SYSCALL_LEN: u64 = 2;
     const USER_TOP: u64 = 1 << 47;

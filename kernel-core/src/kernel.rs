@@ -3,7 +3,7 @@
 use crate::cap::{Cap, FLAG_CONSOLE, FLAG_DEVICE, FLAG_PORTS, FLAG_POWER};
 use crate::hal::Hal;
 use crate::mem::{Paddr, Phys};
-use crate::smp::{Cpu, Held, MAX_CPUS};
+use crate::smp::Held;
 use crate::thread::{INACTIVE, IPC_CALL, IPC_GRANT, RUNNABLE, Thread};
 use core::cell::Cell;
 use silica_abi::{Error, KEEP, MsgInfo, NONBLOCK, ObjectType, PAGE_BITS, Rights, Syscall};
@@ -25,7 +25,7 @@ pub struct Kernel<H: Hal> {
     pub hal: H,
     /// Physical memory.
     pub phys: Phys,
-    pub(crate) cpus: [Cpu; MAX_CPUS],
+    pub(crate) cpus: crate::smp::CpuTable,
     pub(crate) ncpu: Cell<usize>,
     /// This processor holds every lock (see `smp.rs`).
     pub(crate) global: Cell<bool>,
@@ -46,7 +46,7 @@ impl<H: Hal> Kernel<H> {
         Kernel {
             hal,
             phys,
-            cpus: [const { Cpu::new() }; MAX_CPUS],
+            cpus: crate::smp::CpuTable::new(),
             ncpu: Cell::new(1),
             global: Cell::new(false),
             structure: crate::lock::Lock::new(),
@@ -271,6 +271,7 @@ impl<H: Hal> Kernel<H> {
             // Only this processor's scheduling state.
             Syscall::Yield => {
                 me.resched.set(true);
+                me.yielded.set(true);
                 me.dirty.set(true);
                 r[H::SYS].set(0);
             }
@@ -361,13 +362,14 @@ impl<H: Hal> Kernel<H> {
                     && self.thread(caller).state.get() == RUNNABLE
                     && self.thread(caller).cpu.get() as usize == self.hal.cpu()
                 {
-                    self.q_remove(&me.rq_head, &me.rq_tail, caller);
+                    self.dequeue(me, caller);
                     self.hand_off(caller);
                 }
                 r
             }
             Syscall::Yield => {
                 self.me().resched.set(true);
+                self.me().yielded.set(true);
                 self.me().dirty.set(true);
                 Ok(Exit::Done)
             }
@@ -445,8 +447,8 @@ impl<H: Hal> Kernel<H> {
                 // The thread may be running on another processor with the
                 // CapSpace and address space it is about to lose.
                 let home = self.thread(th.obj).cpu.get() as usize;
-                self.cpus[home].dirty.set(true);
-                if home != self.hal.cpu() && self.cpus[home].cur.get() == th.obj {
+                self.cpus.get(home).dirty.set(true);
+                if home != self.hal.cpu() && self.cpus.get(home).cur.get() == th.obj {
                     self.hal.kick(home, true);
                 }
                 let slots = Thread::embedded_slots(th.obj);
@@ -505,24 +507,29 @@ impl<H: Hal> Kernel<H> {
                         Ok(Exit::Done)
                     }
                     2 => {
-                        // Move the thread to processor `a2`. It is stopped
-                        // first and stays stopped.
+                        // Move the thread to processor `a2`, doing what it
+                        // was doing. A deadline reservation is on one
+                        // processor: unbind it first.
                         if a[2] >= self.ncpu.get() as u64 {
                             return Err(Error::BadArg);
+                        }
+                        if self.dl_of(th.obj).is_some() {
+                            return Err(Error::InUse);
                         }
                         if th.obj == t {
                             self.thread(t).regs[H::SYS].set(0);
                         }
-                        self.cancel(th.obj, true);
-                        let old = self.home(th.obj);
-                        if old.loaded.get() == th.obj {
-                            old.loaded.set(0);
-                        }
-                        if old.cur.get() == th.obj {
-                            old.cur.set(0);
-                        }
-                        self.thread(th.obj).cpu.set(a[2]);
+                        self.move_thread(th.obj, a[2] as usize);
                         Ok(if th.obj == t { Exit::Blocked } else { Exit::Done })
+                    }
+                    3 => {
+                        let s = if a[2] == 0 { 0 } else { self.ccap(t, a[2], ObjectType::SchedContext, Rights::READ)?.1.obj };
+                        self.sched_bind(th.obj, s)?;
+                        let home = self.thread(th.obj).cpu.get() as usize;
+                        if home != self.hal.cpu() && self.cpus.get(home).cur.get() == th.obj {
+                            self.hal.kick(home, false);
+                        }
+                        Ok(Exit::Done)
                     }
                     _ => Err(Error::BadArg),
                 }
@@ -593,11 +600,31 @@ impl<H: Hal> Kernel<H> {
                         }
                     }
                     ObjectType::Thread if a[1] == 0 && a[2] == 0 => thread(cap.obj),
+                    ObjectType::SchedContext => {
+                        let sc = self.sched(cap.obj);
+                        let deadline = sc.class.get() == silica_abi::SCHED_DEADLINE;
+                        let size = if deadline { sc.budget.get() } else { sc.weight.get() };
+                        let cpu = sc.cpu.get().saturating_sub(1);
+                        [sc.class.get(), size, sc.period.get(), sc.remaining.get(), sc.consumed.get(), cpu]
+                    }
                     ObjectType::CapSpace | ObjectType::Thread => return Err(Error::BadArg),
                     _ => return Err(Error::WrongType),
                 };
                 for (i, v) in out.iter().enumerate() {
                     r[H::ARG[i]].set(*v);
+                }
+                Ok(Exit::Done)
+            }
+            Syscall::SchedConfigure => {
+                let (_, sc) = self.ccap(t, a[0], ObjectType::SchedContext, Rights::WRITE)?;
+                self.sched_configure(sc.obj, a[1], a[2], a[3], a[4])?;
+                // Its threads' processors look at their queues again.
+                let mut b = self.sched(sc.obj).threads.get();
+                while b != 0 {
+                    let home = self.thread(b).cpu.get() as usize;
+                    self.cpus.get(home).dirty.set(true);
+                    self.cpus.get(home).resched.set(true);
+                    b = self.thread(b).sc_next.get();
                 }
                 Ok(Exit::Done)
             }
@@ -754,11 +781,49 @@ impl<H: Hal> Kernel<H> {
         }
     }
 
+    /// Whether every processor's run queues are well formed: linked both
+    /// ways, ending, holding only runnable threads of that processor that
+    /// are not running, the fair queue in order of virtual runtime and the
+    /// deadline queue only threads bound to deadline contexts. For tests and
+    /// fuzzing.
+    pub fn check_runqueues(&self) -> Result<(), &'static str> {
+        for (i, cpu) in self.cpus.iter(self.ncpu.get()).enumerate() {
+            for (head, tail, dl) in [(&cpu.rq_head, &cpu.rq_tail, false), (&cpu.dl_head, &cpu.dl_tail, true)] {
+                let (mut t, mut prev, mut last, mut n) = (head.get(), 0, 0, 0usize);
+                while t != 0 {
+                    let th = self.thread(t);
+                    if th.qprev.get() != prev {
+                        return Err("a run queue's back link is wrong");
+                    }
+                    if th.cpu.get() as usize != i || th.state.get() != RUNNABLE || t == cpu.cur.get() {
+                        return Err("a run queue holds a thread that is not a waiting runnable thread of its processor");
+                    }
+                    if self.dl_of(t).is_some() != dl {
+                        return Err("a thread is on the run queue of the wrong class");
+                    }
+                    if !dl && th.vr.get() < last {
+                        return Err("the fair run queue is out of order");
+                    }
+                    last = th.vr.get();
+                    n += 1;
+                    if n > 1 << 20 {
+                        return Err("a run queue does not end");
+                    }
+                    (prev, t) = (t, th.qnext.get());
+                }
+                if tail.get() != prev {
+                    return Err("a run queue's tail is wrong");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Whether every processor's timer list is well formed: linked both
     /// ways, in deadline order, ending, and holding only threads of that
     /// processor that have a deadline. For tests and fuzzing.
     pub fn check_timers(&self) -> Result<(), &'static str> {
-        for (i, cpu) in self.cpus.iter().enumerate().take(self.ncpu.get()) {
+        for (i, cpu) in self.cpus.iter(self.ncpu.get()).enumerate() {
             let (mut t, mut prev, mut last, mut n) = (cpu.timers.get(), 0, 0, 0usize);
             while t != 0 {
                 let th = self.thread(t);
@@ -836,6 +901,10 @@ impl<H: Hal> Kernel<H> {
     pub fn can_run(&self) -> bool {
         let me = self.me();
         let c = me.cur.get();
-        (c != 0 && self.thread(c).state.get() == RUNNABLE) || me.rq_head.get() != 0 || me.direct.get() != 0 || me.timers.get() != 0
+        (c != 0 && self.thread(c).state.get() == RUNNABLE)
+            || me.rq_head.get() != 0
+            || me.dl_head.get() != 0
+            || me.direct.get() != 0
+            || me.timers.get() != 0
     }
 }

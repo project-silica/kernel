@@ -57,6 +57,7 @@ impl Hal for TestHal {
     const FLAGS: usize = 2;
     const SYS: usize = 3;
     const ARG: [usize; 6] = [4, 5, 6, 7, 8, 9];
+    const BY_SYSCALL: usize = 10;
     const FLAGS_INIT: u64 = 0x202;
     const SYSCALL_LEN: u64 = 2;
     const USER_TOP: u64 = 0x7FFF_FFFF_F000;
@@ -392,6 +393,7 @@ impl Machine {
         loop {
             r[TestHal::IP].set(0x40_0002);
             r[TestHal::SYS].set(n);
+            r[TestHal::BY_SYSCALL].set(1);
             for i in 0..6 {
                 r[TestHal::ARG[i]].set(a[i]);
             }
@@ -405,6 +407,9 @@ impl Machine {
                 break;
             }
         }
+        // Back in user mode: a later look at this thread (here, as on a
+        // machine, through an interrupt) finds a frame no system call saved.
+        r[TestHal::BY_SYSCALL].set(0);
         let out = SysResult { thread: t, status: r[TestHal::SYS].get(), blocked: self.k.thread_view(t).state != 1 };
         if self.k.can_run() {
             self.k.enter();

@@ -134,6 +134,7 @@ impl Hal for X86 {
     const SP: usize = REG_RSP;
     const FLAGS: usize = REG_RFLAGS;
     const SYS: usize = REG_RAX;
+    const BY_SYSCALL: usize = REG_BY_SYSCALL;
     const ARG: [usize; 6] = [REG_RDI, REG_RSI, REG_RDX, REG_R10, REG_R8, REG_R9];
     const FLAGS_INIT: u64 = 0x202;
     const SYSCALL_LEN: u64 = 2;
@@ -322,8 +323,15 @@ impl Hal for X86 {
             // 0 disarms the timer, so a deadline at tick 0 is moved to tick 1.
             (self.tsc0.get() as u128 + ticks).clamp(1, u64::MAX as u128 - 1) as u64
         };
-        percpu().deadline.set(tsc);
         let per_ns = self.apic_per_ns.get();
+        // Writing the timer leaves a virtual machine; writing what it holds
+        // already (above all: disarming a timer that has fired, on every
+        // way into idle) is skipped. The deadline is forgotten when the
+        // timer fires (`irq`), as the hardware disarms itself then.
+        if per_ns == 0 && percpu().deadline.replace(tsc) == tsc {
+            return;
+        }
+        percpu().deadline.set(tsc);
         // SAFETY: the timer MSRs exist (x2APIC and, for the first branch,
         // TSC-deadline were checked at boot). A zero count or deadline disarms.
         unsafe {
@@ -387,6 +395,16 @@ impl Hal for X86 {
             }
         }
         me.mode.enter_kernel();
+    }
+
+    fn cpu_slot(&self) -> usize {
+        let s: usize;
+        // SAFETY: reads this processor's slot from its `PerCpu`; it never
+        // changes, so the read is pure.
+        unsafe {
+            asm!("mov {}, gs:[{off}]", out(reg) s, off = const core::mem::offset_of!(cpu::PerCpu, slot), options(nostack, pure, readonly, preserves_flags))
+        }
+        s
     }
 
     fn cpu(&self) -> usize {
@@ -566,8 +584,12 @@ fn canonical(v: u64) -> u64 {
 pub fn irq(vector: u64, locked: bool) {
     let k = kernel();
     match vector {
-        TIMER_VECTOR if locked => k.on_timer(),
-        TIMER_VECTOR | KICK_VECTOR => {}
+        TIMER_VECTOR if locked => {
+            percpu().deadline.set(u64::MAX);
+            k.on_timer()
+        }
+        TIMER_VECTOR => percpu().deadline.set(u64::MAX),
+        KICK_VECTOR => {}
         SPURIOUS_VECTOR => return,
         v if (ioapic::FIRST_VECTOR..ioapic::FIRST_VECTOR + silica_abi::IRQ_LINES).contains(&v) => {
             let line = (v - ioapic::FIRST_VECTOR) as usize;

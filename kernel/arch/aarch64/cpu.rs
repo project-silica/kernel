@@ -208,6 +208,17 @@ user_entry:
     mrs x2, spsr_el1
     mrs x3, tpidr_el0
     stp x2, x3, [x0, #264]
+    // Whether a system call saved this frame (an SVC: synchronous, class
+    // 0x15), marked before this processor says it is in the kernel: another
+    // one holding its lock reads the frame only after that, and restarts a
+    // system call that had not yet taken effect.
+    mov x2, #0
+    cbnz x1, 1f
+    mrs x3, esr_el1
+    lsr x3, x3, #26
+    cmp x3, #0x15
+    cset x2, eq
+1:  str x2, [x0, #{by_svc}]
     mov x29, #0
     mov x30, #0
     mov x0, x1
@@ -307,6 +318,7 @@ kernel_irq:
     isb
 "#,
     user_trap = sym super::user_trap,
+    by_svc = const REG_BY_SVC * 8,
     schedule = sym super::schedule_rust,
     fault = sym super::kernel_fault,
     irq_idle = sym super::irq_idle,

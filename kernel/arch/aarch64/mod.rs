@@ -505,6 +505,7 @@ impl Hal for Arm {
     const SP: usize = cpu::REG_SP;
     const FLAGS: usize = cpu::REG_SPSR;
     const SYS: usize = 8;
+    const BY_SYSCALL: usize = cpu::REG_BY_SVC;
     const ARG: [usize; 6] = [0, 1, 2, 3, 4, 5];
     /// EL0, interrupts unmasked.
     const FLAGS_INIT: u64 = 0;
@@ -711,20 +712,11 @@ impl Hal for Arm {
 /// An exception from EL0: `kind` 0 synchronous (SVC or a fault), 1 interrupt.
 extern "C" fn user_trap(kind: u64) {
     let k = kernel();
+    // The entry stub has saved the frame and marked whether a system call
+    // saved it (REG_BY_SVC).
     percpu().mode.enter_kernel();
     k.enter();
-    // While this processor waited for its lock, another one may have
-    // destroyed the thread it was running (that is what a kick waits for):
-    // then there is no frame to mark, and `syscall` and `fault` see that
-    // the thread is gone.
-    let cur = k.current();
-    let by_svc = |v: u64| {
-        if cur != 0 {
-            k.regs(cur)[cpu::REG_BY_SVC].set(v);
-        }
-    };
     if kind != 0 {
-        by_svc(0);
         irq(true);
         return;
     }
@@ -733,11 +725,9 @@ extern "C" fn user_trap(kind: u64) {
     unsafe { asm!("mrs {}, esr_el1", "mrs {}, far_el1", out(reg) esr, out(reg) far, options(nomem, nostack, preserves_flags)) }
     let class = esr >> 26 & 0x3F;
     if class == 0x15 {
-        by_svc(1);
         k.syscall();
         return;
     }
-    by_svc(0);
     match class {
         // Instruction abort (0x20) or data abort (0x24) from EL0. Fault
         // status 0x0C-0x0F is a permission fault: something is mapped.

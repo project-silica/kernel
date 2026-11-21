@@ -28,6 +28,7 @@ pub mod mem;
 #[cfg(kani)]
 mod proofs;
 pub mod root;
+pub mod sched;
 pub mod smp;
 pub mod thread;
 pub mod untyped;

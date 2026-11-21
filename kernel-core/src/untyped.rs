@@ -79,6 +79,7 @@ impl<H: Hal> Kernel<H> {
                     // A thread starts on the processor that made it.
                     self.thread(obj).cpu.set(self.hal.cpu() as u64);
                 }
+                ObjectType::SchedContext => self.init_sched(obj),
                 ObjectType::AddressSpace => {
                     self.phys.obj::<AsHeader>(obj).bits.set(obits);
                     self.hal.init_root(&self.phys, obj + (1 << PAGE_BITS));

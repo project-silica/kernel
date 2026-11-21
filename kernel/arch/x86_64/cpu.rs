@@ -53,6 +53,8 @@ pub struct PerCpu {
     /// How long this processor takes to come out of an idle wait once its
     /// timer fires, in nanoseconds (a running average; see `X86::idle`).
     pub wake_ns: Cell<u64>,
+    /// `kernel_core::smp::cpu_slot(index)`, for `Hal::cpu_slot`.
+    pub slot: usize,
     /// The address of this processor's kernel lock (`Kernel::cpu_lock`),
     /// which the system-call entry takes before it saves anything.
     pub lock: u64,
@@ -111,6 +113,7 @@ impl Tables {
                 pcid_gen: Cell::new(0),
                 pcid_next: Cell::new(1),
                 wake_ns: Cell::new(0),
+                slot: 0,
                 lock: 0,
             },
         }
@@ -273,6 +276,7 @@ pub unsafe fn init(t: *mut Tables, index: usize, apic_id: u32, stack: (u64, u64)
         (*t).percpu.stack = stack;
         (*t).percpu.this = &raw const (*t).percpu as u64;
         (*t).percpu.index = index;
+        (*t).percpu.slot = kernel_core::smp::cpu_slot(index);
         (*t).percpu.lock = super::kernel().cpu_lock(index) as *const kernel_core::lock::Lock as u64;
         (*t).percpu.apic_id = apic_id;
         CPUS[index].store(t, Ordering::Release);

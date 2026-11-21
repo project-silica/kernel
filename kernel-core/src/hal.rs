@@ -20,6 +20,12 @@ pub trait Hal {
     const SYS: usize;
     /// Frame indices of the six syscall argument registers.
     const ARG: [usize; 6];
+    /// Frame index of a word that is not 0 when a system call saved the
+    /// frame (an interrupt or a fault saved it otherwise). The entry marks
+    /// it before the processor says it is in the kernel, so another
+    /// processor holding this one's lock, and finding its thread in the
+    /// kernel, knows whether it is waiting to make a system call.
+    const BY_SYSCALL: usize;
     /// Flags a new user thread starts with.
     const FLAGS_INIT: u64;
     /// Length of the syscall instruction, to restart a preempted syscall.
@@ -59,6 +65,11 @@ pub trait Hal {
 
     /// Index of the processor running this code.
     fn cpu(&self) -> usize;
+    /// [`crate::smp::cpu_slot`] of that index, which an architecture keeps
+    /// beside it: finding this processor's state is then one load.
+    fn cpu_slot(&self) -> usize {
+        crate::smp::cpu_slot(self.cpu())
+    }
     /// Interrupt processor `cpu` so that it enters the kernel. With `wait`,
     /// return only when it is no longer running user code: it is in the
     /// kernel, has saved its thread's registers, and will take its lock

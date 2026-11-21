@@ -77,7 +77,12 @@ pub enum Syscall {
     /// first argument, `a4` not 0: make the thread runnable.
     ThreadStart = 13,
     /// `a0` thread, `a1` 0 suspend, 1 resume, 2 move to processor `a2`
-    /// (the thread is suspended first and stays suspended).
+    /// (it carries on there with what it was doing: a call waiting for its
+    /// reply is answered there, a send or receive not yet delivered is made
+    /// again there, a suspended thread stays suspended; `InUse` while it is
+    /// bound to a deadline context), 3 bind it to the SchedContext `a2`
+    /// (read; 0: unbind, back to the default fair share; a deadline context
+    /// must be on the thread's processor).
     ThreadControl = 14,
     /// `a0` port capability, `a1` port, `a2` width in bytes (1, 2, 4) with
     /// bit 8 set for a write, `a3` value. Returns `a0` value read.
@@ -99,6 +104,9 @@ pub enum Syscall {
     /// `a0` a Thread and `a1` 0: returns `a0` state (the `THREAD_` values),
     /// `a1` processor, `a2` instruction pointer, `a3` stack pointer, `a4`
     /// the identity of what it waits on.
+    /// `a0` a SchedContext: returns `a0` class, `a1` weight (fair) or
+    /// budget (deadline), `a2` period, `a3` budget left this period, `a4`
+    /// nanoseconds charged to it so far, `a5` processor (deadline).
     /// `a0` a CapSpace, `a1` a slot index and `a2` 1: the same about the
     /// thread in that slot (`WrongType` if it holds something else), so a
     /// holder of a CapSpace sees every thread it holds without copying.
@@ -118,6 +126,17 @@ pub enum Syscall {
     /// Returns `Unsupported` where the machine cannot be turned off yet
     /// (x86_64 outside a harness: that needs ACPI, M3).
     PowerOff = 20,
+    /// `a0` SchedContext (write), `a1` class. [`SCHED_FAIR`]: `a2` weight
+    /// (1 to [`SCHED_MAX_WEIGHT`]; a thread with none weighs
+    /// [`SCHED_DEFAULT_WEIGHT`]): bound threads share the processor in
+    /// proportion to their weights. [`SCHED_DEADLINE`]: `a2` budget and `a3`
+    /// period in nanoseconds, `a4` processor: bound threads run before any
+    /// fair work, earliest deadline first, for `a2` of every `a3`, and are
+    /// held back once it is spent until the next period. `Overload` when the
+    /// processor's reservations would take more than 90% of it. `InUse` to
+    /// change the class, or a deadline context's processor, while threads
+    /// are bound to it.
+    SchedConfigure = 21,
 }
 
 impl Syscall {
@@ -148,6 +167,7 @@ impl Syscall {
             18 => Syscall::Inspect,
             19 => Syscall::Console,
             20 => Syscall::PowerOff,
+            21 => Syscall::SchedConfigure,
             _ => return None,
         })
     }
@@ -194,7 +214,8 @@ pub enum ObjectType {
     Endpoint = 6,
     /// Asynchronous signal word; also carries interrupts.
     Notification = 7,
-    /// Processor time budget.
+    /// Processor time: a weighted fair share or a deadline reservation,
+    /// which threads bound to it run on (`SchedConfigure`, `ThreadControl`).
     SchedContext = 8,
     /// A range of hardware resources that are not memory: I/O ports or
     /// interrupt lines. Created at boot, narrowed by `CapCopy`.
@@ -215,7 +236,8 @@ impl ObjectType {
             Self::AddressSpace if (ASPACE_MIN_BITS as u64..=30).contains(&bits) => Ok(bits as u8),
             Self::Thread => Ok(THREAD_BITS),
             Self::Endpoint | Self::Notification => Ok(ENDPOINT_BITS),
-            Self::SchedContext | Self::Vcpu => Err(Error::Unsupported),
+            Self::SchedContext => Ok(SCHED_BITS),
+            Self::Vcpu => Err(Error::Unsupported),
             _ => Err(Error::BadArg),
         }
     }
@@ -249,6 +271,16 @@ pub const SLOT_BITS: u8 = 6;
 pub const THREAD_BITS: u8 = 12;
 /// Size of an Endpoint or Notification in bits.
 pub const ENDPOINT_BITS: u8 = 6;
+/// Size in bits of a SchedContext object.
+pub const SCHED_BITS: u8 = 7;
+/// `SchedConfigure` class: weighted fair share.
+pub const SCHED_FAIR: u64 = 0;
+/// `SchedConfigure` class: a deadline reservation.
+pub const SCHED_DEADLINE: u64 = 1;
+/// The weight of a thread with no scheduling context, and of a new one.
+pub const SCHED_DEFAULT_WEIGHT: u64 = 1024;
+/// The largest weight.
+pub const SCHED_MAX_WEIGHT: u64 = 1 << 20;
 /// Smallest AddressSpace: a header page and the root table. Each further
 /// page is one page table.
 pub const ASPACE_MIN_BITS: u8 = 13;
@@ -321,6 +353,9 @@ pub enum Error {
     Unsupported = 15,
     /// The capability has been derived through too many generations.
     TooDeep = 16,
+    /// The processor's time is already promised: a deadline reservation
+    /// would take more than the share deadline work may have.
+    Overload = 17,
 }
 
 impl Error {
@@ -343,6 +378,7 @@ impl Error {
             14 => Error::InUse,
             15 => Error::Unsupported,
             16 => Error::TooDeep,
+            17 => Error::Overload,
             _ => Error::BadSyscall,
         })
     }

@@ -24,7 +24,8 @@ pub use silica_abi::Syscall;
 pub use silica_abi::root;
 pub use silica_abi::{
     Error, FAULT_FETCH, FAULT_LABEL, FAULT_MAP, FAULT_PRESENT, FAULT_RESUME, FAULT_WRITE, Fault, IRQ_ACTIVE_LOW, IRQ_LEVEL, KEEP, MsgInfo,
-    ObjectType, Rights, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
+    ObjectType, Rights, SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING,
+    THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
 };
 
 /// Platform API level (`spec/CI_RELEASE.md` section 7).
@@ -257,8 +258,12 @@ pub fn thread_suspend(thread: Cap) -> Result<()> {
     sys(Syscall::ThreadControl, [thread.0, 0, 0, 0, 0, 0]).map(|_| ())
 }
 
-/// Move a thread to processor `cpu` (an index below `RootInfo::cpus`). The
-/// thread is suspended first and stays suspended; resume it to run there.
+/// Move a thread to processor `cpu` (an index below `RootInfo::cpus`). It
+/// carries on there with what it was doing, so moving threads to balance
+/// load is invisible to them: a call waiting for its reply is answered
+/// there, a send or receive not yet delivered is made again there, and a
+/// suspended thread stays suspended. A thread may move itself. `InUse`
+/// while it is bound to a deadline context (which belongs to one processor).
 pub fn thread_set_cpu(thread: Cap, cpu: usize) -> Result<()> {
     sys(Syscall::ThreadControl, [thread.0, 2, cpu as u64, 0, 0, 0]).map(|_| ())
 }
@@ -368,6 +373,50 @@ pub struct ThreadInfo {
 pub fn inspect_thread(thread: Cap) -> Result<ThreadInfo> {
     let r = sys(Syscall::Inspect, [thread.0, 0, 0, 0, 0, 0])?;
     Ok(ThreadInfo { state: r[0], cpu: r[1] as usize, ip: r[2], sp: r[3], waits_on: r[4] })
+}
+
+/// Make `sc` a weighted fair share: threads bound to it share their
+/// processor with others in proportion to `weight` (an unbound thread
+/// weighs [`SCHED_DEFAULT_WEIGHT`]).
+pub fn sched_fair(sc: Cap, weight: u64) -> Result<()> {
+    sys(Syscall::SchedConfigure, [sc.0, SCHED_FAIR, weight, 0, 0, 0]).map(|_| ())
+}
+
+/// Make `sc` a reservation of `budget` nanoseconds in every `period` on
+/// processor `cpu`: threads bound to it run first while it lasts, and wait
+/// for the next period once it is spent. `Overload` when the processor's
+/// reservations would take more than 90% of it.
+pub fn sched_deadline(sc: Cap, budget: u64, period: u64, cpu: usize) -> Result<()> {
+    sys(Syscall::SchedConfigure, [sc.0, SCHED_DEADLINE, budget, period, cpu as u64, 0]).map(|_| ())
+}
+
+/// Run `thread` on the scheduling context `sc` (`Cap::NONE`: the default
+/// fair share). A deadline context must be on the thread's processor.
+pub fn thread_bind(thread: Cap, sc: Cap) -> Result<()> {
+    sys(Syscall::ThreadControl, [thread.0, 3, sc.0, 0, 0, 0]).map(|_| ())
+}
+
+/// A scheduling context, as [`inspect_sched`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchedInfo {
+    /// [`SCHED_FAIR`] or [`SCHED_DEADLINE`].
+    pub class: u64,
+    /// Fair: the weight. Deadline: the budget in nanoseconds.
+    pub weight_or_budget: u64,
+    /// Deadline: the period in nanoseconds.
+    pub period: u64,
+    /// Deadline: what is left of this period's budget.
+    pub remaining: u64,
+    /// Nanoseconds charged to it so far.
+    pub consumed: u64,
+    /// Deadline: its processor.
+    pub cpu: usize,
+}
+
+/// What the scheduling context `sc` is and has used.
+pub fn inspect_sched(sc: Cap) -> Result<SchedInfo> {
+    let r = sys(Syscall::Inspect, [sc.0, 0, 0, 0, 0, 0])?;
+    Ok(SchedInfo { class: r[0], weight_or_budget: r[1], period: r[2], remaining: r[3], consumed: r[4], cpu: r[5] as usize })
 }
 
 /// The thread whose capability is in slot `index` of the CapSpace `space`

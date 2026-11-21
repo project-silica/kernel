@@ -1480,7 +1480,142 @@ fn t_console() -> T {
     Ok(())
 }
 
+/// Spinner state for `t_sched`: 0 wait, 1 count, 2 stop and report.
+static SPIN: AtomicU64 = AtomicU64::new(0);
+static SPUN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// How late `sched_sleeper`'s 1 ms sleeps woke, at most, in nanoseconds (+1 when done).
+static WORST_WAKE: AtomicU64 = AtomicU64::new(0);
+
+/// Count as fast as possible until told to stop: CPU time, measured.
+extern "C" fn sched_spinner(arg: u64) -> ! {
+    let i = (arg & 7) as usize;
+    while SPIN.load(SeqCst) == 0 {
+        core::hint::spin_loop();
+    }
+    let mut n = 0u64;
+    while SPIN.load(SeqCst) == 1 {
+        n += 1;
+        if n % 4096 == 0 {
+            SPUN[i].store(n, SeqCst);
+        }
+    }
+    SPUN[i].store(n, SeqCst);
+    finish(arg)
+}
+
+/// Sleep 1 ms at a time, 200 times, and record the latest wake. The first
+/// ten are not counted: a thread started beside the busy ones is their
+/// equal until it has slept, and may wait one turn; what is measured is a
+/// thread that mostly sleeps.
+extern "C" fn sched_sleeper(arg: u64) -> ! {
+    let n = new(ObjectType::Notification, 0);
+    let mut worst = 0;
+    for i in 0..200 {
+        let at = CLOCK.now() + 1_000_000;
+        let _ = recv(n, Wait::Until(at));
+        if i >= 10 {
+            worst = worst.max(CLOCK.now().saturating_sub(at));
+        }
+    }
+    WORST_WAKE.store(worst + 1, SeqCst);
+    finish(arg)
+}
+
+/// Run `spinners` (index, scheduling context or Cap::NONE) on processor
+/// `cpu` for `ms` and return what each counted.
+fn spin_on(cpu: usize, spinners: &[(usize, Cap)], ms: u64) -> core::result::Result<[u64; 8], &'static str> {
+    SPIN.store(0, SeqCst);
+    let mut threads = [Cap::NONE; 8];
+    for &(i, sc) in spinners {
+        SPUN[i].store(0, SeqCst);
+        let (t, _) = spawn_on(cpu, sched_spinner, i as u64, Cap::NONE);
+        if sc != Cap::NONE {
+            thread_bind(t, sc).map_err(|_| "cannot bind a thread to a scheduling context")?;
+        }
+        threads[i] = t;
+    }
+    SPIN.store(1, SeqCst);
+    sleep_ms(ms);
+    SPIN.store(2, SeqCst);
+    sleep_ms(20);
+    let mut out = [0u64; 8];
+    for &(i, _) in spinners {
+        out[i] = SPUN[i].load(SeqCst);
+        // SAFETY: the test's own thread, stopped or about to be.
+        let _ = unsafe { cap_delete(threads[i]) };
+    }
+    Ok(out)
+}
+
+/// The scheduler on real time: weights, a deadline reservation, wake-up
+/// latency beside busy threads, admission control.
+fn t_sched() -> T {
+    // A processor of its own where there is one; on one processor the
+    // main thread sleeps while the others run.
+    let cpus = CPUS.load(SeqCst) as usize;
+    let cpu = cpus - 1;
+    // 1. Weights 1024 and 3072 share the processor about 1:3.
+    let heavy = new(ObjectType::SchedContext, 0);
+    sched_fair(heavy, 3072).map_err(|_| "cannot configure a fair context")?;
+    let c = spin_on(cpu, &[(0, Cap::NONE), (1, heavy)], 300)?;
+    let ratio = c[1] as f64 / c[0].max(1) as f64;
+    println!("sched: weights 1024 and 3072 counted {} and {} (ratio {:.2})", c[0], c[1], ratio);
+    if !(2.5..=3.5).contains(&ratio) {
+        return Err("weights 1024 and 3072 did not share the processor about 1:3");
+    }
+    // 2. A 2 ms in 10 ms reservation beside three fair spinners gets a fifth.
+    let dl = new(ObjectType::SchedContext, 0);
+    sched_deadline(dl, 2_000_000, 10_000_000, cpu).map_err(|_| "cannot reserve 20% of a processor")?;
+    let c = spin_on(cpu, &[(0, Cap::NONE), (1, Cap::NONE), (2, Cap::NONE), (3, dl)], 400)?;
+    let total: u64 = c[..4].iter().sum();
+    let share = c[3] as f64 / total.max(1) as f64;
+    println!("sched: a 2 ms in 10 ms reservation beside three fair spinners got {:.1}%", share * 100.0);
+    if !(0.17..=0.23).contains(&share) {
+        return Err("a 20% deadline reservation did not get about 20% beside fair spinners");
+    }
+    if inspect_sched(dl).map(|i| i.consumed).unwrap_or(0) < 60_000_000 {
+        return Err("the reservation's context was not charged for the time its thread ran");
+    }
+    // 3. More than 90% of a processor is not promised.
+    let more = new(ObjectType::SchedContext, 0);
+    if sched_deadline(more, 8_000_000, 10_000_000, cpu) != Err(Error::Overload) {
+        return Err("a reservation that would take the processor past 90% was accepted");
+    }
+    // SAFETY: nothing is bound to them any more.
+    unsafe {
+        let _ = cap_delete(dl);
+        let _ = cap_delete(heavy);
+    }
+    sched_deadline(more, 8_000_000, 10_000_000, cpu).map_err(|_| "a reservation's share was not given back when it was destroyed")?;
+    // SAFETY: nothing is bound to it.
+    let _ = unsafe { cap_delete(more) };
+    // 4. A thread waking from 1 ms sleeps beside two spinners runs promptly.
+    WORST_WAKE.store(0, SeqCst);
+    SPIN.store(0, SeqCst);
+    let (sleeper, _) = spawn_on(cpu, sched_sleeper, 7, Cap::NONE);
+    let c = spin_on(cpu, &[(0, Cap::NONE), (1, Cap::NONE)], 300);
+    for _ in 0..200 {
+        if WORST_WAKE.load(SeqCst) != 0 {
+            break;
+        }
+        sleep_ms(5);
+    }
+    // SAFETY: the sleeper is finished.
+    let _ = unsafe { cap_delete(sleeper) };
+    c?;
+    let worst = WORST_WAKE.load(SeqCst);
+    println!("sched: beside two spinners, 1 ms sleeps woke at most {} us late", worst.saturating_sub(1) / 1000);
+    if worst == 0 {
+        return Err("the sleeping thread never finished beside the spinners");
+    }
+    if worst - 1 > 2_000_000 {
+        return Err("a waking thread waited behind busy ones for more than 2 ms");
+    }
+    Ok(())
+}
+
 const TESTS: &[(&str, fn() -> T)] = &[
+    ("sched", t_sched),
     ("console", t_console),
     ("syscall", t_syscall),
     ("fault_page", t_fault_page),
@@ -1548,8 +1683,10 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
             b"ctx" => bench_ctx_switch,
             b"fault" => bench_page_fault,
             b"timer" => bench_timer,
+            b"pairs8" => || println!("BENCH ipc_pairs8 {} ops/s", bench_pairs(8, false)),
+            b"cross1" => || println!("BENCH ipc_cross_pairs1 {} ops/s", bench_pairs(1, true)),
             _ => {
-                println!("ERROR: roottest: no benchmark of that name (null, ipc, ctx, fault, timer)");
+                println!("ERROR: roottest: no benchmark of that name (null, ipc, ctx, fault, timer, pairs8, cross1)");
                 exit(false)
             }
         };

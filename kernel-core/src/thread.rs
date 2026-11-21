@@ -14,12 +14,10 @@ use crate::mem::{KObj, Paddr};
 use crate::smp::Cpu;
 use core::cell::Cell;
 use core::mem::offset_of;
-use silica_abi::Error;
+use silica_abi::{Error, Syscall};
 
 /// Offset of the extended-state (FPU, SIMD) save area inside a Thread object.
 pub const FPU_OFFSET: usize = 1024;
-/// Time slice when more than one thread is runnable.
-pub const SLICE_NS: u64 = 10_000_000;
 
 /// Not runnable: new, suspended, or faulted with nobody to tell.
 pub const INACTIVE: u64 = 0;
@@ -77,6 +75,13 @@ pub struct Thread {
     pub(crate) via_slot: Cell<Paddr>,
     /// While receiving: the slot of a notification to park the next call on.
     pub(crate) park: Cell<u64>,
+    /// The scheduling context it is bound to (0: the default fair share),
+    /// and its links in that context's list of threads.
+    pub(crate) sc: Cell<Paddr>,
+    pub(crate) sc_next: Cell<Paddr>,
+    pub(crate) sc_prev: Cell<Paddr>,
+    /// Fair class: virtual runtime (`sched.rs`).
+    pub(crate) vr: Cell<u64>,
 }
 impl KObj for Thread {}
 const _: () = assert!(core::mem::size_of::<Thread>() <= FPU_OFFSET);
@@ -125,7 +130,7 @@ impl<H: Hal> Kernel<H> {
     }
     /// The processor thread `t` runs on.
     pub(crate) fn home(&self, t: Paddr) -> &Cpu {
-        &self.cpus[self.thread(t).cpu.get() as usize]
+        self.cpus.get(self.thread(t).cpu.get() as usize)
     }
 
     pub(crate) fn q_push(&self, head: &Cell<Paddr>, tail: &Cell<Paddr>, t: Paddr) {
@@ -229,7 +234,26 @@ impl<H: Hal> Kernel<H> {
         th.state.set(RUNNABLE);
         cpu.dirty.set(true);
         if t != cpu.cur.get() {
-            self.q_push(&cpu.rq_head, &cpu.rq_tail, t);
+            if self.dl_of(t).is_none() {
+                self.place(cpu, t);
+            }
+            // Whether it takes the processor is decided by that processor,
+            // with its own account charged there: a wake from elsewhere only
+            // marks it (charging from here would pull the other processor's
+            // running thread into this one's cache on every message).
+            let local = th.cpu.get() as usize == self.hal.cpu();
+            let preempts = local && self.preempts(cpu, t);
+            self.enqueue_at(cpu, t, preempts);
+            if preempts {
+                cpu.resched.set(true);
+            } else {
+                // When the running thread is next looked at depends on the
+                // queue's new head: work it out again on the way out.
+                cpu.preempt_at.set(u64::MAX);
+                if !local {
+                    cpu.woken.set(true);
+                }
+            }
         }
         let home = th.cpu.get() as usize;
         if home != self.hal.cpu() {
@@ -256,8 +280,18 @@ impl<H: Hal> Kernel<H> {
         self.timer_remove(t);
         let on = th.blocked_on.get();
         match th.state.get() {
-            RUNNABLE if t != cpu.cur.get() => self.q_remove(&cpu.rq_head, &cpu.rq_tail, t),
-            RUNNABLE if home != self.hal.cpu() => self.hal.kick(home, true),
+            RUNNABLE if t != cpu.cur.get() => self.dequeue(cpu, t),
+            RUNNABLE if home != self.hal.cpu() => {
+                self.hal.kick(home, true);
+                // Its processor is in the kernel now. If a system call took
+                // it there, that call has not taken effect (it waits for a
+                // lock this one holds) and is made again when the thread
+                // next runs; anything else saved the frame where the thread
+                // goes on from.
+                if th.regs[H::BY_SYSCALL].get() != 0 {
+                    th.regs[H::IP].set(th.regs[H::IP].get().wrapping_sub(H::SYSCALL_LEN));
+                }
+            }
             SENDING | RECEIVING => {
                 let q = self.queue(on);
                 self.q_remove(&q.head, &q.tail, t);
@@ -268,6 +302,14 @@ impl<H: Hal> Kernel<H> {
                     // The fault was never delivered; it recurs when the thread runs.
                 } else if restart {
                     th.regs[H::IP].set(th.regs[H::IP].get().wrapping_sub(H::SYSCALL_LEN));
+                    // A `ReplyRecv` waiting here has replied already: made
+                    // again, it must only receive (with no deadline and
+                    // nothing to park on, as its receive was).
+                    if th.regs[H::SYS].get() == Syscall::ReplyRecv as u64 {
+                        th.regs[H::SYS].set(Syscall::Recv as u64);
+                        th.regs[H::ARG[1]].set(0);
+                        th.regs[H::ARG[2]].set(0);
+                    }
                 }
             }
             REPLY => {
@@ -282,6 +324,46 @@ impl<H: Hal> Kernel<H> {
         th.blocked_on.set(0);
         th.state.set(INACTIVE);
         cpu.dirty.set(true);
+    }
+
+    /// Make processor `to` thread `t`'s home without changing what it does,
+    /// so that balancing (userspace policy) is invisible to the thread: a
+    /// runnable one runs there next; one waiting for a reply keeps waiting
+    /// and is answered there; one blocked in a send or receive (nothing
+    /// delivered yet) makes the same system call again there; an inactive
+    /// one stays inactive. The caller holds every lock.
+    pub(crate) fn move_thread(&self, t: Paddr, to: usize) {
+        let th = self.thread(t);
+        let from = th.cpu.get() as usize;
+        if from == to {
+            return;
+        }
+        let state = th.state.get();
+        let again = state != INACTIVE && state != REPLY;
+        if again {
+            // Off its run queue or wait queue (a running thread's processor
+            // is first brought into the kernel), with an undelivered system
+            // call set up to run again.
+            self.cancel(t, true);
+        }
+        let (old, new) = (self.cpus.get(from), self.cpus.get(to));
+        if old.account.get() == t {
+            self.charge(old, self.hal.now());
+            old.account.set(0);
+        }
+        for c in [&old.loaded, &old.cur, &old.direct] {
+            if c.get() == t {
+                c.set(0);
+            }
+        }
+        old.dirty.set(true);
+        // Its standing among the fair threads, carried over to the new
+        // processor's scale.
+        th.vr.set(th.vr.get().saturating_sub(old.min_vr.get()).saturating_add(new.min_vr.get()));
+        th.cpu.set(to as u64);
+        if again {
+            self.make_runnable(t);
+        }
     }
 
     /// Unlink `c`, whose call was delivered and is unanswered, from the
@@ -359,7 +441,11 @@ impl<H: Hal> Kernel<H> {
     pub(crate) fn finalise_thread(&self, t: Paddr) {
         self.cancel(t, false);
         self.drop_caller(t);
+        self.sched_unlink(t);
         let cpu = self.home(t);
+        if cpu.account.get() == t {
+            cpu.account.set(0);
+        }
         if cpu.loaded.get() == t {
             cpu.loaded.set(0);
         }
@@ -425,9 +511,8 @@ impl<H: Hal> Kernel<H> {
 
     /// Wake every thread of this processor whose deadline has passed and
     /// note the end of the slice.
-    fn expire(&self) {
+    fn expire(&self, now: u64) {
         let me = self.me();
-        let now = self.hal.now();
         let mut global = false;
         loop {
             let t = me.timers.get();
@@ -454,7 +539,7 @@ impl<H: Hal> Kernel<H> {
         if global {
             self.go_local();
         }
-        if now >= me.slice_end.get() {
+        if now >= me.preempt_at.get() {
             me.resched.set(true);
         }
     }
@@ -488,41 +573,85 @@ impl<H: Hal> Kernel<H> {
             return;
         }
         loop {
+            // The clock is read at most once per pass.
+            let mut clock = 0;
             if me.tick.replace(false) {
-                self.expire();
+                clock = self.hal.now();
+                self.expire(clock);
             }
             let cur = me.cur.get();
             let cur_ok = cur != 0 && self.thread(cur).state.get() == RUNNABLE;
+            // A thread another processor woke: does the first one waiting
+            // now come before the running one?
+            if me.woken.get() && cur_ok {
+                me.woken.set(false);
+                let first = if me.dl_head.get() != 0 { me.dl_head.get() } else { me.rq_head.get() };
+                if first != 0 && self.preempts(me, first) {
+                    me.resched.set(true);
+                }
+            }
             let direct = me.direct.replace(0);
             if direct != 0 {
-                // A hand-off continues the giver's time slice.
+                // A hand-off: whoever was paying for this processor's time
+                // still is (`sched.rs`), and no clock is read.
                 if cur_ok {
-                    self.q_push(&me.rq_head, &me.rq_tail, cur);
+                    self.enqueue(me, cur);
                 }
                 me.cur.set(direct);
                 break;
             }
-            if cur_ok && !(me.resched.get() && me.rq_head.get() != 0) {
-                break;
-            }
-            let next = self.q_pop(&me.rq_head, &me.rq_tail);
-            if next != 0 {
-                if cur_ok {
-                    self.q_push(&me.rq_head, &me.rq_tail, cur);
+            let others = me.rq_head.get() != 0 || me.dl_head.get() != 0;
+            if cur_ok && !me.resched.get() {
+                // Keep running; a queue that has just stopped being empty
+                // needs a time at which to look again.
+                if others && me.preempt_at.get() == u64::MAX {
+                    me.preempt_at.set(self.preempt_at(me, self.hal.now()));
                 }
-                me.cur.set(next);
-                me.slice_end.set(self.hal.now().saturating_add(SLICE_NS));
                 break;
             }
+            // Asked to look again (a yield, the timer, a waking thread):
+            // charge what ran. A thread alone keeps the processor unless its
+            // deadline budget is spent.
+            let now = if clock != 0 { clock } else { self.hal.now() };
+            self.charge(me, now);
+            if cur_ok && !others && !self.spent(me, now) {
+                me.yielded.set(false);
+                me.preempt_at.set(self.preempt_at(me, now));
+                break;
+            }
+            // Choose afresh: queue the running thread (behind its equals if
+            // it yielded) and pick.
+            if cur_ok {
+                let tail = me.rq_tail.get();
+                if me.yielded.replace(false) && tail != 0 && self.dl_of(cur).is_none() {
+                    // A yield: behind every fair thread waiting.
+                    let th = self.thread(cur);
+                    th.vr.set(th.vr.get().max(self.thread(tail).vr.get()));
+                    self.q_push(&me.rq_head, &me.rq_tail, cur);
+                } else {
+                    self.enqueue(me, cur);
+                }
+            }
+            let next = self.pick(me, now);
+            if next != 0 {
+                me.cur.set(next);
+                me.account.set(next);
+                me.preempt_at.set(self.preempt_at(me, now));
+                break;
+            }
+            me.account.set(0);
             // Nothing to run. The timer is set exactly (or switched off) so
             // an idle processor wakes only when there is something to do,
             // and the lock is released while it waits so other processors
             // can hand it work.
             me.cur.set(0);
+            // Wake for the next deadline, or for a spent deadline context's next period.
             let t = me.timers.get();
             let until = if t != 0 { self.thread(t).deadline.get() } else { u64::MAX };
+            let until = until.min(self.preempt_at(me, now));
+            me.preempt_at.set(u64::MAX);
             self.hal.idle_begin();
-            self.unlock(self.hal.cpu());
+            me.lock.unlock();
             self.hal.idle(until);
             self.enter();
             // The interrupt may have been the timer: look at deadlines, and
@@ -554,7 +683,7 @@ impl<H: Hal> Kernel<H> {
             && me.direct.get() == 0
             && me.loaded.get() == cur
             && me.loaded_root.get() == self.thread(cur).aspace.cap().map_or(0, |c| c.obj + 4096)
-            && (me.rq_head.get() == 0 || me.timer_at.get() <= me.slice_end.get())
+            && me.timer_at.get() <= me.preempt_at.get()
             && (me.timers.get() == 0 || me.timer_at.get() <= self.thread(me.timers.get()).deadline.get())
     }
 
@@ -567,8 +696,8 @@ impl<H: Hal> Kernel<H> {
         let me = self.me();
         let t = me.timers.get();
         let mut want = if t != 0 { self.thread(t).deadline.get() } else { u64::MAX };
-        if me.cur.get() != 0 && me.rq_head.get() != 0 {
-            want = want.min(me.slice_end.get());
+        if me.cur.get() != 0 {
+            want = want.min(me.preempt_at.get());
         }
         let armed = me.timer_at.get();
         if want < armed {

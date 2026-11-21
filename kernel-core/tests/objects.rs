@@ -76,7 +76,7 @@ fn retype_checks_and_untyped_balances() {
     let cs = SLOT_CAPSPACE;
     assert_eq!(m.err(S::Retype, [ut, 99, 0, cs, FREE, 1]), Error::BadArg);
     assert_eq!(m.err(S::Retype, [ut, T::Hw as u64, 0, cs, FREE, 1]), Error::BadArg);
-    assert_eq!(m.err(S::Retype, [ut, T::SchedContext as u64, 0, cs, FREE, 1]), Error::Unsupported);
+    assert_eq!(m.err(S::Retype, [ut, T::Vcpu as u64, 0, cs, FREE, 1]), Error::Unsupported);
     assert_eq!(m.err(S::Retype, [ut, T::Frame as u64, 11, cs, FREE, 1]), Error::BadArg);
     assert_eq!(m.err(S::Retype, [ut, T::Frame as u64, 12, cs, FREE, 0]), Error::BadArg);
     assert_eq!(m.err(S::Retype, [ut, T::Frame as u64, 12, cs, FREE, 257]), Error::BadArg);
@@ -631,14 +631,115 @@ fn two_processors() -> (Machine, u64) {
     m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 15, 77, 0]);
     let t = m.spawn(ut, FREE + 2);
     m.ok(S::ThreadControl, [FREE + 2, 2, 1, 0, 0, 0]);
-    assert_eq!(m.k.thread_view(t).state, INACTIVE, "a moved thread stays stopped");
-    m.ok(S::ThreadControl, [FREE + 2, 1, 0, 0, 0, 0]);
+    assert_eq!(m.k.thread_view(t).state, RUNNABLE, "a moved runnable thread stays runnable");
     assert_eq!(m.k.hal.kicks.borrow().last(), Some(&(1, false)), "the other processor is told it has work");
     m.settle(1);
     assert_eq!(m.k.current(), t, "the thread runs on processor 1");
     m.on(0);
     assert_eq!(m.k.current(), m.root);
     (m, t)
+}
+
+#[test]
+fn a_thread_moved_while_it_waits_for_a_reply_is_answered_on_its_new_processor() {
+    let (m, t) = two_processors();
+    // t, on processor 1, calls the root on processor 0; the call is delivered.
+    m.on(0);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(1);
+    assert!(m.raw(S::Call as u64, [FREE + 1, MsgInfo::new(3, 1).0, 10, 0, 0, 0]).blocked);
+    m.settle(0);
+    assert_eq!((m.k.current(), m.arg(m.root, 2)), (m.root, 10));
+    // Moved while it waits: still waiting, now on processor 0.
+    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    let v = m.k.thread_view(t);
+    assert_eq!((v.state, v.cpu), (REPLY, 0), "the call survives the move");
+    // The answer reaches it there.
+    assert!(m.raw(S::ReplyRecv as u64, [FREE, MsgInfo::new(0, 1).0, 11, 0, 0, 0]).blocked);
+    m.settle(0);
+    assert_eq!(m.k.current(), t);
+    assert_eq!((m.status(t), m.arg(t, 2)), (0, 11));
+    assert_eq!(m.k.check_runqueues(), Ok(()));
+}
+
+#[test]
+fn a_thread_moved_while_it_waits_to_receive_makes_its_receive_again_there() {
+    let (m, t) = two_processors();
+    m.on(1);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    let ip = m.k.regs(t)[0].get();
+    m.on(0);
+    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    let v = m.k.thread_view(t);
+    assert_eq!((v.state, v.cpu, v.blocked_on), (RUNNABLE, 0, 0), "off the endpoint, runnable on its new processor");
+    assert_eq!(m.k.regs(t)[0].get(), ip - 2, "set to make the same system call again");
+    assert_eq!(m.k.check_runqueues(), Ok(()));
+    // Nothing was delivered to it: a call now finds no receiver.
+    assert_eq!(m.err(S::Send, [(FREE + 1) | NONBLOCK, MsgInfo::new(1, 0).0, 0, 0, 0, 0]), Error::WouldBlock);
+}
+
+#[test]
+fn a_server_stopped_in_reply_recv_after_replying_only_receives_when_it_runs_again() {
+    let (m, t) = two_processors();
+    m.on(1);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(0);
+    assert!(m.raw(S::Call as u64, [FREE + 1, MsgInfo::new(3, 1).0, 10, 0, 0, 0]).blocked);
+    m.settle(1);
+    assert_eq!(m.k.current(), t);
+    // It answers and waits for the next call.
+    assert!(m.raw(S::ReplyRecv as u64, [FREE, MsgInfo::new(0, 1).0, 11, 0, 0, 0]).blocked);
+    let ip = m.k.regs(t)[0].get();
+    m.settle(0);
+    assert_eq!((m.k.current(), m.status(m.root), m.arg(m.root, 2)), (m.root, 0, 11));
+    // Stopped there (here: moved), the reply is not made again: what runs
+    // again is the receive.
+    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    let r = m.k.regs(t);
+    assert_eq!(r[0].get(), ip - 2);
+    assert_eq!((r[3].get(), m.arg(t, 0), m.arg(t, 1), m.arg(t, 2)), (S::Recv as u64, FREE, 0, 0));
+}
+
+#[test]
+fn a_system_call_overtaken_while_it_waits_for_a_lock_is_made_again() {
+    // Thread t, on processor 1, has entered a system call and waits for its
+    // lock, which processor 0 holds to stop it: the call has not happened.
+    let (m, t) = two_processors();
+    let r = m.k.regs(t);
+    r[0].set(0x40_0002);
+    r[3].set(S::Recv as u64);
+    r[10].set(1);
+    m.on(0);
+    m.ok(S::ThreadControl, [FREE + 2, 0, 0, 0, 0, 0]);
+    assert_eq!((r[0].get(), r[3].get()), (0x40_0000, S::Recv as u64), "set to make the call again");
+    // Interrupted in user mode instead, it goes on from where it was.
+    m.ok(S::ThreadControl, [FREE + 2, 1, 0, 0, 0, 0]);
+    m.settle(1);
+    assert_eq!(m.k.current(), t);
+    r[0].set(0x40_1234);
+    r[10].set(0);
+    m.on(0);
+    m.ok(S::ThreadControl, [FREE + 2, 0, 0, 0, 0, 0]);
+    assert_eq!(r[0].get(), 0x40_1234);
+}
+
+#[test]
+fn a_suspended_thread_moved_stays_suspended_and_a_thread_may_move_itself() {
+    let (m, t) = two_processors();
+    m.on(0);
+    m.ok(S::ThreadControl, [FREE + 2, 0, 0, 0, 0, 0]);
+    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    let v = m.k.thread_view(t);
+    assert_eq!((v.state, v.cpu), (INACTIVE, 0));
+    // The root moves itself to processor 1 and carries on there.
+    let r = m.raw(S::ThreadControl as u64, [SLOT_THREAD, 2, 1, 0, 0, 0]);
+    assert_eq!(r.status, 0);
+    assert_ne!(m.k.current(), m.root, "processor 0 no longer runs it");
+    let v = m.k.thread_view(m.root);
+    assert_eq!((v.state, v.cpu), (RUNNABLE, 1));
+    m.settle(1);
+    assert_eq!((m.k.current(), m.status(m.root)), (m.root, 0));
+    assert_eq!(m.k.check_runqueues(), Ok(()));
 }
 
 #[test]

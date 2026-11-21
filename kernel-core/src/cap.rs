@@ -220,6 +220,7 @@ impl<H: Hal> Kernel<H> {
             }
             ObjectType::AddressSpace => self.finalise_aspace(cap.obj),
             ObjectType::Endpoint | ObjectType::Notification => self.finalise_queue(cap.obj),
+            ObjectType::SchedContext => self.finalise_sched(cap.obj),
             _ => {}
         }
     }

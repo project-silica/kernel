@@ -164,7 +164,8 @@ impl Model {
                     T::AddressSpace if (13..=30).contains(&bits) => (bits, bits),
                     T::Thread => (12, 12),
                     T::Endpoint | T::Notification => (6, 6),
-                    T::SchedContext | T::Vcpu => return Err(Error::Unsupported),
+                    T::SchedContext => (7, 7),
+                    T::Vcpu => return Err(Error::Unsupported),
                     _ => return Err(Error::BadArg),
                 };
                 if a[5] == 0 || a[5] > 256 {
