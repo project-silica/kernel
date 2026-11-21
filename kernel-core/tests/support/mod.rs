@@ -17,10 +17,22 @@ use std::cell::{Cell, RefCell};
 
 /// Physical address of the first byte of the host machine's memory.
 pub const RAM_BASE: u64 = 0x10_0000;
+/// Processors a test machine can have.
+pub const TEST_CPUS: usize = 4;
+
+impl TestHal {
+    /// The deadline the current processor's timer was last set to.
+    pub fn timer(&self) -> u64 {
+        self.timers[self.cpu.get()].get()
+    }
+}
 
 pub struct TestHal {
     pub now: Cell<u64>,
-    pub timer: Cell<u64>,
+    /// Each simulated processor's timer: its deadline, and whether it is
+    /// armed (set and not yet fired).
+    pub timers: [Cell<u64>; TEST_CPUS],
+    pub armed: [Cell<bool>; TEST_CPUS],
     /// When set, `irq_pending` is true this many more times.
     pub pending: Cell<u32>,
     pub console: RefCell<Vec<u8>>,
@@ -110,7 +122,9 @@ impl Hal for TestHal {
         self.now.get()
     }
     fn set_timer(&self, deadline: u64) {
-        self.timer.set(deadline);
+        let c = self.cpu.get();
+        self.timers[c].set(deadline);
+        self.armed[c].set(deadline != u64::MAX);
     }
     fn irq_pending(&self) -> bool {
         let n = self.pending.get();
@@ -121,15 +135,13 @@ impl Hal for TestHal {
     }
     fn idle_begin(&self) {}
     fn idle(&self) {
-        // As hardware: a timer fires once, at its deadline, and not again
-        // until it is set anew. Idling with none still to fire would sleep
-        // for ever (here: the kernel would spin).
-        assert!(self.timer.get() != u64::MAX, "idle with no timer armed: every thread is blocked for ever");
-        assert!(
-            self.timer.get() > self.now.get(),
-            "idle with the timer already fired and not set again: the processor would sleep for ever"
-        );
-        self.now.set(self.timer.get());
+        // As hardware: each processor's timer fires once, at its deadline
+        // (at once if that has passed), and not again until it is set anew.
+        // Idling with none armed would sleep for ever (here: the kernel
+        // would spin).
+        let c = self.cpu.get();
+        assert!(self.armed[c].replace(false), "idle with no timer armed: the processor would sleep for ever");
+        self.now.set(self.now.get().max(self.timers[c].get()));
     }
     fn irq_route(&self, line: usize, cpu: usize, level: bool, active_low: bool) -> bool {
         self.irq_log.borrow_mut().push(format!("route {line} cpu{cpu} level={level} low={active_low}"));
@@ -267,10 +279,12 @@ impl Machine {
 
     /// A machine with `cpus` processors; the root task runs on processor 0.
     pub fn with_cpus(mib: u64, cpus: usize) -> Machine {
+        assert!(cpus <= TEST_CPUS, "the test machine has at most {TEST_CPUS} processors");
         let ram = Ram::new((mib << 20) as usize);
         let hal = TestHal {
             now: Cell::new(1000),
-            timer: Cell::new(u64::MAX),
+            timers: [const { Cell::new(u64::MAX) }; TEST_CPUS],
+            armed: [const { Cell::new(false) }; TEST_CPUS],
             pending: Cell::new(0),
             console: RefCell::new(Vec::new()),
             flushes: Cell::new(0),

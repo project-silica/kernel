@@ -361,7 +361,7 @@ fn notification_accumulates_badges_and_wait_honours_deadlines() {
     // A deadline wakes the waiter with Timeout; the kernel arms the timer for it.
     let at = m.k.hal.now.get() + 5_000_000;
     assert!(m.sys_as(t, S::Recv, [FREE, at, 0, 0, 0, 0]).blocked);
-    assert!(m.k.hal.timer.get() <= at);
+    assert!(m.k.hal.timer() <= at);
     m.k.hal.now.set(at);
     m.k.on_timer();
     m.k.schedule();
@@ -381,8 +381,8 @@ fn time_slices_rotate_runnable_threads() {
     let (ut, _) = m.big_untyped();
     let t = m.spawn(ut, FREE);
     assert_eq!(m.k.current(), m.root);
-    assert!(m.k.hal.timer.get() != u64::MAX, "a second runnable thread arms the slice timer");
-    m.k.hal.now.set(m.k.hal.timer.get());
+    assert!(m.k.hal.timer() != u64::MAX, "a second runnable thread arms the slice timer");
+    m.k.hal.now.set(m.k.hal.timer());
     m.k.on_timer();
     m.k.schedule();
     assert_eq!(m.k.current(), t);
@@ -542,7 +542,7 @@ fn an_idle_system_has_no_timer_armed() {
     m.retype(ut, T::Notification, 0, FREE, 1);
     let t = m.spawn(ut, FREE + 1);
     // Two runnable threads: a slice timer is armed.
-    assert!(m.k.hal.timer.get() != u64::MAX);
+    assert!(m.k.hal.timer() != u64::MAX);
     assert!(m.sys_as(t, S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
     assert!(m.sys(S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
     assert!(!m.k.can_run());
