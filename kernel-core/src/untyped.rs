@@ -11,9 +11,7 @@ use crate::hal::Hal;
 use crate::kernel::{Exit, Kernel};
 use crate::mem::Paddr;
 use crate::vm::AsHeader;
-use silica_abi::{
-    ASPACE_MIN_BITS, ENDPOINT_BITS, Error, ObjectType, PAGE_BITS, RETYPE_MAX, Rights, SLOT_BITS, THREAD_BITS, UNTYPED_MAX_BITS,
-};
+use silica_abi::{Error, ObjectType, PAGE_BITS, RETYPE_MAX, Rights};
 
 /// Bytes zeroed between checks for a pending interrupt.
 const ZERO_CHUNK: u64 = 1 << 18;
@@ -28,17 +26,8 @@ impl<H: Hal> Kernel<H> {
             return Err(Error::WrongType);
         }
         let device = ut.flags & FLAG_DEVICE != 0;
-        // (object size in bits, the `bits` field of the new capability)
-        let (obits, cbits) = match ty {
-            ObjectType::Untyped if (SLOT_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => (bits, bits),
-            ObjectType::Frame if (PAGE_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => (bits, bits),
-            ObjectType::CapSpace if (1..=32).contains(&bits) => (bits + SLOT_BITS as u64, bits),
-            ObjectType::AddressSpace if (ASPACE_MIN_BITS as u64..=30).contains(&bits) => (bits, bits),
-            ObjectType::Thread => (THREAD_BITS as u64, THREAD_BITS as u64),
-            ObjectType::Endpoint | ObjectType::Notification => (ENDPOINT_BITS as u64, ENDPOINT_BITS as u64),
-            ObjectType::SchedContext | ObjectType::Vcpu => return Err(Error::Unsupported),
-            _ => return Err(Error::BadArg),
-        };
+        let obits = ty.storage_bits(bits)? as u64;
+        let cbits = if ty == ObjectType::CapSpace { bits } else { obits };
         if device && !matches!(ty, ObjectType::Untyped | ObjectType::Frame) {
             return Err(Error::BadArg);
         }

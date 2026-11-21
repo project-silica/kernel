@@ -184,6 +184,22 @@ pub enum ObjectType {
 }
 
 impl ObjectType {
+    /// Log2 of the bytes one object requires for a Retype with this size
+    /// argument. CapSpace sizes count slots. Other variable-size objects
+    /// count bytes. Fixed-size objects ignore the size argument.
+    pub fn storage_bits(self, bits: u64) -> Result<u8, Error> {
+        match self {
+            Self::Untyped if (SLOT_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => Ok(bits as u8),
+            Self::Frame if (PAGE_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => Ok(bits as u8),
+            Self::CapSpace if (1..=32).contains(&bits) => Ok(bits as u8 + SLOT_BITS),
+            Self::AddressSpace if (ASPACE_MIN_BITS as u64..=30).contains(&bits) => Ok(bits as u8),
+            Self::Thread => Ok(THREAD_BITS),
+            Self::Endpoint | Self::Notification => Ok(ENDPOINT_BITS),
+            Self::SchedContext | Self::Vcpu => Err(Error::Unsupported),
+            _ => Err(Error::BadArg),
+        }
+    }
+
     /// Decode an object type number.
     pub const fn from_u64(n: u64) -> Option<ObjectType> {
         Some(match n {
