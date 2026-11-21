@@ -6,11 +6,11 @@
 //!   object a capability existed for at the start, carries no right the
 //!   capability it was made from did not have, and keeps the badge it was
 //!   given (a badge, once set, is never changed or removed).
-//! - **Revoke completeness** is not proved here yet: harnesses that run
-//!   delete and revoke on a symbolic derivation list of three slots did not
-//!   finish in 20 minutes (the next slot to clear is a symbolic address, so
-//!   every access becomes one). It is checked by the reference-model tests
-//!   (tests/model.rs); `tools/test.sh --deep` reports the missing proof.
+//! - **Revoke completeness** is proved by exhaustion in `exhaustive.rs`
+//!   (every derivation list of up to five slots, every interrupt pattern),
+//!   run with the host tests: harnesses here on a symbolic list of three
+//!   slots did not finish in 30 minutes (every slot address read back from
+//!   memory is symbolic).
 //!
 //! Each proof runs one operation of the kernel's own code on a machine of a
 //! few capability slots in any well-formed state and checks its result, so

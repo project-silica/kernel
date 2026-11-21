@@ -17,6 +17,8 @@ pub mod boot;
 pub mod cap;
 /// The image format readers (their own crate, shared with the loader and userspace).
 pub use silica_formats::{elf, ramdisk};
+#[cfg(test)]
+mod exhaustive;
 pub mod hal;
 pub mod ipc;
 pub mod kernel;

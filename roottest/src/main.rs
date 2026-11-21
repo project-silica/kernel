@@ -773,6 +773,20 @@ fn t_inspect() -> T {
     if waiter.state != THREAD_RECEIVING || waiter.waits_on != ep_info.object {
         return Err("a thread waiting on an endpoint is not reported as receiving on it");
     }
+    // The same thread seen through the CapSpace that holds it.
+    let through = inspect_thread_in(SPACE, t.0).map_err(|_| "cannot inspect a thread through its CapSpace")?;
+    if (through.state, through.cpu, through.waits_on) != (waiter.state, waiter.cpu, waiter.waits_on) {
+        return Err("a thread seen through its CapSpace differs from the same thread seen directly");
+    }
+    if inspect_thread_in(SPACE, ep.0) != Err(Error::WrongType) {
+        return Err("inspecting a thread in a slot that holds something else was accepted");
+    }
+    if inspect_thread_in(t, 1) != Err(Error::BadArg) {
+        return Err("inspecting a thread with arguments meant for a CapSpace was accepted");
+    }
+    if libsys::raw(Syscall::Inspect, [SPACE.0, t.0, 2, 0, 0, 0]).map(|_| ()) != Err(Error::BadArg) {
+        return Err("an unknown inspection was accepted");
+    }
     // Walk the whole CapSpace, as the console's `caps` command would.
     let slots = 4096;
     let (mut caps, mut threads) = (0u64, 0u64);

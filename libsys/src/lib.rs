@@ -370,6 +370,13 @@ pub fn inspect_thread(thread: Cap) -> Result<ThreadInfo> {
     Ok(ThreadInfo { state: r[0], cpu: r[1] as usize, ip: r[2], sp: r[3], waits_on: r[4] })
 }
 
+/// The thread whose capability is in slot `index` of the CapSpace `space`
+/// (another program's, say), without copying it.
+pub fn inspect_thread_in(space: Cap, index: u64) -> Result<ThreadInfo> {
+    let r = sys(Syscall::Inspect, [space.0, index, 1, 0, 0, 0])?;
+    Ok(ThreadInfo { state: r[0], cpu: r[1] as usize, ip: r[2], sp: r[3], waits_on: r[4] })
+}
+
 /// The monotonic clock: converts the processor's timestamp counter with the
 /// calibration from [`root::RootInfo::clock`]. Reading it is not a syscall.
 #[derive(Clone, Copy, Debug)]

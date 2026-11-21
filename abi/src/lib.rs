@@ -99,6 +99,10 @@ pub enum Syscall {
     /// `a0` a Thread and `a1` 0: returns `a0` state (the `THREAD_` values),
     /// `a1` processor, `a2` instruction pointer, `a3` stack pointer, `a4`
     /// the identity of what it waits on.
+    /// `a0` a CapSpace, `a1` a slot index and `a2` 1: the same about the
+    /// thread in that slot (`WrongType` if it holds something else), so a
+    /// holder of a CapSpace sees every thread it holds without copying.
+    /// (`a2` must otherwise be 0.)
     Inspect = 18,
     /// `a0` console capability (the root task's [`root::SLOT_CONSOLE`] or
     /// one derived from it), `a1` number of bytes (at most 32), `a2` to `a5`
