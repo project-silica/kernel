@@ -270,24 +270,38 @@ fn madt(rsdp: u64) -> Option<Madt> {
 
 // ---- faults and panics -------------------------------------------------------
 
-/// Print return addresses by following frame records (x29) on the boot stack.
+/// Walk frame records only on the stack this processor is actually using.
+/// The boot stack is available even before per-processor state is installed.
 fn backtrace(first: u64, mut fp: u64) {
     let slide = SLIDE.load(Ordering::Relaxed);
     let _ = write!(Out, "#0 {:#018x}\r\n", first.wrapping_sub(slide));
-    let lo = BOOT_STACK.0.get() as u64;
-    let hi = lo + STACK_SIZE as u64;
+    let sp: u64;
+    // SAFETY: reading our current stack pointer.
+    unsafe { asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+    let boot_top = BOOT_STACK.0.get() as u64 + STACK_SIZE as u64;
+    let tops = core::iter::once(boot_top)
+        .chain((1..kernel_core::smp::MAX_CPUS).filter_map(cpu::percpu_of).map(|p| p.kstack_top.load(Ordering::Relaxed)));
+    let Some(hi) = tops.into_iter().find(|&top| (top - STACK_SIZE as u64..top).contains(&sp)) else { return };
     for n in 1..32 {
-        if !(fp.is_multiple_of(16) && fp >= lo && fp + 16 <= hi) {
+        if !(fp.is_multiple_of(16) && fp >= sp && fp <= hi - 16) {
             break;
         }
-        // SAFETY: `fp` was just checked to lie inside the boot stack.
+        // SAFETY: `fp` was just checked to lie inside this processor's kernel stack.
         let (next, ret) = unsafe { (*(fp as *const u64), *((fp + 8) as *const u64)) };
         if ret == 0 {
             break;
         }
         let _ = write!(Out, "#{} {:#018x}\r\n", n, ret.wrapping_sub(slide));
+        if next <= fp {
+            break;
+        }
         fp = next;
     }
+}
+
+#[inline(never)]
+fn deliberate_panic(cpu: usize) -> ! {
+    panic!("deliberate panic on processor {cpu}");
 }
 
 static SLIDE: AtomicU64 = AtomicU64::new(0);
@@ -716,7 +730,7 @@ extern "C" fn kmain(info: u64) -> ! {
         bi.kernel_slide
     );
     if cmdline.get("panic") == Some(b"test") {
-        panic!("deliberate panic (panic=test on the command line)");
+        deliberate_panic(0);
     }
     let k = kernel();
     BOOT_CPU.kstack_top.store(BOOT_STACK.0.get() as u64 + STACK_SIZE as u64, Ordering::Relaxed);
@@ -794,7 +808,7 @@ extern "C" fn kmain(info: u64) -> ! {
         let _ = write!(Out, "ERROR: kernel: cannot start the root task: {e:?}\r\n");
         die();
     }
-    smp::launch(cpus);
+    smp::launch(cpus, cmdline.get("panic") == Some(b"secondary"));
     // SAFETY: the vectors, the processor and the root thread are set up and
     // the kernel is entered; this is the first exit to user mode.
     unsafe { cpu::exit_to_user() }

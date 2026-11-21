@@ -19,7 +19,7 @@ use kernel_core::boot::RegionTable;
 use kernel_core::smp::MAX_CPUS;
 
 const PAGE: u64 = 4096;
-const STACK: u64 = 64 << 10;
+const STACK: u64 = super::STACK_SIZE as u64;
 /// Per processor: its stack, then a page for its PerCpu and start context.
 const EACH: u64 = STACK + PAGE;
 
@@ -208,7 +208,8 @@ pub fn prepare(rsdp: u64, regions: &mut RegionTable, gicr: (u64, u64)) -> usize 
 
 /// Start the processors `prepare` set up, one at a time, each within a
 /// second; say which did not start.
-pub fn launch(cpus: usize) {
+pub fn launch(cpus: usize, panic_secondary: bool) {
+    PANIC_SECONDARY.store(panic_secondary, Ordering::Release);
     let entry_pa = image_phys(&raw const ap_entry as u64);
     for index in 1..cpus {
         let p = PAGES[index].load(Ordering::Acquire);
@@ -230,6 +231,7 @@ pub fn launch(cpus: usize) {
     }
 }
 
+static PANIC_SECONDARY: AtomicBool = AtomicBool::new(false);
 static GICR_REGION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 extern "C" fn ap_main(index: usize) -> ! {
@@ -238,6 +240,9 @@ extern "C" fn ap_main(index: usize) -> ! {
     // SAFETY: this processor's own data, on its first and only pass here,
     // interrupts masked.
     unsafe { cpu::install(p) };
+    if index == 1 && PANIC_SECONDARY.load(Ordering::Acquire) {
+        super::deliberate_panic(index);
+    }
     super::load_ttbr0(kernel().hal.empty_root());
     let region = (GICR_REGION[0].load(Ordering::Relaxed), GICR_REGION[1].load(Ordering::Relaxed));
     match gic::find_redistributor(region.0, region.1, gic::my_affinity()) {
