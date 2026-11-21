@@ -511,7 +511,7 @@ impl<H: Hal> Kernel<H> {
                     self.q_push(&me.rq_head, &me.rq_tail, cur);
                 }
                 me.cur.set(next);
-                me.slice_end.set(self.hal.now() + SLICE_NS);
+                me.slice_end.set(self.hal.now().saturating_add(SLICE_NS));
                 break;
             }
             // Nothing to run. The timer is set exactly (or switched off) so

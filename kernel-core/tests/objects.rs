@@ -1116,3 +1116,12 @@ fn syscall_sequences_the_fuzzer_found_keep_the_kernel_invariants() {
 fn deadline_max_waits_for_ever() {
     support::fuzz::run(include_bytes!("../fuzz/corpus/syscalls/recv-deadline-max-spins-idle"));
 }
+
+/// Found by the syscall fuzzer: once the clock reached a deadline just
+/// below `u64::MAX`, the end of the next time slice overflowed (in a
+/// release build it wrapped to the past and every entry rescheduled).
+/// The slice end saturates.
+#[test]
+fn slice_end_saturates_near_the_end_of_time() {
+    support::fuzz::run(include_bytes!("../fuzz/corpus/syscalls/slice-end-overflows-near-time-max"));
+}
