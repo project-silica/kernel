@@ -5,6 +5,7 @@ PHDRS {
   text PT_LOAD FLAGS(5);
   rodata PT_LOAD FLAGS(4);
   data PT_LOAD FLAGS(6);
+  stack PT_LOAD FLAGS(6);
   dynamic PT_DYNAMIC FLAGS(4);
 }
 SECTIONS {
@@ -24,6 +25,9 @@ SECTIONS {
   .data : { *(.data .data.*) *(.got .got.*) } :data
   .bss : { *(.bss .bss.*) *(COMMON) } :data
   . = ALIGN(4096);
+  /* The loader maps only PT_LOAD pages. Leave one unmapped below SP. */
+  . += 4096;
+  .boot_stack (NOLOAD) : { *(.boot_stack) } :stack
   __kernel_end = .;
   /DISCARD/ : { *(.eh_frame*) *(.note*) *(.comment) }
 }

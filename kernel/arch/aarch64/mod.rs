@@ -6,8 +6,8 @@
 //! UART the ACPI SPCR table names and the GICv3 the MADT describes into its
 //! device window (`gic.rs`), sets up the EL1 virtual timer and starts the
 //! root task. User address spaces are TTBR0's; the kernel's mappings are
-//! TTBR1's and never change. Not yet: the other processors (PSCI), ASIDs
-//! (every address-space switch flushes the local TLB).
+//! TTBR1's and never change. PSCI starts the other processors. Every address-space switch
+//! currently flushes the local TLB.
 
 mod cpu;
 mod gic;
@@ -36,6 +36,8 @@ const STACK_SIZE: usize = 64 << 10;
 struct Stack(UnsafeCell<[u8; STACK_SIZE]>);
 // SAFETY: used only as the boot processor's stack, through the stack pointer.
 unsafe impl Sync for Stack {}
+// SAFETY: the linker puts only this page-aligned stack in the segment.
+#[unsafe(link_section = ".boot_stack")]
 static BOOT_STACK: Stack = Stack(UnsafeCell::new([0; STACK_SIZE]));
 
 global_asm!(
@@ -269,6 +271,21 @@ fn madt(rsdp: u64) -> Option<Madt> {
 }
 
 // ---- faults and panics -------------------------------------------------------
+
+/// Check the installed translation on the processor that will use the stack.
+fn verify_stack(top: u64) {
+    let base = top - STACK_SIZE as u64;
+    let (guard, first): (u64, u64);
+    // SAFETY: translation probes only update PAR_EL1. Interrupts are masked.
+    unsafe {
+        asm!("at s1e1r, {below}", "isb", "mrs {guard}, par_el1",
+             "at s1e1w, {base}", "isb", "mrs {first}, par_el1",
+             below = in(reg) base - 1, base = in(reg) base,
+             guard = out(reg) guard, first = out(reg) first, options(nostack));
+    }
+    // PAR.F and FST[5:2]: a translation fault, at any table level.
+    assert!(guard & 0x79 == 9 && first & 1 == 0, "invalid kernel stack mappings at {base:#x}: guard {guard:#x}, stack {first:#x}");
+}
 
 /// Walk frame records only on the stack this processor is actually using.
 /// The boot stack is available even before per-processor state is installed.
@@ -729,6 +746,7 @@ extern "C" fn kmain(info: u64) -> ! {
         el >> 2 & 3,
         bi.kernel_slide
     );
+    verify_stack(BOOT_STACK.0.get() as u64 + STACK_SIZE as u64);
     if cmdline.get("panic") == Some(b"test") {
         deliberate_panic(0);
     }

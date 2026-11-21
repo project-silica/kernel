@@ -8,8 +8,7 @@
 //! half on its own stack. Everything it reads before its MMU is on is
 //! cleaned to the point of coherency first.
 //!
-//! Known gap (spec/COMPONENTS.md B08): these stacks are in the physical
-//! map, with no guard page below them.
+//! Each processor uses a kernel stack alias with an unmapped page below it.
 
 use super::{PHYS_MAP_BASE, acpi_table, acpi8, acpi32, acpi64, cpu, gic, image_phys, kernel};
 use core::arch::{asm, global_asm};
@@ -169,7 +168,35 @@ pub fn prepare(rsdp: u64, regions: &mut RegionTable, gicr: (u64, u64)) -> usize 
     if found == 0 {
         return 1;
     }
-    let Some(base) = regions.carve(EACH * found as u64, PAGE, 0, u64::MAX) else { return 1 };
+    // Use the second GiB of the device window for normal-memory stack
+    // aliases. Each 17-page virtual extent starts with an absent PTE.
+    const WINDOW: u64 = super::DEVICE_BASE + (1 << 30);
+    const _: () = assert!(EACH * MAX_CPUS as u64 <= 1 << 30);
+    let bytes = EACH * found as u64;
+    let leaf_tables = bytes.div_ceil(super::BLOCK);
+    let Some(base) = regions.carve(bytes + PAGE * (1 + leaf_tables), PAGE, 0, u64::MAX) else {
+        panic!("no contiguous memory for {found} secondary kernel stacks");
+    };
+    let l2 = base + bytes;
+    let phys = &kernel().phys;
+    phys.zero(l2, PAGE * (1 + leaf_tables));
+    for i in 0..leaf_tables {
+        phys.write_val(l2 + i * 8, &((l2 + PAGE * (1 + i)) | 3));
+    }
+    for i in 0..found as u64 {
+        for offset in (0..STACK).step_by(PAGE as usize) {
+            let index = (i * EACH + PAGE + offset) / PAGE;
+            // Normal write-back, inner-shareable, EL1 read/write, no execute.
+            let entry = (base + i * EACH + offset) | 3 | (3 << 8) | super::AF | super::PXN | super::UXN;
+            phys.write_val(l2 + PAGE + index * 8, &entry);
+        }
+    }
+    // SAFETY: boot processor only. Slot zero maps the GIC, slot one was
+    // absent. Publish the completed subtree before any secondary starts.
+    unsafe {
+        (*super::DEVICE_L1.0.get())[1] = l2 | 3;
+        asm!("dsb ishst", "isb", options(nostack));
+    }
     GICR_REGION[0].store(gicr.0, Ordering::Relaxed);
     GICR_REGION[1].store(gicr.1, Ordering::Relaxed);
     let (mair, tcr, ttbr1): (u64, u64, u64);
@@ -184,6 +211,7 @@ pub fn prepare(rsdp: u64, regions: &mut RegionTable, gicr: (u64, u64)) -> usize 
         let index = i + 1;
         let stack = base + i as u64 * EACH;
         let page = stack + STACK;
+        let stack_top = WINDOW + (i as u64 + 1) * EACH;
         let page_va = PHYS_MAP_BASE + page;
         // SAFETY: carved memory, the kernel's alone; the PerCpu sits after
         // the context in the same page and lives for ever.
@@ -194,11 +222,11 @@ pub fn prepare(rsdp: u64, regions: &mut RegionTable, gicr: (u64, u64)) -> usize 
                 tcr,
                 ttbr0: LOW_ROOT.load(Ordering::Relaxed),
                 ttbr1,
-                stack_top: PHYS_MAP_BASE + stack + STACK,
+                stack_top,
                 entry: ap_main as usize as u64,
                 index: index as u64,
             });
-            ((page_va + 256) as *mut cpu::PerCpu).write(cpu::PerCpu::new(index, PHYS_MAP_BASE + stack + STACK, mpidr));
+            ((page_va + 256) as *mut cpu::PerCpu).write(cpu::PerCpu::new(index, stack_top, mpidr));
         }
         clean(page_va, 256);
         PAGES[index].store(page_va + 256, Ordering::Release);
@@ -240,6 +268,7 @@ extern "C" fn ap_main(index: usize) -> ! {
     // SAFETY: this processor's own data, on its first and only pass here,
     // interrupts masked.
     unsafe { cpu::install(p) };
+    super::verify_stack(p.kstack_top.load(Ordering::Relaxed));
     if index == 1 && PANIC_SECONDARY.load(Ordering::Acquire) {
         super::deliberate_panic(index);
     }

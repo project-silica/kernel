@@ -20,7 +20,8 @@
   "position-independent-executables": true,
   "pre-link-args": {
     "gnu-lld": [
-      "--fix-cortex-a53-843419"
+      "--fix-cortex-a53-843419",
+      "-zmax-page-size=4096"
     ]
   },
   "relro-level": "full",
