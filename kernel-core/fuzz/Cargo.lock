@@ -68,6 +68,7 @@ dependencies = [
  "kernel-core",
  "libfuzzer-sys",
  "silica-abi",
+ "silica-formats",
 ]
 
 [[package]]

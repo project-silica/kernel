@@ -36,6 +36,26 @@ pub mod vm;
 
 pub use kernel::Kernel;
 
+/// A constant that an experiment may set when the kernel is built: the
+/// value of the environment variable given by `option_env!("SILICA_TUNE_...")`
+/// at the use, a decimal number, or `default` when it is not set (every
+/// ordinary build). `tools/bench.sh --sweep` builds one kernel per value and
+/// measures them side by side; the value that wins becomes the default, with
+/// the measurement beside it. Nothing is read at run time, so a constant
+/// declared this way costs what any constant costs.
+pub const fn tuned(set: Option<&str>, default: u64) -> u64 {
+    let Some(s) = set else { return default };
+    let b = s.as_bytes();
+    assert!(!b.is_empty(), "a SILICA_TUNE_ variable is set to nothing");
+    let (mut v, mut i) = (0u64, 0);
+    while i < b.len() {
+        assert!(b[i].is_ascii_digit(), "a SILICA_TUNE_ variable is not a decimal number");
+        v = v * 10 + (b[i] - b'0') as u64;
+        i += 1;
+    }
+    v
+}
+
 /// The atomics `lock.rs` is written against (the loom model substitutes its own).
 mod sync {
     pub(crate) use core::hint::spin_loop as spin;

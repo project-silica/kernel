@@ -114,6 +114,11 @@ pub struct Presence(AtomicU8);
 const USER: u8 = 0;
 const KERNEL: u8 = 1;
 const IDLE: u8 = 2;
+/// Idle, and watching this word for a while before halting: whoever has
+/// work for the processor changes it to `POKED` instead of interrupting.
+const WATCH: u8 = 3;
+/// Idle no longer: a processor with work for this one said so here.
+const POKED: u8 = 4;
 
 impl Presence {
     ctor! {
@@ -147,6 +152,33 @@ impl Presence {
     /// lock, and lets go of it next).
     pub fn idle(&self) {
         self.0.store(IDLE, Ordering::Release);
+    }
+    /// The idle processor (which has let go of its lock) will look at this
+    /// word for a while before it halts.
+    pub fn watch(&self) {
+        self.0.store(WATCH, Ordering::Release);
+    }
+    /// Whether the watching processor may go on watching: nobody has poked
+    /// it, and no interrupt it took in between has left it in another state.
+    pub fn watching(&self) -> bool {
+        self.0.load(Ordering::Acquire) == WATCH
+    }
+    /// The watching processor gives up and is about to halt. False when it
+    /// must not: it was poked first (or an interrupt it took changed what it
+    /// was doing), and has work to look for.
+    pub fn stop_watching(&self) -> bool {
+        self.0.compare_exchange(WATCH, IDLE, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+    /// Tell a watching processor that there is work for it. True when it
+    /// will find it without an interrupt: it was watching (it now stops and
+    /// looks) or has been poked already. One of this and
+    /// [`Presence::stop_watching`] succeeds, never both: either the
+    /// processor does not halt, or the caller knows to interrupt it.
+    pub fn poke(&self) -> bool {
+        match self.0.compare_exchange(WATCH, POKED, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => true,
+            Err(now) => now == POKED,
+        }
     }
     /// Whether the processor is running user code.
     pub fn is_user(&self) -> bool {

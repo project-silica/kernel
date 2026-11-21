@@ -399,3 +399,62 @@ fn work_queued_for_an_idling_processor_is_never_missed() {
         assert_eq!(idler.join().unwrap(), 1);
     });
 }
+
+/// The same with a processor that watches before it halts: whoever queues
+/// work for it pokes its presence word, and interrupts it only when the
+/// poke comes too late. The watcher halts only if it stopped watching
+/// before any poke, and then the interrupt is on its way: the work is
+/// never missed, whichever of the two compare-and-swaps comes first.
+#[test]
+fn work_queued_for_a_watching_processor_is_never_missed() {
+    loom::model(|| {
+        struct S {
+            lock: Lock,
+            presence: Presence,
+            queue: UnsafeCell<u32>,
+            interrupt: loom::sync::Notify,
+        }
+        let s =
+            Arc::new(S { lock: Lock::new(), presence: Presence::new(), queue: UnsafeCell::new(0), interrupt: loom::sync::Notify::new() });
+        let idler = {
+            let s = s.clone();
+            thread::spawn(move || {
+                s.lock.lock();
+                let mut ran = 0;
+                loop {
+                    ran += s.queue.with_mut(|q| unsafe { core::mem::take(&mut *q) });
+                    if ran > 0 {
+                        break;
+                    }
+                    s.presence.idle();
+                    s.lock.unlock();
+                    s.presence.watch();
+                    // One look (a real watch takes many; the model needs
+                    // only the two ways it can end).
+                    if s.presence.watching() {
+                        thread::yield_now();
+                    }
+                    if s.presence.stop_watching() {
+                        // Halt until an interrupt (any interrupt: a halt
+                        // may end for one that has nothing to do with
+                        // this work, and the processor then watches again).
+                        s.interrupt.wait();
+                    }
+                    s.presence.enter_kernel();
+                    s.lock.lock();
+                }
+                s.lock.unlock();
+                ran
+            })
+        };
+        s.lock.lock();
+        s.queue.with_mut(|q| unsafe { *q += 1 });
+        if !s.presence.in_kernel() && !s.presence.poke() {
+            s.interrupt.notify();
+        }
+        s.lock.unlock();
+        // A wake that was lost would leave the idler halted for ever: the
+        // model would report a deadlock.
+        assert_eq!(idler.join().unwrap(), 1);
+    });
+}

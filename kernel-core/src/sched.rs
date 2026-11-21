@@ -33,17 +33,31 @@ use silica_abi::{Error, SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_
 
 /// How far a fair thread may run ahead of the one that has run least before
 /// it is preempted, in default-weight nanoseconds.
-pub(crate) const GRANULE: u64 = 3_000_000;
+pub(crate) const GRANULE: u64 = crate::tuned(option_env!("SILICA_TUNE_GRANULE"), 3_000_000);
 /// How far behind the one that has run least a waking fair thread is
 /// placed at most: a thread that slept long gets this much credit, no more.
-const SLEEPER_CREDIT: u64 = 3_000_000;
+const SLEEPER_CREDIT: u64 = crate::tuned(option_env!("SILICA_TUNE_SLEEPER_CREDIT"), 3_000_000);
 /// How far behind the running fair thread a waking one must be to take the
 /// processor at once: less than its sleeper credit, so a thread that slept
 /// runs promptly, more than nothing, so a thread that only paused does not
 /// make the processor switch for every message.
-const WAKE_GRANULE: u64 = 1_000_000;
+const WAKE_GRANULE: u64 = crate::tuned(option_env!("SILICA_TUNE_WAKE_GRANULE"), 1_000_000);
 /// The shortest time a fair thread runs before it can be preempted again.
-const MIN_RUN: u64 = 100_000;
+const MIN_RUN: u64 = crate::tuned(option_env!("SILICA_TUNE_MIN_RUN"), 100_000);
+/// How long a processor with nothing to run watches for work before it
+/// halts (`Presence::watch`): while it watches, a processor with work for
+/// it says so with one store instead of an interrupt, and a deadline that
+/// falls inside the watch needs no timer. 0: halt at once. Spinning is
+/// power spent on the chance that work arrives soon, so the value is a
+/// measured trade (`tools/bench.sh --sweep IDLE_WATCH=...`): about what a
+/// halt and its wake-up cost (2 us each in a virtual machine), so a watch
+/// that ends unused wastes no more than halting at once would have saved.
+/// Swept on the reference host, cross-processor round trips per second on
+/// one pair: 0 ns 218,000; 1 us 472,000; 2 us 1,021,000; 5 us 1,041,000;
+/// 20 us 1,036,000; 200 us 1,018,000; nothing else moved. Longer only
+/// helps a partner slower than a ping; that is decided with a workload
+/// that has one.
+pub const IDLE_WATCH_NS: u64 = crate::tuned(option_env!("SILICA_TUNE_IDLE_WATCH"), 5_000);
 /// The share of a processor deadline reservations may take, in parts of 2^20.
 pub(crate) const DEADLINE_CAP: u64 = ((1 << 20) * 9u64).div_ceil(10);
 /// The shortest deadline period.

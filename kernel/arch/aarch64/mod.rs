@@ -638,6 +638,33 @@ impl Hal for Arm {
     }
 
     fn idle(&self, until: u64) {
+        // Watch for work first, as on x86 (`IDLE_WATCH_NS`).
+        if kernel_core::sched::IDLE_WATCH_NS != 0 {
+            let me = percpu();
+            me.mode.watch();
+            let end = self.now().saturating_add(kernel_core::sched::IDLE_WATCH_NS);
+            loop {
+                // SAFETY: a window for a pending interrupt, taken by
+                // `kernel_irq` as in the wait below; masking is restored.
+                unsafe { asm!("msr daifclr, #2", "isb", "msr daifset, #2", options(nomem, nostack)) }
+                if !me.mode.watching() {
+                    break;
+                }
+                let now = self.now();
+                if now >= until {
+                    me.mode.enter_kernel();
+                    return;
+                }
+                if now >= end {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            if !me.mode.stop_watching() {
+                me.mode.enter_kernel();
+                return;
+            }
+        }
         self.set_timer(until);
         // WFI wakes for a pending interrupt even while interrupts are
         // masked, so none is lost between the decision to wait and the
@@ -653,7 +680,7 @@ impl Hal for Arm {
 
     fn kick(&self, cpu: usize, wait: bool) {
         let Some(them) = cpu::percpu_of(cpu) else { return };
-        if !them.online.load(Ordering::Acquire) || them.mode.in_kernel() {
+        if !them.online.load(Ordering::Acquire) || them.mode.in_kernel() || them.mode.poke() {
             return;
         }
         gic::kick(them.mpidr.load(Ordering::Relaxed));

@@ -387,6 +387,40 @@ impl Hal for X86 {
         // capped so that a rare long stall (the host core leaving a deep
         // sleep state) neither drags it up nor makes every wake spin long.
         let me = percpu();
+        // First watch for work for a while (`IDLE_WATCH_NS`): a processor
+        // that has some pokes this one's presence word instead of sending
+        // an interrupt, which in a virtual machine saves leaving it twice
+        // (the sender's interrupt and this processor's halt), and on any
+        // machine the wake from a sleep state. Each turn opens a window
+        // for a pending interrupt, handled on this stack as in the halt
+        // below; one that was taken ends the watch (it may have made
+        // something runnable), as does a poke or the deadline.
+        if kernel_core::sched::IDLE_WATCH_NS != 0 {
+            me.mode.watch();
+            let end = self.now().saturating_add(kernel_core::sched::IDLE_WATCH_NS);
+            loop {
+                // SAFETY: STI takes effect after the next instruction, so
+                // the window is the NOP; the handler returns here.
+                unsafe { asm!("sti", "nop", "cli", options(nomem, nostack)) }
+                if !me.mode.watching() {
+                    break;
+                }
+                let now = self.now();
+                if now >= until {
+                    // The deadline came while watching: no timer was needed.
+                    me.mode.enter_kernel();
+                    return;
+                }
+                if now >= end {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            if !me.mode.stop_watching() {
+                me.mode.enter_kernel();
+                return;
+            }
+        }
         let early = me.wake_ns.get();
         let armed = if until == u64::MAX { u64::MAX } else { until.saturating_sub(early).max(1) };
         self.set_timer(armed);
@@ -430,7 +464,8 @@ impl Hal for X86 {
         let Some(them) = cpu::percpu_of(cpu) else { return };
         // A processor in the kernel looks at what changed before it leaves
         // (the caller holds its lock, so it has not passed that point).
-        if !them.online.load(Ordering::Acquire) || them.mode.in_kernel() {
+        // One that is idle and still watching is told with a store.
+        if !them.online.load(Ordering::Acquire) || them.mode.in_kernel() || them.mode.poke() {
             return;
         }
         // SAFETY: the x2APIC interrupt command register: a fixed interrupt
