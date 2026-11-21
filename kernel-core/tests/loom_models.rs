@@ -283,6 +283,74 @@ fn another_processors_thread_is_changed_only_after_that_processor_left_user_mode
     });
 }
 
+/// The system-call entry first tries its own lock, before saving anything:
+/// when that works, nobody can look at the registers while they are saved,
+/// so they may be saved before "kernel" is announced; when another processor
+/// holds the lock, the entry falls back to saving, announcing, then waiting.
+/// Either way processor 1, holding the lock and waiting for processor 0 to
+/// leave user mode, never meets a half-saved frame.
+#[test]
+fn a_system_call_that_takes_its_lock_first_is_never_seen_half_saved() {
+    loom::model(|| {
+        struct S {
+            lock: Lock,
+            presence: Presence,
+            regs: UnsafeCell<u32>,
+            stopped: AtomicBool,
+        }
+        let s = Arc::new(S { lock: Lock::new(), presence: Presence::new(), regs: UnsafeCell::new(0), stopped: AtomicBool::new(false) });
+
+        let owner = {
+            let s = s.clone();
+            thread::spawn(move || {
+                s.lock.lock();
+                let mut in_user = !s.stopped.load(Ordering::SeqCst);
+                if in_user {
+                    s.regs.with(|r| unsafe { *r });
+                    s.presence.leave_to_user();
+                }
+                s.lock.unlock();
+                for _ in 0..2 {
+                    if !in_user {
+                        break;
+                    }
+                    if s.lock.try_lock() {
+                        // Entry stub, lock first: save, then announce.
+                        s.regs.with_mut(|r| unsafe { *r += 1 });
+                        s.presence.enter_kernel();
+                    } else {
+                        s.regs.with_mut(|r| unsafe { *r += 1 });
+                        s.presence.enter_kernel();
+                        s.lock.lock();
+                    }
+                    if s.stopped.load(Ordering::SeqCst) {
+                        in_user = false;
+                    } else {
+                        s.regs.with(|r| unsafe { *r });
+                        s.presence.leave_to_user();
+                    }
+                    s.lock.unlock();
+                }
+                if in_user {
+                    s.regs.with_mut(|r| unsafe { *r += 1 });
+                    s.presence.enter_kernel();
+                }
+            })
+        };
+
+        s.lock.lock();
+        while s.presence.is_user() {
+            thread::yield_now();
+        }
+        s.stopped.store(true, Ordering::SeqCst);
+        s.regs.with_mut(|r| unsafe { *r = 1000 });
+        s.lock.unlock();
+
+        owner.join().unwrap();
+        assert_eq!(s.regs.with(|r| unsafe { *r }), 1000);
+    });
+}
+
 /// A processor about to idle announces it before letting go of its lock, so
 /// a processor that queues work for it and finds it "idle" interrupts it,
 /// and one that finds it "in the kernel" knows it will see the work.

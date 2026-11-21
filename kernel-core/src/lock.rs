@@ -30,6 +30,12 @@ impl Lock {
             }
         }
     }
+    /// Take the lock if it is free, without waiting. This is what the x86_64
+    /// system-call entry does with one XCHG before it saves the registers
+    /// (`kernel/arch/x86_64/cpu.rs`); the loom models run it in its place.
+    pub fn try_lock(&self) -> bool {
+        !self.0.swap(true, Ordering::Acquire)
+    }
     /// Release the lock.
     pub fn unlock(&self) {
         self.0.store(false, Ordering::Release);
