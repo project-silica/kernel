@@ -23,6 +23,8 @@ pub mod kernel;
 pub mod lock;
 pub mod log;
 pub mod mem;
+#[cfg(kani)]
+mod proofs;
 pub mod root;
 pub mod smp;
 pub mod thread;
