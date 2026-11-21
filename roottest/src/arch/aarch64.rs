@@ -7,7 +7,7 @@ use libsys::*;
 /// Whether the machine has I/O ports (and the root task a port capability).
 pub const HAS_PORTS: bool = false;
 /// Hardware-resource capabilities the root task starts with.
-pub const HW_CAPS: u64 = 1;
+pub const HW_CAPS: u64 = 3;
 
 /// A system call with no arguments; returns the status register.
 pub fn raw_syscall(n: u64) -> u64 {

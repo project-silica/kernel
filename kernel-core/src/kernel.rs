@@ -1,6 +1,6 @@
 //! The kernel state for one processor and the syscall dispatcher.
 
-use crate::cap::{Cap, FLAG_DEVICE, FLAG_PORTS};
+use crate::cap::{Cap, FLAG_CONSOLE, FLAG_DEVICE, FLAG_PORTS, FLAG_POWER};
 use crate::hal::Hal;
 use crate::mem::{Paddr, Phys};
 use crate::smp::{Cpu, Held, MAX_CPUS};
@@ -164,7 +164,7 @@ impl<H: Hal> Kernel<H> {
         };
         match s {
             // `Map` takes the structure lock itself.
-            Syscall::Yield | Syscall::PortIo | Syscall::Map => true,
+            Syscall::Yield | Syscall::PortIo | Syscall::Map | Syscall::Console | Syscall::PowerOff => true,
             // Passing capabilities changes capability slots.
             Syscall::Call | Syscall::Send => MsgInfo(a[1]).caps() == 0 && queue(a[0] & !NONBLOCK),
             Syscall::Recv => queue(a[0]) && self.park_is_local(h, t, a[2]),
@@ -589,6 +589,30 @@ impl<H: Hal> Kernel<H> {
                     r[H::ARG[i]].set(*v);
                 }
                 Ok(Exit::Done)
+            }
+            Syscall::Console => {
+                let (_, cap) = self.ccap(t, a[0], ObjectType::Hw, Rights::WRITE)?;
+                if cap.flags & FLAG_CONSOLE == 0 {
+                    return Err(Error::WrongType);
+                }
+                let n = a[1] as usize;
+                if n > 32 {
+                    return Err(Error::BadArg);
+                }
+                let mut bytes = [0u8; 32];
+                for (i, w) in a[2..6].iter().enumerate() {
+                    bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+                }
+                self.hal.console(&bytes[..n]);
+                Ok(Exit::Done)
+            }
+            Syscall::PowerOff => {
+                let (_, cap) = self.ccap(t, a[0], ObjectType::Hw, Rights::WRITE)?;
+                if cap.flags & FLAG_POWER == 0 {
+                    return Err(Error::WrongType);
+                }
+                self.hal.power_off(a[1]);
+                Err(Error::Unsupported)
             }
             Syscall::PortIo => {
                 let (width, write) = (a[2] & 0xFF, a[2] & 0x100 != 0);

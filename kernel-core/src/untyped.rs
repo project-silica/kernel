@@ -6,7 +6,7 @@
 //! becomes an object; the zeroing is done in pieces and remembered, so an
 //! interrupt can preempt a large `Retype` without repeating finished work.
 
-use crate::cap::{Cap, FLAG_DEVICE};
+use crate::cap::{Cap, FLAG_KEPT};
 use crate::hal::Hal;
 use crate::kernel::{Exit, Kernel};
 use crate::mem::Paddr;
@@ -25,10 +25,10 @@ impl<H: Hal> Kernel<H> {
         if ut.ty != ObjectType::Untyped {
             return Err(Error::WrongType);
         }
-        let device = ut.flags & FLAG_DEVICE != 0;
+        let kept = ut.flags & FLAG_KEPT != 0;
         let obits = ty.storage_bits(bits)? as u64;
         let cbits = if ty == ObjectType::CapSpace { bits } else { obits };
-        if device && !matches!(ty, ObjectType::Untyped | ObjectType::Frame) {
+        if kept && !matches!(ty, ObjectType::Untyped | ObjectType::Frame) {
             return Err(Error::BadArg);
         }
         if count == 0 || count > RETYPE_MAX {
@@ -55,7 +55,7 @@ impl<H: Hal> Kernel<H> {
         if end > 1u64 << ut.bits {
             return Err(Error::NoMemory);
         }
-        let zeroed = ty != ObjectType::Untyped && !device;
+        let zeroed = ty != ObjectType::Untyped && !kept;
         if zeroed {
             // Memory in [free, cleared) is zero. Extend that to `end`.
             let mut cleared = uslot.aux.get().max(start);

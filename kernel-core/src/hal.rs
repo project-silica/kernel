@@ -102,4 +102,7 @@ pub trait Hal {
     fn port_io(&self, port: u16, width: u8, write: bool, value: u32) -> u32;
     /// Write to the kernel's console.
     fn console(&self, bytes: &[u8]);
+    /// Turn the machine off, telling a test harness `status` (0: success).
+    /// Returns only where that is not possible.
+    fn power_off(&self, status: u64);
 }

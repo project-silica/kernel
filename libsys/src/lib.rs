@@ -19,12 +19,13 @@ mod arch;
 mod buffer;
 
 pub use buffer::{IpcBuffer, Pass};
+use silica_abi::NONBLOCK;
+pub use silica_abi::Syscall;
 pub use silica_abi::root;
 pub use silica_abi::{
     Error, FAULT_FETCH, FAULT_LABEL, FAULT_MAP, FAULT_PRESENT, FAULT_RESUME, FAULT_WRITE, Fault, IRQ_ACTIVE_LOW, IRQ_LEVEL, KEEP, MsgInfo,
     ObjectType, Rights, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
 };
-use silica_abi::{NONBLOCK, Syscall};
 
 /// Platform API level (`spec/CI_RELEASE.md` section 7).
 pub const API_LEVEL: u32 = 0;
@@ -71,6 +72,15 @@ pub enum Wait {
 fn sys(n: Syscall, a: [u64; 6]) -> Result<[u64; 6]> {
     let (status, out) = arch::syscall(n as u64, a);
     Error::result(status).map(|()| out)
+}
+
+/// System call `n` with six argument words, as the ABI defines it
+/// (`silica_abi::Syscall`): the six result words, or the error. The typed
+/// functions of this crate are built on it; use it for what they do not
+/// cover, such as testing how the kernel answers malformed arguments.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn raw(n: Syscall, a: [u64; 6]) -> Result<[u64; 6]> {
+    sys(n, a)
 }
 
 fn message(r: [u64; 6]) -> Message {
@@ -261,6 +271,28 @@ pub fn thread_resume(thread: Cap) -> Result<()> {
 /// Read `width` bytes (1, 2 or 4) from an I/O port covered by `ports`.
 pub fn port_in(ports: Cap, port: u16, width: u8) -> Result<u32> {
     sys(Syscall::PortIo, [ports.0, port as u64, width as u64, 0, 0, 0]).map(|r| r[0] as u32)
+}
+
+/// Write `bytes` to the kernel's console through a console capability, 32
+/// bytes per system call.
+pub fn console_write(console: Cap, bytes: &[u8]) -> Result<()> {
+    for chunk in bytes.chunks(32) {
+        let mut w = [0u64; 4];
+        for (i, b) in chunk.iter().enumerate() {
+            w[i / 8] |= (*b as u64) << (i % 8 * 8);
+        }
+        sys(Syscall::Console, [console.0, chunk.len() as u64, w[0], w[1], w[2], w[3]])?;
+    }
+    Ok(())
+}
+
+/// Turn the machine off through a power capability, telling a test harness
+/// `status` (0: success). Returns only with the reason it could not.
+pub fn power_off(power: Cap, status: u64) -> Error {
+    match sys(Syscall::PowerOff, [power.0, status, 0, 0, 0, 0]) {
+        Ok(_) => Error::Unsupported,
+        Err(e) => e,
+    }
 }
 
 /// Write `width` bytes (1, 2 or 4) to an I/O port covered by `ports`.

@@ -20,12 +20,21 @@ use crate::mem::{KObj, Paddr};
 use crate::smp::Word;
 use silica_abi::{Error, ObjectType, Rights, SLOT_BITS};
 
-/// Capability flag: device memory (not zeroed, mapped uncached).
+/// Capability flag: device memory, mapped with device attributes
+/// (uncached; on Arm also no unaligned access). Always also [`FLAG_KEPT`].
 pub const FLAG_DEVICE: u8 = 1;
 /// Hw capability flag: a range of I/O ports.
 pub const FLAG_PORTS: u8 = 2;
 /// Hw capability flag: a range of interrupt lines.
 pub const FLAG_IRQS: u8 = 4;
+/// Hw capability flag: the kernel's console.
+pub const FLAG_CONSOLE: u8 = 8;
+/// Hw capability flag: turning the machine off.
+pub const FLAG_POWER: u8 = 16;
+/// Untyped and Frame flag: memory whose contents are kept (device memory,
+/// firmware tables, the ramdisk). It is never zeroed, so it becomes only
+/// frames and smaller Untyped, never kernel objects.
+pub const FLAG_KEPT: u8 = 32;
 
 /// One capability slot.
 ///

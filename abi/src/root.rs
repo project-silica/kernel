@@ -16,6 +16,11 @@ pub const SLOT_PORTS: u64 = 4;
 pub const SLOT_IRQS: u64 = 5;
 /// Slot of the root thread's IPC buffer frame.
 pub const SLOT_IPCBUF: u64 = 6;
+/// Slot of the console capability: writes to the kernel's console
+/// (`Syscall::Console`).
+pub const SLOT_CONSOLE: u64 = 8;
+/// Slot of the power capability: turns the machine off (`Syscall::PowerOff`).
+pub const SLOT_POWER: u64 = 9;
 /// Slot of the Untyped the root task's own objects were made from; what is
 /// left of it is the root task's to use.
 pub const SLOT_BOOT_UNTYPED: u64 = 7;
@@ -46,7 +51,9 @@ pub const KIND_RAM: u8 = 0;
 /// Device or firmware memory: not zeroed, only retyped into frames or
 /// smaller untyped.
 pub const KIND_DEVICE: u8 = 1;
-/// Device-kind memory holding the ramdisk archive.
+/// Ordinary memory holding the ramdisk archive: like device memory it is
+/// never zeroed and becomes only frames and smaller untyped, but those map
+/// as ordinary memory.
 pub const KIND_RAMDISK: u8 = 2;
 
 /// The root task's start-up record. Read-only, mapped by the kernel.

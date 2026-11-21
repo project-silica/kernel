@@ -22,6 +22,15 @@ pub const EM_X86_64: u16 = 62;
 pub const EM_AARCH64: u16 = 183;
 /// `e_machine` for RISC-V.
 pub const EM_RISCV: u16 = 243;
+/// `e_machine` of the machine this code is built for: what a program loader
+/// running here accepts.
+pub const EM_NATIVE: u16 = if cfg!(target_arch = "aarch64") {
+    EM_AARCH64
+} else if cfg!(target_arch = "riscv64") {
+    EM_RISCV
+} else {
+    EM_X86_64
+};
 
 /// Segment may be executed.
 pub const PF_X: u32 = 1;

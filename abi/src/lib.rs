@@ -100,6 +100,20 @@ pub enum Syscall {
     /// `a1` processor, `a2` instruction pointer, `a3` stack pointer, `a4`
     /// the identity of what it waits on.
     Inspect = 18,
+    /// `a0` console capability (the root task's [`root::SLOT_CONSOLE`] or
+    /// one derived from it), `a1` number of bytes (at most 32), `a2` to `a5`
+    /// the bytes, eight to a register, lowest address in the low byte.
+    /// Writes them to the console the kernel logs to, so a program's lines
+    /// and the kernel's never tear each other. For bring-up and panics; the
+    /// logging service replaces it for everything else.
+    Console = 19,
+    /// `a0` power capability (the root task's [`root::SLOT_POWER`]), `a1`
+    /// status (0: success). Turns the machine off; a test harness (QEMU's
+    /// debug-exit device on x86_64, semihosting on aarch64 with
+    /// `exit=semihosting` on the kernel command line) is told the status.
+    /// Returns `Unsupported` where the machine cannot be turned off yet
+    /// (x86_64 outside a harness: that needs ACPI, M3).
+    PowerOff = 20,
 }
 
 impl Syscall {
@@ -128,6 +142,8 @@ impl Syscall {
             16 => Syscall::IrqBind,
             17 => Syscall::IrqAck,
             18 => Syscall::Inspect,
+            19 => Syscall::Console,
+            20 => Syscall::PowerOff,
             _ => return None,
         })
     }

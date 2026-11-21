@@ -38,6 +38,8 @@ struct Context {
 static PAGES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// PSCI through HVC (else SMC).
 static HVC: AtomicBool = AtomicBool::new(true);
+/// The firmware has PSCI.
+static PSCI: AtomicBool = AtomicBool::new(false);
 /// The loader's identity root, used once by each processor to turn its MMU on.
 pub static LOW_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -115,6 +117,14 @@ fn clean(va: u64, len: u64) {
     unsafe { asm!("dsb sy", options(nostack, preserves_flags)) }
 }
 
+/// Turn the machine off through PSCI SYSTEM_OFF. Returns only when the
+/// firmware has no PSCI (or refuses).
+pub fn system_off() {
+    if PSCI.load(Ordering::Relaxed) {
+        psci(0x8400_0008, 0, 0, 0);
+    }
+}
+
 fn psci(f: u64, a: u64, b: u64, c: u64) -> i64 {
     let r: u64;
     // SAFETY: a PSCI call to the firmware; CPU_ON does not touch this
@@ -163,6 +173,7 @@ pub fn prepare(rsdp: u64, regions: &mut RegionTable, gicr: (u64, u64)) -> usize 
         return 1;
     }
     HVC.store(flags & 2 != 0, Ordering::Relaxed);
+    PSCI.store(true, Ordering::Relaxed);
     let mut ids = [0u64; MAX_CPUS];
     let found = others(rsdp, &mut ids);
     if found == 0 {

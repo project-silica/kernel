@@ -476,6 +476,17 @@ impl Hal for X86 {
     fn console(&self, bytes: &[u8]) {
         serial::write(bytes);
     }
+
+    fn power_off(&self, status: u64) {
+        // QEMU's debug-exit device ends the emulation with this status
+        // (success 0x10, failure 0x11, as every test reports it). Turning a
+        // PC off takes ACPI's S5 sleep state, which comes with ACPI at M3;
+        // until then this returns and the caller is told Unsupported.
+        let code = if status == 0 { kernel_core::ExitStatus::Success } else { kernel_core::ExitStatus::Failure }.code();
+        // SAFETY: a write to the debug-exit port, the same the test harness
+        // has always used; on a machine without the device it is ignored.
+        unsafe { asm!("out dx, al", in("dx") 0xF4u16, in("al") code, options(nomem, nostack, preserves_flags)) }
+    }
 }
 
 /// The extended state every thread starts with, for clearing the registers.
@@ -955,6 +966,15 @@ pub(super) fn kernel_pte(phys: &Phys, vaddr: u64, level: u64) -> Option<*mut u64
     None
 }
 
+/// `panic=null`: reach a thread object through the null address, which must
+/// fault (physical page 0 is never mapped for the kernel), so the test sees
+/// a kernel exception with a backtrace through this function.
+#[inline(never)]
+fn deliberate_null_access(k: &'static Kernel<X86>) -> ! {
+    let v = core::hint::black_box(k.regs(core::hint::black_box(0)))[0].get();
+    panic!("physical page 0 is mapped: read {v:#x} through a null object address");
+}
+
 #[inline(never)]
 fn deliberate_panic() {
     panic!("deliberate panic requested with panic=test");
@@ -1023,6 +1043,33 @@ pub extern "C" fn kmain(info: u64) -> ! {
         table.fill(from);
         (table, k.phys.bytes(bi.cmdline, bi.cmdline_len), k.phys.bytes(bi.ramdisk, bi.ramdisk_len))
     };
+    // Physical page 0 is never an object (address 0 means "none" in the
+    // kernel), so it is unmapped in the physical map: a kernel bug that
+    // reaches an object through a null address faults at once, as on
+    // aarch64, instead of writing into page 0. The map's first 2 MiB block
+    // becomes a table of pages with the block's attributes (bits 7 and 12
+    // mean different things in the two kinds of entry, so only the common
+    // ones are copied).
+    if let (Some(pt), Some(pde)) = (table.carve(4096, 4096, 1 << 20, 1 << 32), kernel_pte(&k.phys, PHYS_MAP_BASE, 1)) {
+        // SAFETY: `pde` is the live entry of the physical map's first 2 MiB
+        // and `pt` a page nobody else has; no other processor runs yet, and
+        // the kernel touches nothing in physical page 0.
+        unsafe {
+            let v = *pde;
+            if v & PTE_P != 0 && v & PTE_PS != 0 {
+                let attrs = v & (0x17F | PTE_NX) & !PTE_PS;
+                let base = v & PTE_ADDR & !0x1F_FFFF;
+                let t = k.phys.ptr(pt).cast::<u64>();
+                *t = 0;
+                for i in 1..512u64 {
+                    *t.add(i as usize) = (base + i * 4096) | attrs;
+                }
+                *pde = pt | PTE_P | PTE_W;
+                flush_all();
+            }
+        }
+    }
+
     // The other processors: memory for each, taken before the root task is
     // given the rest. `cpus=1` on the command line keeps them asleep.
     let cpus = match Cmdline(cmdline).get("cpus") {
@@ -1048,6 +1095,9 @@ pub extern "C" fn kmain(info: u64) -> ! {
     }
     if Cmdline(cmdline).get("panic") == Some(b"test") {
         deliberate_panic();
+    }
+    if Cmdline(cmdline).get("panic") == Some(b"null") {
+        deliberate_null_access(k);
     }
 
     let Some(image) = kernel_core::ramdisk::find(ramdisk, "root") else {

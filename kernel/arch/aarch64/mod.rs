@@ -316,6 +316,15 @@ fn backtrace(first: u64, mut fp: u64) {
     }
 }
 
+/// `panic=null`: reach a thread object through the null address, which must
+/// fault (physical page 0 is never mapped for the kernel), so the test sees
+/// a kernel exception with a backtrace through this function.
+#[inline(never)]
+fn deliberate_null_access(k: &'static Kernel<Arm>) -> ! {
+    let v = core::hint::black_box(k.regs(core::hint::black_box(0)))[0].get();
+    panic!("physical page 0 is mapped: read {v:#x} through a null object address");
+}
+
 #[inline(never)]
 fn deliberate_panic(cpu: usize) -> ! {
     panic!("deliberate panic on processor {cpu}");
@@ -686,6 +695,15 @@ impl Hal for Arm {
     fn console(&self, bytes: &[u8]) {
         write_bytes(bytes);
     }
+
+    fn power_off(&self, status: u64) {
+        let code = if status == 0 { ExitStatus::Success } else { ExitStatus::Failure };
+        if HARNESS.load(Ordering::Relaxed) {
+            stop(code);
+        }
+        // PSCI SYSTEM_OFF; it returns only if the firmware has no PSCI.
+        smp::system_off();
+    }
 }
 
 // ---- entry from user mode ----------------------------------------------------
@@ -695,9 +713,18 @@ extern "C" fn user_trap(kind: u64) {
     let k = kernel();
     percpu().mode.enter_kernel();
     k.enter();
-    let regs = k.regs(k.current());
+    // While this processor waited for its lock, another one may have
+    // destroyed the thread it was running (that is what a kick waits for):
+    // then there is no frame to mark, and `syscall` and `fault` see that
+    // the thread is gone.
+    let cur = k.current();
+    let by_svc = |v: u64| {
+        if cur != 0 {
+            k.regs(cur)[cpu::REG_BY_SVC].set(v);
+        }
+    };
     if kind != 0 {
-        regs[cpu::REG_BY_SVC].set(0);
+        by_svc(0);
         irq(true);
         return;
     }
@@ -706,11 +733,11 @@ extern "C" fn user_trap(kind: u64) {
     unsafe { asm!("mrs {}, esr_el1", "mrs {}, far_el1", out(reg) esr, out(reg) far, options(nomem, nostack, preserves_flags)) }
     let class = esr >> 26 & 0x3F;
     if class == 0x15 {
-        regs[cpu::REG_BY_SVC].set(1);
+        by_svc(1);
         k.syscall();
         return;
     }
-    regs[cpu::REG_BY_SVC].set(0);
+    by_svc(0);
     match class {
         // Instruction abort (0x20) or data abort (0x24) from EL0. Fault
         // status 0x0C-0x0F is a permission fault: something is mapped.
@@ -827,6 +854,9 @@ extern "C" fn kmain(info: u64) -> ! {
         deliberate_panic(0);
     }
     let k = kernel();
+    if cmdline.get("panic") == Some(b"null") {
+        deliberate_null_access(k);
+    }
     BOOT_CPU.kstack_top.store(BOOT_STACK.0.get() as u64 + STACK_SIZE as u64, Ordering::Relaxed);
     BOOT_CPU.mpidr.store(gic::my_affinity(), Ordering::Relaxed);
     // SAFETY: once, on the boot processor, with interrupts masked; the

@@ -5,7 +5,7 @@
 //! Untyped, so it owns and is accounted for its own memory.
 
 use crate::boot::{Region, RegionKind};
-use crate::cap::{Cap, FLAG_DEVICE, FLAG_IRQS, FLAG_PORTS};
+use crate::cap::{Cap, FLAG_CONSOLE, FLAG_DEVICE, FLAG_IRQS, FLAG_KEPT, FLAG_PORTS, FLAG_POWER};
 use crate::elf::{Elf, ElfError, PF_W, PF_X};
 use crate::hal::Hal;
 use crate::kernel::{Exit, Kernel};
@@ -127,6 +127,8 @@ impl<H: Hal> Kernel<H> {
             self.insert_root(slot(SLOT_PORTS), &hw(FLAG_PORTS, 1 << 16));
         }
         self.insert_root(slot(SLOT_IRQS), &hw(FLAG_IRQS, 256));
+        self.insert_root(slot(SLOT_CONSOLE), &hw(FLAG_CONSOLE, 1));
+        self.insert_root(slot(SLOT_POWER), &hw(FLAG_POWER, 1));
         let asp = self.slot(slot(SLOT_ASPACE)).obj.get();
 
         // Every other piece of memory, as Untyped capabilities.
@@ -137,7 +139,13 @@ impl<H: Hal> Kernel<H> {
         let mut emit = |mut a: u64, b: u64, kind: u8| {
             while a < b && count < MAX_UNTYPED as u64 {
                 let bits = (a.trailing_zeros().min(63 - (b - a).leading_zeros()) as u8).min(silica_abi::UNTYPED_MAX_BITS);
-                let flags = if kind == KIND_RAM { 0 } else { FLAG_DEVICE };
+                // The ramdisk is ordinary memory whose contents are kept: it
+                // maps as memory, not as a device.
+                let flags = match kind {
+                    KIND_RAM => 0,
+                    KIND_RAMDISK => FLAG_KEPT,
+                    _ => FLAG_DEVICE | FLAG_KEPT,
+                };
                 let cap = Cap { ty: ObjectType::Untyped, rights: Rights::ALL, bits, flags, obj: a, badge: 0 };
                 self.insert_root(slot(SLOT_FIRST_UNTYPED + count), &cap);
                 let d = UntypedDesc { base: a, bits, kind, reserved: [0; 6] };

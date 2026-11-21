@@ -1439,7 +1439,35 @@ fn bench() -> ! {
     exit(true)
 }
 
+/// The console and power capabilities: a line through the console, and
+/// every way of misusing either is refused with the documented error.
+fn t_console() -> T {
+    console_write(Cap(SLOT_CONSOLE), b"console: a line written through the console capability\r\n")
+        .map_err(|_| "a console write failed")?;
+    let raw = |cap: u64, n: u64| libsys::raw(Syscall::Console, [cap, n, 0, 0, 0, 0]).map(|_| ());
+    if raw(SLOT_CONSOLE, 33) != Err(Error::BadArg) {
+        return Err("a console write of more than 32 bytes was accepted");
+    }
+    if raw(SLOT_IRQS, 1) != Err(Error::WrongType) || raw(SLOT_POWER, 1) != Err(Error::WrongType) {
+        return Err("a hardware capability that is not the console wrote to it");
+    }
+    let ep = new(ObjectType::Endpoint, 0);
+    if raw(ep.0, 1) != Err(Error::WrongType) || raw(0, 1) != Err(Error::BadCap) {
+        return Err("a console write through something that is not a capability to it was accepted");
+    }
+    let weak = slot();
+    cap_derive(SPACE, weak, Cap(SLOT_CONSOLE), Rights::READ, 0).map_err(|_| "derive a read-only console capability")?;
+    if raw(weak, 1) != Err(Error::NoRights) {
+        return Err("a console capability without write rights wrote");
+    }
+    if power_off(Cap(SLOT_CONSOLE), 0) != Error::WrongType || power_off(ep, 0) != Error::WrongType {
+        return Err("something other than the power capability was accepted to turn the machine off");
+    }
+    Ok(())
+}
+
 const TESTS: &[(&str, fn() -> T)] = &[
+    ("console", t_console),
     ("syscall", t_syscall),
     ("fault_page", t_fault_page),
     ("fault_instruction", t_fault_instruction),

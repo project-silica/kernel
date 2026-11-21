@@ -157,6 +157,7 @@ impl Hal for TestHal {
     fn console(&self, bytes: &[u8]) {
         self.console.borrow_mut().extend_from_slice(bytes);
     }
+    fn power_off(&self, _: u64) {}
 }
 
 /// A minimal ELF64 executable: one read-execute segment at 0x40_0000 and
