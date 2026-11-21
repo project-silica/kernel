@@ -184,7 +184,7 @@ impl Hal for X86 {
         // format declared in XCOMP_BV.
         let area = thread + FPU_OFFSET as u64;
         phys.write_val(area, &0x037Fu16);
-        phys.write_val(area + 24, &0x1F80u32);
+        phys.write_val(area + 24, &MXCSR_DEFAULT);
         if self.xsave_kind.get() == 2 {
             phys.write_val(area + 520, &(1u64 << 63 | self.xcr0.get()));
         }
@@ -207,12 +207,15 @@ impl Hal for X86 {
         // in the kernel the user's GS base is the inactive one, reached by
         // SWAPGS; interrupts are off, so nothing runs between the two swaps.
         unsafe {
+            // The control words the processor holds now (the outgoing
+            // thread's): a thread that resumes from a system call gets its
+            // own loaded only where they differ, and they rarely do.
+            let mut hw = [0u32; 2];
+            asm!("stmxcsr [{p}]", "fnstcw [{p} + 4]", p = in(reg) hw.as_mut_ptr(), options(nostack));
             if from != 0 {
                 let regs = kernel().regs(from);
                 if regs[REG_BY_SYSCALL].get() != 0 {
-                    let mut ctl = [0u32; 2];
-                    asm!("stmxcsr [{p}]", "fnstcw [{p} + 4]", p = in(reg) ctl.as_mut_ptr(), options(nostack));
-                    regs[REG_FPCTL].set(ctl[0] as u64 | (ctl[1] as u64) << 32);
+                    regs[REG_FPCTL].set(hw[0] as u64 | (hw[1] as u64) << 32);
                 } else {
                     let area = phys.ptr(from + FPU_OFFSET as u64);
                     match kind {
@@ -229,22 +232,35 @@ impl Hal for X86 {
                     // More than x87, SSE and AVX is enabled, or the processor
                     // cannot say what is in use: restore the initial image.
                     self.restore(INIT_STATE.0.get().cast());
+                    hw = [MXCSR_DEFAULT, FCW_DEFAULT];
                 } else {
-                    // VZEROALL clears every SSE and AVX register. x87 is
-                    // reset only when XINUSE says it holds anything.
+                    // VZEROALL clears every SSE and AVX register (MXCSR is
+                    // kept). x87 is reset only when XINUSE says it holds
+                    // anything, and FNINIT sets its control word to the default.
+                    let x87: u32;
                     asm!(
-                        "vzeroall", "mov ecx, 1", "xgetbv", "test al, 1", "jz 2f", "fninit", "2:",
-                        out("eax") _, out("ecx") _, out("edx") _, options(nostack, nomem),
+                        "vzeroall", "mov ecx, 1", "xgetbv", "and eax, 1", "jz 2f", "fninit", "2:",
+                        out("eax") x87, out("ecx") _, out("edx") _, options(nostack, nomem),
                     );
+                    if x87 != 0 {
+                        hw[1] = FCW_DEFAULT;
+                    }
                 }
-                asm!("ldmxcsr [{p}]", "fldcw [{p} + 4]", p = in(reg) ctl.as_ptr(), options(nostack));
+                if ctl[0] != hw[0] {
+                    asm!("ldmxcsr [{p}]", p = in(reg) ctl.as_ptr(), options(nostack));
+                }
+                if ctl[1] & 0xFFFF != hw[1] & 0xFFFF {
+                    asm!("fldcw [{p} + 4]", p = in(reg) ctl.as_ptr(), options(nostack));
+                }
             } else {
                 self.restore(phys.ptr(to + FPU_OFFSET as u64));
             }
             let (old_fs, old_gs): (u64, u64);
             if self.fsgsbase.get() {
+                // Written only when they change: most threads have neither.
                 asm!(
-                    "rdfsbase {of}", "wrfsbase {nf}", "swapgs", "rdgsbase {og}", "wrgsbase {ng}", "swapgs",
+                    "rdfsbase {of}", "cmp {of}, {nf}", "je 2f", "wrfsbase {nf}", "2:",
+                    "swapgs", "rdgsbase {og}", "cmp {og}, {ng}", "je 3f", "wrgsbase {ng}", "3:", "swapgs",
                     of = out(reg) old_fs, nf = in(reg) fs, og = out(reg) old_gs, ng = in(reg) gs,
                     options(nostack, nomem),
                 );
@@ -498,6 +514,10 @@ impl X86 {
     }
 }
 
+/// MXCSR and the x87 control word as the processor's initial state has them.
+const MXCSR_DEFAULT: u32 = 0x1F80;
+const FCW_DEFAULT: u32 = 0x037F;
+
 /// A user FS or GS base the processor accepts (it faults on a non-canonical one).
 fn canonical(v: u64) -> u64 {
     if v < 1 << 47 || v >= !0 << 47 { v } else { 0 }
@@ -710,7 +730,7 @@ pub(super) fn init_processor(first: bool) {
             // The initial image: default control words, nothing in use.
             let init = INIT_STATE.0.get().cast::<u8>();
             init.cast::<u16>().write(0x037F);
-            init.add(24).cast::<u32>().write(0x1F80);
+            init.add(24).cast::<u32>().write(MXCSR_DEFAULT);
             if kind == 2 {
                 init.add(520).cast::<u64>().write(1 << 63 | xcr0);
             }

@@ -121,17 +121,25 @@ pub fn hold_in_vector_registers(v: u64, ticks: u64) -> [u64; 3] {
     [a, b, c]
 }
 
-/// Fill vector registers with `v` and yield once.
-pub fn yield_holding_secret(v: u64) {
+/// Fill vector registers with `v` and yield once; return this thread's
+/// floating-point control register and thread pointer afterwards.
+pub fn yield_holding_secret(v: u64) -> [u64; 2] {
+    let (fpcr, tp): (u64, u64);
     // SAFETY: only registers declared here are touched; call 4 is Yield.
     unsafe {
         asm!(
             "dup v0.2d, {v}", "mov v1.16b, v0.16b", "mov v7.16b, v0.16b", "mov v15.16b, v0.16b",
             "mov x8, #4", "svc #0",
-            v = in(reg) v, clobber_abi("C"), options(nostack),
+            "mrs x20, fpcr", "mrs x21, tpidr_el0",
+            v = in(reg) v, out("x20") fpcr, out("x21") tp, clobber_abi("C"), options(nostack),
         );
     }
+    [fpcr, tp]
 }
+
+/// What [`yield_holding_secret`] and [`fp_control_across_yield`] report for
+/// a thread that never changed them.
+pub const CONTROLS_DEFAULT: [u64; 2] = [0, 0];
 
 /// Yield, then return what two vector registers hold (both should be clear
 /// after a system call); there is no x87 stack here.
@@ -148,19 +156,21 @@ pub fn vectors_after_yield() -> (u64, u64, bool) {
     (a, b, false)
 }
 
-/// Set a non-default rounding mode, yield, and return what was set and what
-/// is there afterwards (restoring the default).
-pub fn fp_control_across_yield() -> (u64, u64) {
-    let fpcr_in = 3u64 << 22; // round toward zero
-    let fpcr_out: u64;
-    // SAFETY: sets FPCR around a Yield; restores the default.
+/// Set a non-default rounding mode and thread pointer, yield, and return
+/// what was set and what is there afterwards (restoring the defaults).
+pub fn fp_control_across_yield() -> ([u64; 2], [u64; 2]) {
+    let set = [3u64 << 22, 0x1234_5000]; // round toward zero
+    let (fpcr, tp): (u64, u64);
+    // SAFETY: sets FPCR and TPIDR_EL0 around a Yield; restores the defaults
+    // (this program uses no thread pointer).
     unsafe {
         asm!(
-            "msr fpcr, {i}", "mov x8, #4", "svc #0", "mrs x20, fpcr", "msr fpcr, xzr",
-            i = in(reg) fpcr_in, out("x20") fpcr_out, clobber_abi("C"), options(nostack),
+            "msr fpcr, {f}", "msr tpidr_el0, {t}", "mov x8, #4", "svc #0",
+            "mrs x20, fpcr", "mrs x21, tpidr_el0", "msr fpcr, xzr", "msr tpidr_el0, xzr",
+            f = in(reg) set[0], t = in(reg) set[1], out("x20") fpcr, out("x21") tp, clobber_abi("C"), options(nostack),
         );
     }
-    (fpcr_in, fpcr_out)
+    (set, [fpcr, tp])
 }
 
 /// One Yield with live vector state, timed in counter ticks.

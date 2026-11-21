@@ -459,10 +459,18 @@ extern "C" fn fpu_worker(arg: u64) -> ! {
     finish(arg)
 }
 
+/// Set by `fpu_secret_holder` when it sees control state that is not its own.
+static CONTROLS_LEAKED: AtomicU64 = AtomicU64::new(0);
+
 extern "C" fn fpu_secret_holder(arg: u64) -> ! {
     // Fill the vector registers with a recognisable value and yield, for ever.
+    // Also record whether, after a yield, its control words or thread
+    // pointer were ever anything but its own (the defaults): another
+    // thread's leaking in.
     loop {
-        arch::yield_holding_secret(0x5EC2_E75E_C2E7_u64 | arg << 48);
+        if arch::yield_holding_secret(0x5EC2_E75E_C2E7_u64 | arg << 48) != arch::CONTROLS_DEFAULT {
+            CONTROLS_LEAKED.store(1, SeqCst);
+        }
         if SHARED[2].load(SeqCst) != 0 {
             finish(arg)
         }
@@ -511,11 +519,22 @@ fn t_fpu() -> T {
             return Err("after a system call a thread saw another thread's x87 stack");
         }
     }
-    // 3. The control words are the thread's own across a switch.
-    let (mxcsr_in, mxcsr_out) = arch::fp_control_across_yield();
+    // 3. Floating-point control words and the thread pointer are each
+    // thread's own across a switch, both ways: this thread gets its own
+    // back, and the thread it yielded to never sees them.
+    for _ in 0..20 {
+        let (set, got) = arch::fp_control_across_yield();
+        if got != set {
+            SHARED[2].store(1, SeqCst);
+            return Err(
+                "the floating-point control words or the thread pointer were not preserved across a system call that switched threads",
+            );
+        }
+    }
+    let _ = arch::vectors_after_yield();
     SHARED[2].store(1, SeqCst);
-    if mxcsr_out != mxcsr_in {
-        return Err("the floating-point control word was not preserved across a system call that switched threads");
+    if CONTROLS_LEAKED.load(SeqCst) != 0 {
+        return Err("a thread saw another thread's floating-point control words or thread pointer after a switch");
     }
     Ok(())
 }
@@ -1437,9 +1456,38 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     UNTYPED.store(SLOT_FIRST_UNTYPED + big as u64, SeqCst);
 
     let cmdline = &info.cmdline[..info.cmdline_len as usize];
-    if cmdline.split(|&b| b == b' ' || b == b'\n').any(|w| w.trim_ascii() == b"bench") {
+    let words = || cmdline.split(|&b| b == b' ' || b == b'\n').map(<[u8]>::trim_ascii);
+    if words().any(|w| w == b"bench") {
         println!("BENCH MARK userspace");
         bench()
+    }
+    // "bench=<name>[:<times>]": that one benchmark alone, once or <times>
+    // times over, for a profile of its path (tools/profile.sh).
+    if let Some(arg) = words().find_map(|w| w.strip_prefix(b"bench=")) {
+        let (name, times) = match arg.iter().position(|&b| b == b':') {
+            Some(i) => (&arg[..i], core::str::from_utf8(&arg[i + 1..]).ok().and_then(|n| n.parse().ok()).unwrap_or(0)),
+            None => (arg, 1),
+        };
+        let f: fn() = match name {
+            b"null" => bench_null_syscall,
+            b"ipc" => bench_ipc,
+            b"ctx" => bench_ctx_switch,
+            b"fault" => bench_page_fault,
+            b"timer" => bench_timer,
+            _ => {
+                println!("ERROR: roottest: no benchmark of that name (null, ipc, ctx, fault, timer)");
+                exit(false)
+            }
+        };
+        if times == 0 {
+            println!("ERROR: roottest: bench=<name>:<times> needs a count of at least 1");
+            exit(false)
+        }
+        for _ in 0..times {
+            f();
+        }
+        println!("BENCH DONE");
+        exit(true)
     }
     let test = cmdline.split(|&b| b == b' ' || b == b'\n').find_map(|w| w.strip_prefix(b"test="));
     let Some(name) = test.and_then(|n| core::str::from_utf8(n).ok()).map(str::trim_ascii) else {

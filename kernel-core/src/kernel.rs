@@ -253,12 +253,39 @@ impl<H: Hal> Kernel<H> {
             return;
         }
         let r = &self.thread(t).regs;
-        let g = |i: usize| r[H::ARG[i]].get();
-        let a = [g(0), g(1), g(2), g(3), g(4), g(5)];
         let Some(s) = Syscall::from_u64(r[H::SYS].get()) else {
             r[H::SYS].set(Error::BadSyscall as u64);
             return;
         };
+        match s {
+            // Only this processor's scheduling state.
+            Syscall::Yield => {
+                me.resched.set(true);
+                me.dirty.set(true);
+                r[H::SYS].set(0);
+            }
+            Syscall::Call | Syscall::ReplyRecv => {
+                let g = |i: usize| r[H::ARG[i]].get();
+                let a = [g(0), g(1), g(2), g(3), g(4), g(5)];
+                let fast = if s == Syscall::Call { self.fast_call(t, &a) } else { self.fast_reply_recv(t, &a) };
+                // A fast path leaves the thread blocked: whoever wakes it
+                // sets its status.
+                if !fast {
+                    self.syscall_general(s, t);
+                }
+            }
+            _ => self.syscall_general(s, t),
+        }
+    }
+
+    /// Any syscall, under whatever locks it needs. Out of line: the paths
+    /// above must not pay for this one's registers and stack.
+    #[inline(never)]
+    fn syscall_general(&self, s: Syscall, t: Paddr) {
+        let me = self.me();
+        let r = &self.thread(t).regs;
+        let g = |i: usize| r[H::ARG[i]].get();
+        let a = [g(0), g(1), g(2), g(3), g(4), g(5)];
         let mut global = !self.is_local(s, t, &a);
         if global {
             match self.try_pair(s, t, &a) {

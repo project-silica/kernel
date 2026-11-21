@@ -394,3 +394,147 @@ impl<H: Hal> Kernel<H> {
         }
     }
 }
+
+// The fast paths. A call and a reply-and-receive between two threads of one
+// processor, through endpoints that processor owns, with no capabilities in
+// the message, is most of all IPC. These do exactly what the general path
+// (`send`, `hand_off`, `await_reply`; `reply`, `recv_any`, `hand_off`) does
+// in that case, without the checks for everything that cannot happen in
+// it. Each first checks every condition, changing nothing, and returns
+// false if one fails: the general path then runs as if the fast one had
+// not been tried. Under this processor's lock alone, everything checked
+// stays as it was checked: it belongs to this processor.
+impl<H: Hal> Kernel<H> {
+    /// The endpoint or notification capability at `index` of `t`'s
+    /// CapSpace with `rights`, and its slot.
+    fn fast_cap(&self, t: Paddr, index: u64, ty: ObjectType, rights: Rights) -> Option<(Paddr, crate::cap::Cap)> {
+        let slot = self.cslot(t, index).ok()?;
+        let cap = self.slot(slot).cap()?;
+        (cap.ty == ty && cap.rights.has(rights)).then_some((slot, cap))
+    }
+
+    /// Whether a message of `words` words from `from` to `to` can be copied
+    /// whole: it fits in registers, or both have an IPC buffer.
+    fn fast_words_fit(&self, from: Paddr, to: Paddr, words: usize) -> bool {
+        words <= MsgInfo::REG_WORDS || (self.ipc_buffer(from).is_some() && self.ipc_buffer(to).is_some())
+    }
+
+    /// Copy `t`'s message (no capabilities) to `to`, as `transfer` does.
+    fn fast_transfer(&self, a: &[u64; 6], from: Paddr, to: Paddr, badge: u64) {
+        let info = MsgInfo(a[1]);
+        let words = info.words();
+        let tt = self.thread(to);
+        tt.regs[H::ARG[0]].set(badge);
+        tt.regs[H::ARG[1]].set(MsgInfo::with_caps(info.label(), words, 0).0);
+        for i in 2..6 {
+            tt.regs[H::ARG[i]].set(a[i]);
+        }
+        if words > MsgInfo::REG_WORDS
+            && let (Some(src), Some(dst)) = (self.ipc_buffer(from), self.ipc_buffer(to))
+        {
+            for i in MsgInfo::REG_WORDS..words {
+                let o = (i * 8) as u64;
+                self.phys.word(dst + o).set(self.phys.word(src + o).get());
+            }
+        }
+        tt.regs[H::SYS].set(0);
+    }
+
+    /// Hand this processor to `to`, which waits without a deadline, at the
+    /// end of this kernel entry.
+    fn fast_hand_off(&self, to: Paddr) {
+        let th = self.thread(to);
+        th.blocked_on.set(0);
+        th.state.set(crate::thread::RUNNABLE);
+        let me = self.me();
+        me.direct.set(to);
+        me.dirty.set(true);
+    }
+
+    /// `Call` of thread `t` (current on this processor) with arguments `a`.
+    pub(crate) fn fast_call(&self, t: Paddr, a: &[u64; 6]) -> bool {
+        let info = MsgInfo(a[1]);
+        if info.caps() != 0 {
+            return false;
+        }
+        let Some((slot, ep)) = self.fast_cap(t, a[0], ObjectType::Endpoint, Rights::WRITE) else { return false };
+        let me = self.hal.cpu() as u64;
+        let q = self.queue(ep.obj);
+        if q.owner.get() != me + 1 || q.kind.get() != RECEIVERS {
+            return false;
+        }
+        let r = q.head.get();
+        let (th, rt) = (self.thread(t), self.thread(r));
+        let local = |x: Paddr| x == 0 || self.thread(x).cpu.get() == me;
+        if rt.cpu.get() != me
+            || rt.caller.get() != 0
+            || rt.park.get() != 0
+            || rt.deadline.get() != 0
+            || !local(th.caller.get())
+            || self.me().direct.get() != 0
+            || !self.fast_words_fit(t, r, info.words())
+        {
+            return false;
+        }
+        // `send` to a waiting receiver.
+        th.via_slot.set(slot);
+        th.ipc_flags.set(IPC_CALL | if ep.rights.has(Rights::GRANT) { IPC_GRANT } else { 0 });
+        self.q_remove(&q.head, &q.tail, r);
+        if q.head.get() == 0 {
+            q.kind.set(0);
+        }
+        self.fast_transfer(a, t, r, ep.badge);
+        self.fast_hand_off(r);
+        // `await_reply`, without a notification to park on.
+        self.q_push(&q.pend_head, &q.pend_tail, t);
+        th.via.set(ep.obj);
+        rt.caller.set(t);
+        th.state.set(REPLY);
+        th.blocked_on.set(r);
+        true
+    }
+
+    /// `ReplyRecv` of thread `t` (current on this processor) with arguments `a`.
+    pub(crate) fn fast_reply_recv(&self, t: Paddr, a: &[u64; 6]) -> bool {
+        let info = MsgInfo(a[1]);
+        if info.caps() != 0 || a[0] == 0 {
+            return false;
+        }
+        let th = self.thread(t);
+        let c = th.caller.get();
+        if c == 0 {
+            return false;
+        }
+        let me = self.hal.cpu() as u64;
+        let ct = self.thread(c);
+        let via = ct.via.get();
+        if ct.cpu.get() != me
+            || ct.ipc_flags.get() & (IPC_FAULT | IPC_PARKED) != 0
+            || ct.deadline.get() != 0
+            || (via != 0 && self.queue(via).owner.get() != me + 1)
+            || self.me().direct.get() != 0
+            || !self.fast_words_fit(t, c, info.words())
+        {
+            return false;
+        }
+        let Some((slot, ep)) = self.fast_cap(t, a[0], ObjectType::Endpoint, Rights::READ) else { return false };
+        let q = self.queue(ep.obj);
+        if q.owner.get() != me + 1 || q.kind.get() == SENDERS {
+            return false;
+        }
+        // `answer` the caller and hand this processor to it.
+        self.unpend(c);
+        th.caller.set(0);
+        ct.ipc_flags.set(0);
+        self.fast_transfer(a, t, c, 0);
+        self.fast_hand_off(c);
+        // `recv` with nothing to receive yet.
+        th.park.set(0);
+        th.via_slot.set(slot);
+        q.kind.set(RECEIVERS);
+        self.q_push(&q.head, &q.tail, t);
+        th.state.set(RECEIVING);
+        th.blocked_on.set(ep.obj);
+        true
+    }
+}

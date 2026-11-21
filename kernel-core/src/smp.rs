@@ -42,6 +42,7 @@ use core::cell::Cell;
 
 /// Most processors the kernel will run.
 pub const MAX_CPUS: usize = 256;
+const _: () = assert!(MAX_CPUS.is_power_of_two());
 
 /// One processor's lock and scheduling state (protected by the lock). Each
 /// has its own cache lines: processors working independently must not make
@@ -121,7 +122,12 @@ impl Cpu {
 impl<H: Hal> Kernel<H> {
     /// This processor's state.
     pub(crate) fn me(&self) -> &Cpu {
-        &self.cpus[self.hal.cpu()]
+        // Masked rather than bounds-checked: this is on every path through
+        // the kernel, and a processor's index is below MAX_CPUS (a power of
+        // two) by construction.
+        let i = self.hal.cpu();
+        debug_assert!(i < MAX_CPUS);
+        &self.cpus[i & (MAX_CPUS - 1)]
     }
 
     /// Number of processors the machine has (set once at boot).
