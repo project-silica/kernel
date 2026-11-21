@@ -92,7 +92,7 @@ impl Hal for ProofHal {
         kani::any()
     }
     fn idle_begin(&self) {}
-    fn idle(&self) {}
+    fn idle(&self, _: u64) {}
     fn irq_route(&self, _: usize, _: usize, _: bool, _: bool) -> bool {
         false
     }
