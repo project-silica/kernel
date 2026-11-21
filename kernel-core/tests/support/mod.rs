@@ -289,7 +289,7 @@ impl Machine {
             regions: &regions,
             elf: &elf,
             machine: 62,
-            reserved: &[],
+            reserved: &[(0xA000, 0xD000), (0x3000, 0x6000), (0x5000, 0x8000)],
             device_top: 0,
             ports: true,
             ramdisk: [RAM_BASE + (mib << 20) - 0x4000, 0x4000],

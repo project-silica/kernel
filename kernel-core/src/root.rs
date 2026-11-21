@@ -36,7 +36,7 @@ pub struct RootSpec<'a> {
     pub elf: &'a [u8],
     /// `e_machine` the image must have.
     pub machine: u16,
-    /// Device ranges the kernel keeps (interrupt controllers), sorted.
+    /// Device ranges the kernel keeps. Firmware may describe them in any order.
     pub reserved: &'a [(u64, u64)],
     /// Device memory is handed out up to this address.
     pub device_top: u64,
@@ -147,12 +147,12 @@ impl<H: Hal> Kernel<H> {
             }
         };
         let device = |mut a: u64, b: u64, emit: &mut dyn FnMut(u64, u64, u8)| {
-            for &(ra, rb) in spec.reserved {
-                if rb <= a || ra >= b {
-                    continue;
+            while let Some(&(start, end)) = spec.reserved.iter().filter(|&&(lo, hi)| lo < hi && hi > a && lo < b).min_by_key(|r| r.0) {
+                emit(a, start, KIND_DEVICE);
+                a = end.min(b);
+                if a == b {
+                    return;
                 }
-                emit(a, ra.max(a), KIND_DEVICE);
-                a = rb.min(b);
             }
             emit(a, b, KIND_DEVICE);
         };

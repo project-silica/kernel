@@ -39,6 +39,14 @@ fn root_task_starts_with_documented_layout() {
             covered += 1 << d.bits;
         }
     }
+    // The low device window has two holes reserved by the platform, one
+    // described by overlapping records. Every other page is granted once.
+    let untyped = m.untyped();
+    for page in (0..RAM_BASE).step_by(4096) {
+        let owners = untyped.iter().filter(|(_, d)| d.base <= page && page < d.base + (1 << d.bits)).count();
+        let reserved = (0x3000..0x8000).contains(&page) || (0xA000..0xD000).contains(&page);
+        assert_eq!(owners, usize::from(!reserved), "wrong coverage at {page:#x}");
+    }
     assert_eq!(covered, 16 << 20);
     assert!(m.untyped().iter().any(|(_, d)| d.kind == KIND_RAMDISK && d.bits == 14));
     // The image is mapped: its entry point translates.
