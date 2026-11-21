@@ -238,7 +238,17 @@ impl<H: Hal> Kernel<H> {
     /// The thread processor `cpu` runs next, taken off its queue: the
     /// earliest deadline with budget left, else the least-run fair thread.
     /// 0 when nothing can run.
+    #[inline]
     pub(crate) fn pick(&self, cpu: &Cpu, now: u64) -> Paddr {
+        // The common case: no deadline work on this processor.
+        if cpu.dl_head.get() == 0 {
+            return self.q_pop(&cpu.rq_head, &cpu.rq_tail);
+        }
+        self.pick_deadline(cpu, now)
+    }
+
+    #[inline(never)]
+    fn pick_deadline(&self, cpu: &Cpu, now: u64) -> Paddr {
         let (mut best, mut best_d) = (0, u64::MAX);
         let mut t = cpu.dl_head.get();
         while t != 0 {

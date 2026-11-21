@@ -581,6 +581,21 @@ impl<H: Hal> Kernel<H> {
             }
             let cur = me.cur.get();
             let cur_ok = cur != 0 && self.thread(cur).state.get() == RUNNABLE;
+            let direct = me.direct.replace(0);
+            if direct != 0 {
+                // A hand-off: whoever was paying for this processor's time
+                // still is (`sched.rs`), and no clock is read. A thread
+                // another processor woke meanwhile is weighed against the
+                // thread handed to, in one more pass.
+                if cur_ok {
+                    self.enqueue(me, cur);
+                }
+                me.cur.set(direct);
+                if me.woken.get() {
+                    continue;
+                }
+                break;
+            }
             // A thread another processor woke: does the first one waiting
             // now come before the running one?
             if me.woken.get() && cur_ok {
@@ -589,16 +604,6 @@ impl<H: Hal> Kernel<H> {
                 if first != 0 && self.preempts(me, first) {
                     me.resched.set(true);
                 }
-            }
-            let direct = me.direct.replace(0);
-            if direct != 0 {
-                // A hand-off: whoever was paying for this processor's time
-                // still is (`sched.rs`), and no clock is read.
-                if cur_ok {
-                    self.enqueue(me, cur);
-                }
-                me.cur.set(direct);
-                break;
             }
             let others = me.rq_head.get() != 0 || me.dl_head.get() != 0;
             if cur_ok && !me.resched.get() {
@@ -622,10 +627,10 @@ impl<H: Hal> Kernel<H> {
             // Choose afresh: queue the running thread (behind its equals if
             // it yielded) and pick.
             if cur_ok {
+                let th = self.thread(cur);
                 let tail = me.rq_tail.get();
-                if me.yielded.replace(false) && tail != 0 && self.dl_of(cur).is_none() {
+                if me.yielded.replace(false) && tail != 0 && (th.sc.get() == 0 || self.dl_of(cur).is_none()) {
                     // A yield: behind every fair thread waiting.
-                    let th = self.thread(cur);
                     th.vr.set(th.vr.get().max(self.thread(tail).vr.get()));
                     self.q_push(&me.rq_head, &me.rq_tail, cur);
                 } else {

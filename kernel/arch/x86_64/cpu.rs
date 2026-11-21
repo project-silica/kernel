@@ -20,7 +20,8 @@ use silica_abi::Fault;
 pub const STACK_SIZE: usize = 64 * 1024;
 
 /// What `gs` points to in kernel mode: one per processor. The offsets of
-/// the first five fields are used by the assembly below.
+/// the first five fields are used by the assembly below. Everything a
+/// system call reads here is in the first 64 bytes.
 #[repr(C)]
 pub struct PerCpu {
     /// 0: top of the kernel stack.
@@ -34,8 +35,13 @@ pub struct PerCpu {
     pub verw: u64,
     /// 32: the address of this structure.
     pub this: u64,
-    /// The processor's index in the kernel.
+    /// 40: the processor's index in the kernel.
     pub index: usize,
+    /// `kernel_core::smp::cpu_slot(index)`, for `Hal::cpu_slot`.
+    pub slot: usize,
+    /// The address of this processor's kernel lock (`Kernel::cpu_lock`),
+    /// which the system-call entry takes before it saves anything.
+    pub lock: u64,
     /// Its x2APIC identifier.
     pub apic_id: u32,
     /// Where the processor is; read by other processors.
@@ -53,12 +59,8 @@ pub struct PerCpu {
     /// How long this processor takes to come out of an idle wait once its
     /// timer fires, in nanoseconds (a running average; see `X86::idle`).
     pub wake_ns: Cell<u64>,
-    /// `kernel_core::smp::cpu_slot(index)`, for `Hal::cpu_slot`.
-    pub slot: usize,
-    /// The address of this processor's kernel lock (`Kernel::cpu_lock`),
-    /// which the system-call entry takes before it saves anything.
-    pub lock: u64,
 }
+const _: () = assert!(core::mem::offset_of!(PerCpu, index) == 40 && core::mem::offset_of!(PerCpu, lock) < 64);
 
 #[repr(C, packed)]
 struct Tss {
