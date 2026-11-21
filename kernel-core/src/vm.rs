@@ -31,33 +31,42 @@ impl<H: Hal> Kernel<H> {
         self.phys.obj(a)
     }
 
-    /// The entry for `vaddr` at `level` (0: 4 KiB pages, 1: 2 MiB pages).
-    /// With `alloc`, missing tables are created.
-    fn pte(&self, a: Paddr, vaddr: u64, level: u8, alloc: bool) -> Result<Option<&Cell<u64>>, Error> {
-        let h = self.aspace(a);
+    /// Walk to the requested level, stopping at a missing entry or a leaf.
+    fn walk(&self, a: Paddr, va: u64, level: u8) -> (&Cell<u64>, u8) {
         let mut table = a + PAGE;
-        for l in (level + 1..4).rev() {
-            let e = self.phys.word(table + ((vaddr >> (12 + 9 * l as u64)) & 511) * 8);
-            if H::pte_present(e.get()) {
-                if H::pte_is_leaf(e.get(), l) {
-                    return Err(Error::Overlap);
-                }
-                table = H::pte_addr(e.get());
-            } else if alloc {
-                let used = h.used.get();
-                if used + 2 >= 1u64 << (h.bits.get() - PAGE_BITS as u64) {
-                    return Err(Error::NoMemory);
-                }
-                h.used.set(used + 1);
-                let page = a + (used + 2) * PAGE;
-                self.phys.zero(page, PAGE);
-                e.set(H::pte_table(page));
-                table = page;
-            } else {
-                return Ok(None);
+        let mut at = 3;
+        loop {
+            let entry = self.phys.word(table + ((va >> (PAGE_BITS + 9 * at)) & 511) * 8);
+            let value = entry.get();
+            if at == level || !H::pte_present(value) || H::pte_is_leaf(value, at) {
+                return (entry, at);
             }
+            table = H::pte_addr(value);
+            at -= 1;
         }
-        Ok(Some(self.phys.word(table + ((vaddr >> (12 + 9 * level as u64)) & 511) * 8)))
+    }
+
+    /// Check both overlap and table capacity without changing the address
+    /// space. Each missing subtree is counted once, even for a frame that
+    /// crosses several table boundaries.
+    fn check_map(&self, a: Paddr, mut va: u64, end: u64, level: u8) -> Result<(), Error> {
+        let h = self.aspace(a);
+        let mut available = (1 << (h.bits.get() - PAGE_BITS as u64)) - 2 - h.used.get();
+        while va < end {
+            let (entry, at) = self.walk(a, va, level);
+            if H::pte_present(entry.get()) {
+                return Err(Error::Overlap);
+            }
+            let span = 1 << (PAGE_BITS + 9 * at);
+            let stop = end.min((va | (span - 1)) + 1);
+            for parent in level + 1..=at {
+                let shift = PAGE_BITS + 9 * parent;
+                let tables = ((stop - 1) >> shift) - (va >> shift) + 1;
+                available = available.checked_sub(tables).ok_or(Error::NoMemory)?;
+            }
+            va = stop;
+        }
+        Ok(())
     }
 
     /// Map the frame in slot `fs` at `vaddr` in address space `a`.
@@ -90,20 +99,22 @@ impl<H: Hal> Kernel<H> {
         if !vaddr.is_multiple_of(step) || vaddr >= H::USER_TOP || size > H::USER_TOP - vaddr {
             return Err(Error::BadArg);
         }
-        let count = size / step;
-        for i in 0..count {
-            let e = self.pte(a, vaddr + i * step, level, true)?.ok_or(Error::NoMemory)?;
-            if H::pte_present(e.get()) {
-                return Err(Error::Overlap);
-            }
-        }
+        self.check_map(a, vaddr, vaddr + size, level)?;
         let device = cap.flags & FLAG_DEVICE != 0;
-        for i in 0..count {
-            if let Ok(Some(e)) = self.pte(a, vaddr + i * step, level, false) {
-                e.set(H::pte_leaf(cap.obj + i * step, rights, level, device));
-            }
-        }
         let h = self.aspace(a);
+        for i in 0..size / step {
+            let va = vaddr + i * step;
+            let (mut entry, at) = self.walk(a, va, level);
+            for child in (level..at).rev() {
+                let used = h.used.get();
+                let page = a + (used + 2) * PAGE;
+                self.phys.zero(page, PAGE);
+                h.used.set(used + 1);
+                entry.set(H::pte_table(page));
+                entry = self.phys.word(page + ((va >> (PAGE_BITS + 9 * child)) & 511) * 8);
+            }
+            entry.set(H::pte_leaf(cap.obj + i * step, rights, level, device));
+        }
         slot.badge.set(vaddr | MAPPED);
         slot.aux.set(a);
         slot.mprev.set(0);
@@ -126,9 +137,9 @@ impl<H: Hal> Kernel<H> {
         let (level, step) = if cap.bits >= LARGE_BITS { (1u8, 1u64 << LARGE_BITS) } else { (0u8, PAGE) };
         let size = 1u64 << cap.bits;
         for i in 0..size / step {
-            if let Ok(Some(e)) = self.pte(a, vaddr + i * step, level, false) {
-                e.set(0);
-            }
+            let (entry, at) = self.walk(a, vaddr + i * step, level);
+            debug_assert_eq!(at, level);
+            entry.set(0);
         }
         self.hal.tlb_flush(a + PAGE, vaddr, size);
         self.shoot_down(a + PAGE);
@@ -190,15 +201,13 @@ impl<H: Hal> Kernel<H> {
 
     /// The physical address `vaddr` maps to in `a`, for tests and the loader of the root task.
     pub fn translate(&self, a: Paddr, vaddr: u64) -> Option<Paddr> {
-        for level in [0u8, 1] {
-            if let Ok(Some(e)) = self.pte(a, vaddr, level, false)
-                && H::pte_present(e.get())
-                && H::pte_is_leaf(e.get(), level)
-            {
-                let mask = (1u64 << (12 + 9 * level as u64)) - 1;
-                return Some(H::pte_addr(e.get()) + (vaddr & mask));
-            }
+        let (entry, level) = self.walk(a, vaddr, 0);
+        let value = entry.get();
+        if H::pte_present(value) && H::pte_is_leaf(value, level) {
+            let mask = (1u64 << (PAGE_BITS + 9 * level)) - 1;
+            Some(H::pte_addr(value) + (vaddr & mask))
+        } else {
+            None
         }
-        None
     }
 }

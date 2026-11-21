@@ -37,7 +37,6 @@ struct MCap {
 #[derive(Default)]
 struct MAs {
     pages: u64,
-    used: u64,
     /// Page tables that exist: (level of the entry pointing to it, vaddr >> shift).
     tables: BTreeSet<(u8, u64)>,
     /// Leaves: (level, vaddr) -> physical address.
@@ -285,6 +284,7 @@ impl Model {
                     return Err(Error::BadArg);
                 }
                 let sp = self.spaces.get_mut(&asp.obj).unwrap();
+                let mut tables = sp.tables.clone();
                 for i in 0..size / step {
                     let v = vaddr + i * step;
                     for l in (level + 1..4).rev() {
@@ -292,18 +292,18 @@ impl Model {
                         if l == 1 && sp.leaves.contains_key(&(1, v & !((1 << 21) - 1))) {
                             return Err(Error::Overlap);
                         }
-                        if !sp.tables.contains(&key) {
-                            if sp.used + 2 >= sp.pages {
+                        if !tables.contains(&key) {
+                            if tables.len() as u64 + 2 >= sp.pages {
                                 return Err(Error::NoMemory);
                             }
-                            sp.used += 1;
-                            sp.tables.insert(key);
+                            tables.insert(key);
                         }
                     }
-                    if sp.leaves.contains_key(&(level, v)) || (level == 1 && sp.tables.contains(&(1, v >> 21))) {
+                    if sp.leaves.contains_key(&(level, v)) || (level == 1 && tables.contains(&(1, v >> 21))) {
                         return Err(Error::Overlap);
                     }
                 }
+                sp.tables = tables;
                 for i in 0..size / step {
                     sp.leaves.insert((level, vaddr + i * step), f.obj + i * step);
                 }

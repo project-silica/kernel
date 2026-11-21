@@ -210,6 +210,7 @@ pub unsafe fn cap_revoke(cap: Cap) -> Result<()> {
 
 /// Map `frame` at `vaddr` in `aspace`. Never replaces an existing mapping
 /// (`Overlap`), and never maps writable and executable at once (`BadArg`).
+/// On error, every mapping and all remaining page-table capacity are preserved.
 pub fn map(aspace: Cap, frame: Cap, vaddr: usize, rights: Rights) -> Result<()> {
     sys(Syscall::Map, [aspace.0, frame.0, vaddr as u64, rights.0 as u64, 0, 0]).map(|_| ())
 }

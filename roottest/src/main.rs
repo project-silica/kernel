@@ -288,6 +288,21 @@ fn t_fault_resume() -> T {
     wait_for(&SHARED[2], 42)
 }
 
+/// The second page collides after the first would have required a new
+/// table. A later mapping needs all three remaining table pages.
+fn t_map_rollback() -> T {
+    let space = new(ObjectType::AddressSpace, 15);
+    let existing = new(ObjectType::Frame, 12);
+    let pair = new(ObjectType::Frame, 13);
+    let boundary = 1 << 21;
+    map(space, existing, boundary, RW).map_err(|_| "cannot map the existing page")?;
+    if map(space, pair, boundary - 4096, RW) != Err(Error::Overlap) {
+        return Err("a range that overlaps on its second page did not return Overlap");
+    }
+    map(space, pair, 1 << 39, RW).map_err(|_| "the refused mapping consumed page tables or retained the frame")?;
+    Ok(())
+}
+
 fn t_w_xor_x() -> T {
     let f = new(ObjectType::Frame, 12);
     let at = region(1 << 12);
@@ -1382,6 +1397,7 @@ const TESTS: &[(&str, fn() -> T)] = &[
     ("fault_stack", t_fault_stack),
     ("fault_resume", t_fault_resume),
     ("w_xor_x", t_w_xor_x),
+    ("map_rollback", t_map_rollback),
     ("ipc", t_ipc),
     ("timer", t_timer),
     ("preempt", t_preempt),

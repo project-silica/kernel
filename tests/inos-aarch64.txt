@@ -9,6 +9,7 @@ fault_kernel_memory
 fault_stack
 fault_resume
 w_xor_x
+map_rollback
 ipc
 timer
 preempt

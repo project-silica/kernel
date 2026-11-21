@@ -212,9 +212,22 @@ fn address_space_table_pool_runs_out_cleanly_and_destroying_it_unmaps_frames() {
     m.retype(ut, T::AddressSpace, 14, FREE, 1);
     m.retype(ut, T::Frame, 12, FREE + 1, 2);
     assert_eq!(m.err(S::Map, [FREE, FREE + 1, 0x1000_0000, 3, 0, 0]), Error::NoMemory);
+    // A refused small mapping must leave the two tables available for a
+    // large page at a different root index.
+    m.retype(ut, T::Frame, 21, FREE + 4, 1);
+    m.ok(S::Map, [FREE, FREE + 4, 1 << 39, 3, 0, 0]);
+    assert_eq!(m.k.translate(m.cap(FREE).unwrap().obj, (1 << 39) + 15), Some(m.cap(FREE + 4).unwrap().obj + 15));
     m.retype(ut, T::AddressSpace, 15, FREE + 3, 1);
     m.ok(S::Map, [FREE + 3, FREE + 1, 0x1000_0000, 3, 0, 0]);
     m.ok(S::Map, [FREE + 3, FREE + 2, 0x1000_1000, 1, 0, 0]);
+    // Cross a table boundary into the first existing page. Both its
+    // translation and the missing page immediately below must survive.
+    m.retype(ut, T::Frame, 13, FREE + 5, 1);
+    let space = m.cap(FREE + 3).unwrap().obj;
+    assert_eq!(m.err(S::Map, [FREE + 3, FREE + 5, 0x0FFF_F000, 3, 0, 0]), Error::Overlap);
+    assert_eq!(m.k.translate(space, 0x0FFF_F000), None);
+    assert_eq!(m.k.translate(space, 0x1000_0000), Some(m.cap(FREE + 1).unwrap().obj));
+    m.ok(S::Map, [FREE + 3, FREE + 5, 1 << 39, 3, 0, 0]);
     let root = m.cap(FREE + 3).unwrap().obj + 4096;
     m.ok(S::CapDelete, [FREE + 3, 0, 0, 0, 0, 0]);
     assert_eq!(m.k.hal.left.get(), root, "the processor is told to leave the dead address space");
