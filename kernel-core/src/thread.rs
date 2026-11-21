@@ -519,10 +519,11 @@ impl<H: Hal> Kernel<H> {
             // and the lock is released while it waits so other processors
             // can hand it work.
             me.cur.set(0);
-            self.arm_timer(true);
+            let t = me.timers.get();
+            let until = if t != 0 { self.thread(t).deadline.get() } else { u64::MAX };
             self.hal.idle_begin();
             self.unlock(self.hal.cpu());
-            self.hal.idle();
+            self.hal.idle(until);
             self.enter();
             // The interrupt may have been the timer: look at deadlines, and
             // program the timer afresh when one is next needed.
@@ -530,7 +531,7 @@ impl<H: Hal> Kernel<H> {
             me.timer_at.set(u64::MAX);
         }
         me.resched.set(false);
-        self.arm_timer(false);
+        self.arm_timer();
         let cur = me.cur.get();
         let root = self.thread(cur).aspace.cap().map_or(0, |c| c.obj + 4096);
         if me.loaded.get() != cur || me.loaded_root.get() != root {
@@ -559,10 +560,10 @@ impl<H: Hal> Kernel<H> {
 
     /// Make sure this processor's timer fires no later than the next
     /// deadline or the end of the slice. Programming the timer is expensive
-    /// (on a virtual machine it leaves the guest), so unless `exact` it is
-    /// only ever moved earlier; a timer left too early fires once and is
-    /// then set right.
-    fn arm_timer(&self, exact: bool) {
+    /// (on a virtual machine it leaves the guest), so it is only ever moved
+    /// earlier; a timer left too early fires once and is then set right.
+    /// (An idle processor arms its timer exactly, through [`Hal::idle`].)
+    fn arm_timer(&self) {
         let me = self.me();
         let t = me.timers.get();
         let mut want = if t != 0 { self.thread(t).deadline.get() } else { u64::MAX };
@@ -570,7 +571,7 @@ impl<H: Hal> Kernel<H> {
             want = want.min(me.slice_end.get());
         }
         let armed = me.timer_at.get();
-        if want < armed || (exact && want != armed) {
+        if want < armed {
             me.timer_at.set(want);
             self.hal.set_timer(want);
         }

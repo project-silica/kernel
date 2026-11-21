@@ -50,6 +50,12 @@ pub struct PerCpu {
     /// Process-context identifiers: the generation and the next free one.
     pub pcid_gen: Cell<u64>,
     pub pcid_next: Cell<u64>,
+    /// How long this processor takes to come out of an idle wait once its
+    /// timer fires, in nanoseconds (a running average; see `X86::idle`).
+    pub wake_ns: Cell<u64>,
+    /// The address of this processor's kernel lock (`Kernel::cpu_lock`),
+    /// which the system-call entry takes before it saves anything.
+    pub lock: u64,
 }
 
 #[repr(C, packed)]
@@ -104,6 +110,8 @@ impl Tables {
                 polls: Cell::new(0),
                 pcid_gen: Cell::new(0),
                 pcid_next: Cell::new(1),
+                wake_ns: Cell::new(0),
+                lock: 0,
             },
         }
     }
@@ -265,6 +273,7 @@ pub unsafe fn init(t: *mut Tables, index: usize, apic_id: u32, stack: (u64, u64)
         (*t).percpu.stack = stack;
         (*t).percpu.this = &raw const (*t).percpu as u64;
         (*t).percpu.index = index;
+        (*t).percpu.lock = super::kernel().cpu_lock(index) as *const kernel_core::lock::Lock as u64;
         (*t).percpu.apic_id = apic_id;
         CPUS[index].store(t, Ordering::Release);
         let gdtr: [u16; 5] = pseudo(&raw const (*t).gdt as u64, 7 * 8 - 1);
@@ -318,10 +327,16 @@ unsafe extern "C" {
 // therefore sees either "in the kernel" (it will look at what changed when
 // it gets the lock) or "in user mode" (it must be interrupted first).
 
-extern "C" fn syscall_rust() {
+/// `contended`: the entry found this processor's lock held by another
+/// processor and did not take it.
+extern "C" fn syscall_rust(contended: u64) {
     let k = super::kernel();
     percpu().mode.enter_kernel();
-    k.enter();
+    if contended == 0 {
+        k.entered();
+    } else {
+        k.enter();
+    }
     k.syscall();
 }
 
@@ -402,6 +417,15 @@ syscall_entry:
     mov rsp, gs:[8]
     mov [rsp + 0], rax
     mov [rsp + 8], rbx
+    // Try this processor's lock before the frame is saved, while few
+    // stores wait to drain: XCHG is a full barrier and waits for them all.
+    // Holding the lock, nobody can look at the frame while it is written.
+    // bl is 0 when the lock was taken here, 1 when another processor holds
+    // it (syscall_rust then follows the usual order: frame saved, presence
+    // marked, lock awaited).
+    mov rax, gs:[{lock}]
+    mov bl, 1
+    xchg [rax], bl
     mov [rsp + 16], rcx
     mov [rsp + 24], rdx
     mov [rsp + 32], rsi
@@ -420,6 +444,8 @@ syscall_entry:
     mov rax, gs:[16]
     mov [rsp + 136], rax
     mov qword ptr [rsp + 160], 1
+    movzx edi, bl
+    mov rbx, [rsp + 8]
     mov rsp, gs:[0]
     xor ebp, ebp
     call {syscall}
@@ -582,6 +608,7 @@ trap_stubs:
     syscall = sym syscall_rust,
     schedule = sym schedule_rust,
     verw = sym VERW_SELECTOR,
+    lock = const core::mem::offset_of!(PerCpu, lock),
     trap_user = sym trap_user,
     trap_kernel = sym trap_kernel,
 );

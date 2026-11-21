@@ -67,9 +67,19 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// The slot `index` of the current thread's CapSpace.
+    /// On every system call: the CapSpace capability's type and size are
+    /// read straight from its slot, with the results of `slot_in`.
     pub(crate) fn cslot(&self, t: Paddr, index: u64) -> Result<Paddr, Error> {
-        let cs = self.thread(t).cspace.cap().ok_or(Error::BadCap)?;
-        self.slot_in(&cs, index)
+        let cs = &self.thread(t).cspace;
+        let m = cs.meta.get();
+        if m & 0xFF != ObjectType::CapSpace as u64 {
+            return Err(if ObjectType::from_u64(m & 0xFF).is_some() { Error::WrongType } else { Error::BadCap });
+        }
+        let bits = (m >> 16) as u8 as u32;
+        if index == 0 || 1u64.checked_shl(bits).is_some_and(|n| index >= n) {
+            return Err(Error::BadCap);
+        }
+        Ok(cs.obj.get() + (index << silica_abi::SLOT_BITS))
     }
 
     /// The capability at `index`, which must be of type `ty` and carry `rights`.

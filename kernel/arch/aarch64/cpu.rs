@@ -37,6 +37,10 @@ pub struct PerCpu {
     pub online: AtomicBool,
     /// When the timer is set to fire, in counter ticks (u64::MAX: never).
     pub deadline: Cell<u64>,
+    /// ASID allocation on this processor: the current generation, and the
+    /// next identifier to hand out in it (see `Arm::ttbr0_for`).
+    pub asid_gen: Cell<u64>,
+    pub asid_next: Cell<u64>,
 }
 
 impl PerCpu {
@@ -50,6 +54,8 @@ impl PerCpu {
             mode: Presence::new(),
             online: AtomicBool::new(false),
             deadline: Cell::new(u64::MAX),
+            asid_gen: Cell::new(1),
+            asid_next: Cell::new(1),
         }
     }
 }

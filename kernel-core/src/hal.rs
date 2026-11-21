@@ -83,10 +83,15 @@ pub trait Hal {
     /// lock: from now until `idle` returns it counts as idle, not as in the
     /// kernel, so a `kick` interrupts it.
     fn idle_begin(&self);
-    /// Wait for an interrupt with interrupts enabled; returns after its
-    /// handler has run. Called without this processor's lock, so the
-    /// handler must not touch kernel state.
-    fn idle(&self);
+    /// Arm this processor's timer for `until` (monotonic nanoseconds;
+    /// `u64::MAX`: no timer) and wait for an interrupt with interrupts
+    /// enabled; return after its handler has run. When it was the timer,
+    /// return no earlier than `until`: an architecture may arm the timer
+    /// ahead of `until` by the time this processor takes to come out of the
+    /// wait, and spin for the rest, so a deadline is met on time rather
+    /// than late by the wake-up latency. Called without this processor's
+    /// lock, so the handler must not touch kernel state.
+    fn idle(&self, until: u64);
     /// Route interrupt line `line` to processor `cpu`, with the given
     /// trigger and polarity, and let it interrupt. `false` when the machine
     /// has no such line.

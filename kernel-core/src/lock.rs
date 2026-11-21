@@ -10,7 +10,9 @@
 
 use crate::sync::{AtomicBool, AtomicU8, AtomicU64, Ordering, spin};
 
-/// A spin lock.
+/// A spin lock: one byte, 0 free and 1 held, so an architecture's entry
+/// code may take it with an atomic exchange of its own.
+#[repr(transparent)]
 pub struct Lock(AtomicBool);
 
 impl Lock {

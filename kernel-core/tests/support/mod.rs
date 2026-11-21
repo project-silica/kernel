@@ -134,7 +134,8 @@ impl Hal for TestHal {
         n > 0
     }
     fn idle_begin(&self) {}
-    fn idle(&self) {
+    fn idle(&self, until: u64) {
+        self.set_timer(until);
         // As hardware: each processor's timer fires once, at its deadline
         // (at once if that has passed), and not again until it is set anew.
         // Idling with none armed would sleep for ever (here: the kernel

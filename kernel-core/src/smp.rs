@@ -152,6 +152,19 @@ impl<H: Hal> Kernel<H> {
         self.caught_up();
     }
 
+    /// Enter the kernel on this processor, whose lock the architecture's
+    /// entry has already taken (`cpu_lock`): act on what other processors
+    /// asked of it while it was away.
+    pub fn entered(&self) {
+        self.caught_up();
+    }
+
+    /// Processor `cpu`'s lock, for an architecture's entry code to take
+    /// before it saves anything (then calling [`Kernel::entered`]).
+    pub fn cpu_lock(&self, cpu: usize) -> &Lock {
+        &self.cpus[cpu].lock
+    }
+
     fn caught_up(&self) {
         let me = self.me();
         if me.flush.replace(false) {

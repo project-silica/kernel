@@ -1199,11 +1199,24 @@ fn foreign_thread(code: &[u8], arg: u64) -> Cap {
     foreign_thread_on(0, code, arg)
 }
 
+/// The page `foreign_thread_on` writes code through (0: not chosen yet).
+static STAGING: AtomicU64 = AtomicU64::new(0);
+
 /// Like `foreign_thread`, on processor `cpu`.
 fn foreign_thread_on(cpu: usize, code: &[u8], arg: u64) -> Cap {
     let aspace = new(ObjectType::AddressSpace, 16);
     let frame = new(ObjectType::Frame, 12);
-    let at = region(1 << 12);
+    // One page of this address space is where code is written every time,
+    // so making threads again and again (a benchmark repeated for a
+    // profile) uses no more page tables.
+    let at = match STAGING.load(SeqCst) {
+        0 => {
+            let at = region(1 << 12) as u64;
+            STAGING.store(at, SeqCst);
+            at as usize
+        }
+        at => at as usize,
+    };
     map(ASPACE, frame, at, RW).expect("map code for writing");
     // SAFETY: one page mapped read-write at `at`; `code` fits in it.
     unsafe {
@@ -1290,7 +1303,16 @@ extern "C" fn toucher(arg: u64) -> ! {
 
 /// First touch of a page, resolved by a pager thread in userspace.
 fn bench_page_fault() {
-    let first = NEXT_SLOT.fetch_add(FAULT_PAGES as u64, SeqCst);
+    // One range of slots, emptied again at the end, so the benchmark can
+    // run more than once in a boot (bench=fault:<times>).
+    let first = match FAULT_SLOTS.load(SeqCst) {
+        0 => {
+            let f = NEXT_SLOT.fetch_add(FAULT_PAGES as u64, SeqCst);
+            FAULT_SLOTS.store(f, SeqCst);
+            f
+        }
+        f => f,
+    };
     for i in 0..FAULT_PAGES as u64 / 256 {
         retype(Cap(UNTYPED.load(SeqCst)), ObjectType::Frame, 12, SPACE, first + i * 256, 256).expect("frames");
     }
@@ -1309,11 +1331,21 @@ fn bench_page_fault() {
     }
     let _ = wait_for(&SHARED[0], 99);
     report("page_fault", FAULT_PAGES, 1);
+    for i in 0..FAULT_PAGES as u64 {
+        // SAFETY: the frames were mapped only at `base`, which nothing
+        // touches any more (the toucher has finished).
+        let _ = unsafe { cap_delete(Cap(first + i)) };
+    }
 }
+
+/// The slots `bench_page_fault` makes its frames in (0: not chosen yet).
+static FAULT_SLOTS: AtomicU64 = AtomicU64::new(0);
 
 fn bench_timer() {
     let n = new(ObjectType::Notification, 0);
-    let count = 500;
+    // As many as every other micro-benchmark takes (spec/TESTING.md 4.1),
+    // so the 99th percentile rests on a hundred samples, not five.
+    let count = 10_000;
     for i in 0..count {
         let at = CLOCK.now() + 1_000_000;
         let _ = recv(n, Wait::Until(at));

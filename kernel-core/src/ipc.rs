@@ -358,6 +358,9 @@ impl<H: Hal> Kernel<H> {
             me.dirty.set(true);
             return;
         }
+        if self.fast_fault(t, kind, addr, code) {
+            return;
+        }
         let th = self.thread(t);
         let global = self.ncpu.get() > 1 && !th.fault_ep.cap().is_some_and(|c| self.queue_is_local(self.held(), t, &c));
         if global {
@@ -494,6 +497,57 @@ impl<H: Hal> Kernel<H> {
         true
     }
 
+    /// A fault of thread `t` (current on this processor), reported to its
+    /// fault endpoint as a call, as `fault` does through `send`.
+    pub(crate) fn fast_fault(&self, t: Paddr, kind: Fault, addr: u64, code: u64) -> bool {
+        let th = self.thread(t);
+        let Some(ep) = th.fault_ep.cap() else { return false };
+        if ep.ty != ObjectType::Endpoint {
+            return false;
+        }
+        let me = self.hal.cpu() as u64;
+        let q = self.queue(ep.obj);
+        if q.owner.get() != me + 1 || q.kind.get() != RECEIVERS {
+            return false;
+        }
+        let r = q.head.get();
+        let rt = self.thread(r);
+        let local = |x: Paddr| x == 0 || self.thread(x).cpu.get() == me;
+        if rt.cpu.get() != me
+            || rt.caller.get() != 0
+            || rt.park.get() != 0
+            || rt.deadline.get() != 0
+            || !local(th.caller.get())
+            || self.me().direct.get() != 0
+        {
+            return false;
+        }
+        th.fault[0].set(kind as u64);
+        th.fault[1].set(addr);
+        th.fault[2].set(code);
+        th.via_slot.set(0);
+        th.ipc_flags.set(IPC_CALL | IPC_FAULT);
+        self.q_remove(&q.head, &q.tail, r);
+        if q.head.get() == 0 {
+            q.kind.set(0);
+        }
+        // The fault message, as `transfer` builds it.
+        rt.regs[H::ARG[0]].set(ep.badge);
+        rt.regs[H::ARG[1]].set(MsgInfo::new(FAULT_LABEL + kind as u64, 4).0);
+        rt.regs[H::ARG[2]].set(th.regs[H::IP].get());
+        rt.regs[H::ARG[3]].set(addr);
+        rt.regs[H::ARG[4]].set(code);
+        rt.regs[H::ARG[5]].set(th.regs[H::SP].get());
+        rt.regs[H::SYS].set(0);
+        self.fast_hand_off(r);
+        self.q_push(&q.pend_head, &q.pend_tail, t);
+        th.via.set(ep.obj);
+        rt.caller.set(t);
+        th.state.set(REPLY);
+        th.blocked_on.set(r);
+        true
+    }
+
     /// `ReplyRecv` of thread `t` (current on this processor) with arguments `a`.
     pub(crate) fn fast_reply_recv(&self, t: Paddr, a: &[u64; 6]) -> bool {
         let info = MsgInfo(a[1]);
@@ -508,8 +562,15 @@ impl<H: Hal> Kernel<H> {
         let me = self.hal.cpu() as u64;
         let ct = self.thread(c);
         let via = ct.via.get();
+        // An answer to a fault resumes the thread (after mapping a page, for
+        // FAULT_MAP); any other answer to one stops it, which is left to the
+        // general path.
+        let fault = ct.ipc_flags.get() & IPC_FAULT != 0;
+        if fault && a[2] != FAULT_MAP && a[2] != FAULT_RESUME {
+            return false;
+        }
         if ct.cpu.get() != me
-            || ct.ipc_flags.get() & (IPC_FAULT | IPC_PARKED) != 0
+            || ct.ipc_flags.get() & IPC_PARKED != 0
             || ct.deadline.get() != 0
             || (via != 0 && self.queue(via).owner.get() != me + 1)
             || self.me().direct.get() != 0
@@ -522,11 +583,23 @@ impl<H: Hal> Kernel<H> {
         if q.owner.get() != me + 1 || q.kind.get() == SENDERS {
             return false;
         }
-        // `answer` the caller and hand this processor to it.
+        // The mapping is the last thing that can fail: if it does, nothing
+        // has changed, and the general path tries it again and reports why.
+        if fault && a[2] == FAULT_MAP {
+            let Ok((_, asp)) = self.ccap(t, a[3], ObjectType::AddressSpace, Rights::WRITE) else { return false };
+            let Ok((fs, _)) = self.ccap(t, a[4], ObjectType::Frame, Rights::NONE) else { return false };
+            if self.map(asp.obj, fs, a[5] & !0xFFF, Rights(a[5] as u8 & 0xF)).is_err() {
+                return false;
+            }
+        }
+        // `answer` the caller and hand this processor to it: a faulting
+        // thread resumes where it faulted, a caller gets the message.
         self.unpend(c);
         th.caller.set(0);
         ct.ipc_flags.set(0);
-        self.fast_transfer(a, t, c, 0);
+        if !fault {
+            self.fast_transfer(a, t, c, 0);
+        }
         self.fast_hand_off(c);
         // `recv` with nothing to receive yet.
         th.park.set(0);

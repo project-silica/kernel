@@ -358,13 +358,35 @@ impl Hal for X86 {
         percpu().mode.idle();
     }
 
-    fn idle(&self) {
+    fn idle(&self, until: u64) {
+        // The timer is armed ahead of `until` by how long this processor
+        // has been taking to come out of the wait (on a virtual machine,
+        // mostly the host waking the virtual processor's thread), and the
+        // rest is spent spinning: the deadline is met on time instead of
+        // late by that latency. The estimate is a running average of how
+        // late past the armed time the processor resumed, each sample
+        // capped so that a rare long stall (the host core leaving a deep
+        // sleep state) neither drags it up nor makes every wake spin long.
+        let me = percpu();
+        let early = me.wake_ns.get();
+        let armed = if until == u64::MAX { u64::MAX } else { until.saturating_sub(early).max(1) };
+        self.set_timer(armed);
         // SAFETY: STI takes effect after the next instruction, so no
         // interrupt can arrive between the decision to wait and HLT (one
         // that is already pending ends the HLT at once). The handler runs
         // on this stack and returns here.
         unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) }
-        percpu().mode.enter_kernel();
+        if until != u64::MAX {
+            let now = self.now();
+            if now >= armed {
+                let late = (now - armed).min(WAKE_ADVANCE_MAX_NS);
+                me.wake_ns.set((early * 7 + late) / 8);
+                while self.now() < until {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+        me.mode.enter_kernel();
     }
 
     fn cpu(&self) -> usize {
@@ -513,6 +535,10 @@ impl X86 {
         root | id
     }
 }
+
+/// The most an idle processor arms its timer ahead of a deadline, and so
+/// the most it spins waiting for it (`X86::idle`).
+const WAKE_ADVANCE_MAX_NS: u64 = 50_000;
 
 /// MXCSR and the x87 control word as the processor's initial state has them.
 const MXCSR_DEFAULT: u32 = 0x1F80;

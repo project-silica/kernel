@@ -365,6 +365,9 @@ pub struct Arm {
     ticks_per_ns: Cell<u64>,
     /// An empty first-level table: TTBR0 when no user address space is loaded.
     empty_root: Cell<u64>,
+    /// The largest ASID: 255 or 65535 (the loader enables 16-bit ASIDs
+    /// where the processor has them).
+    asid_max: Cell<u64>,
 }
 
 struct Global(Kernel<Arm>);
@@ -374,7 +377,7 @@ struct Global(Kernel<Arm>);
 unsafe impl Sync for Global {}
 
 static KERNEL: Global = Global(Kernel::new(
-    Arm { count0: Cell::new(0), ns_per_tick: Cell::new(0), ticks_per_ns: Cell::new(0), empty_root: Cell::new(0) },
+    Arm { count0: Cell::new(0), ns_per_tick: Cell::new(0), ticks_per_ns: Cell::new(0), empty_root: Cell::new(0), asid_max: Cell::new(255) },
     // SAFETY: the loader maps all RAM at PHYS_MAP_BASE and the kernel only
     // uses addresses from the boot regions through it.
     unsafe { Phys::new(PHYS_MAP_BASE as *mut u8) },
@@ -397,6 +400,49 @@ impl Arm {
     pub fn empty_root(&self) -> u64 {
         self.empty_root.get()
     }
+
+    /// The TTBR0 value that loads `root`. With ASIDs a switch keeps the
+    /// translations cached for each address space: it has an ASID per
+    /// processor for that processor's current generation, kept in its
+    /// header page (words owned by this module from offset 2048, as on
+    /// x86_64). A processor hands out its ASIDs in order; when they run out
+    /// it starts a new generation, so every address space takes a fresh one
+    /// there. An ASID is dropped from this processor's TLB as it is handed
+    /// out, so whatever an earlier holder left cached is gone first. ASID 0
+    /// is the empty root's.
+    fn ttbr0_for(&self, phys: &Phys, root: Paddr) -> u64 {
+        if root == self.empty_root.get() {
+            return root;
+        }
+        let me = percpu();
+        let generation = me.asid_gen.get();
+        // SAFETY: `root` is the root table of a live AddressSpace object,
+        // whose header page precedes it; kernel-core uses only its first
+        // bytes, and the second half holds one word per processor.
+        let slot = unsafe { &mut *phys.ptr(root - 4096 + 2048 + me.index as u64 * 8).cast::<u64>() };
+        if *slot >> 16 == generation {
+            return root | (*slot & 0xFFFF) << 48;
+        }
+        let id = me.asid_next.get();
+        if id >= self.asid_max.get() {
+            me.asid_next.set(1);
+            me.asid_gen.set(generation + 1);
+        } else {
+            me.asid_next.set(id + 1);
+        }
+        *slot = generation << 16 | id;
+        // SAFETY: TLB maintenance only drops cached translations.
+        unsafe { asm!("tlbi aside1, {}", "dsb nsh", in(reg) id << 48, options(nostack, preserves_flags)) }
+        root | id << 48
+    }
+}
+
+/// This processor's translation control register.
+fn tcr() -> u64 {
+    let v: u64;
+    // SAFETY: reading a system register.
+    unsafe { asm!("mrs {}, tcr_el1", out(reg) v, options(nomem, nostack, preserves_flags)) }
+    v
 }
 
 fn counter() -> u64 {
@@ -413,11 +459,27 @@ fn ttbr0() -> u64 {
     v & ADDR
 }
 
-/// Load `root` as the user address space and forget every cached user
-/// translation on this processor (there are no ASIDs yet).
-fn load_ttbr0(root: u64) {
+/// The ASID TTBR0 holds now.
+fn current_asid() -> u64 {
+    let v: u64;
+    // SAFETY: reading the translation table base.
+    unsafe { asm!("mrs {}, ttbr0_el1", out(reg) v, options(nomem, nostack, preserves_flags)) }
+    v >> 48
+}
+
+/// Load a TTBR0 value (a root and its ASID). Translations cached for other
+/// ASIDs stay: user mappings are not global, so each is tagged with its
+/// address space's ASID (`Arm::ttbr0_for`).
+fn load_ttbr0(value: u64) {
     // SAFETY: TTBR0 holds only user mappings; the kernel runs from TTBR1,
     // which this does not touch.
+    unsafe { asm!("msr ttbr0_el1, {}", "isb", in(reg) value, options(nostack, preserves_flags)) }
+}
+
+/// Load `root` (with ASID 0) and drop every cached translation on this
+/// processor: once at start-up, when the loader's may still be cached.
+fn reset_ttbr0(root: u64) {
+    // SAFETY: as `load_ttbr0`; TLB maintenance only drops cached translations.
     unsafe { asm!("msr ttbr0_el1, {}", "isb", "tlbi vmalle1", "dsb nsh", "isb", in(reg) root, options(nostack, preserves_flags)) }
 }
 
@@ -503,7 +565,7 @@ impl Hal for Arm {
         }
         let want = if root == 0 { self.empty_root.get() } else { root };
         if ttbr0() != want {
-            load_ttbr0(want);
+            load_ttbr0(self.ttbr0_for(phys, want));
         }
     }
 
@@ -514,19 +576,22 @@ impl Hal for Arm {
     }
 
     fn tlb_flush(&self, root: Paddr, vaddr: u64, len: u64) {
-        // Another root has nothing cached here: every switch flushes.
         if ttbr0() != root {
+            // Not loaded: forget its ASID here, so its next load takes a
+            // fresh one, whose stale translations are dropped first.
+            self.tlb_forget(root, percpu().index);
             return;
         }
+        let asid = current_asid() << 48;
         // SAFETY: TLB maintenance only drops cached translations.
         unsafe {
-            if len > 32 * 4096 {
-                asm!("dsb ishst", "tlbi vmalle1", "dsb nsh", "isb", options(nostack, preserves_flags));
-                return;
-            }
             asm!("dsb ishst", options(nostack, preserves_flags));
-            for page in (vaddr..vaddr + len).step_by(4096) {
-                asm!("tlbi vae1, {}", in(reg) page >> 12 & 0xFFF_FFFF_FFFF, options(nostack, preserves_flags));
+            if len > 32 * 4096 {
+                asm!("tlbi aside1, {}", in(reg) asid, options(nostack, preserves_flags));
+            } else {
+                for page in (vaddr..vaddr + len).step_by(4096) {
+                    asm!("tlbi vae1, {}", in(reg) asid | (page >> 12 & 0xFFF_FFFF_FFFF), options(nostack, preserves_flags));
+                }
             }
             asm!("dsb nsh", "isb", options(nostack, preserves_flags));
         }
@@ -562,7 +627,8 @@ impl Hal for Arm {
         percpu().mode.idle();
     }
 
-    fn idle(&self) {
+    fn idle(&self, until: u64) {
+        self.set_timer(until);
         // WFI wakes for a pending interrupt even while interrupts are
         // masked, so none is lost between the decision to wait and the
         // wait; it is then taken, briefly unmasked, by `kernel_irq`.
@@ -587,10 +653,20 @@ impl Hal for Arm {
     }
 
     fn tlb_reset(&self) {
+        // A new generation makes every address space's ASID on this
+        // processor stale; each takes a fresh one, dropped from the TLB
+        // first, when next loaded.
+        let me = percpu();
+        me.asid_gen.set(me.asid_gen.get() + 1);
+        me.asid_next.set(1);
         load_ttbr0(self.empty_root.get());
     }
 
-    fn tlb_forget(&self, _root: Paddr, _cpu: usize) {}
+    fn tlb_forget(&self, root: Paddr, cpu: usize) {
+        // SAFETY: that processor's word in the header page of a live
+        // address space (see `ttbr0_for`); the caller holds its lock.
+        unsafe { *kernel().phys.ptr(root - 4096 + 2048 + cpu as u64 * 8).cast::<u64>() = 0 }
+    }
 
     fn irq_route(&self, line: usize, cpu: usize, level: bool, active_low: bool) -> bool {
         // GIC inputs are active-high; a platform with an active-low line
@@ -793,7 +869,8 @@ extern "C" fn kmain(info: u64) -> ! {
     h.ns_per_tick.set(((1_000_000_000u128 << 32) / freq as u128) as u64);
     h.ticks_per_ns.set((((freq as u128) << 32) / 1_000_000_000) as u64);
     h.empty_root.set(image_phys(EMPTY_ROOT.0.get() as u64));
-    load_ttbr0(h.empty_root.get());
+    h.asid_max.set(if tcr() & 1 << 36 != 0 { u16::MAX as u64 } else { u8::MAX as u64 });
+    reset_ttbr0(h.empty_root.get());
     k.enter();
 
     // SAFETY: loader memory, read-only until the root task owns it.
