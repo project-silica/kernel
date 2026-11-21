@@ -817,6 +817,8 @@ fn t_inspect() -> T {
 // ---- more than one processor ---------------------------------------------
 
 static CPUS: AtomicU64 = AtomicU64::new(1);
+/// `RootInfo::entropy` as four words, and `entropy_sources`.
+static ENTROPY: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static ROOT_BUFFER: AtomicU64 = AtomicU64::new(0);
 
 /// Like `spawn`, on processor `cpu`.
@@ -1614,7 +1616,28 @@ fn t_sched() -> T {
     Ok(())
 }
 
+/// The secret the root task starts with: from at least one source the
+/// loader trusts (the emulated machines have both the firmware's and the
+/// processor's), and not a constant.
+fn t_entropy() -> T {
+    let w: [u64; 4] = core::array::from_fn(|i| ENTROPY[i].load(SeqCst));
+    let sources = ENTROPY[4].load(SeqCst);
+    println!(
+        "entropy: sources{}{}",
+        if sources & ENTROPY_FIRMWARE != 0 { " firmware" } else { "" },
+        if sources & ENTROPY_CPU != 0 { " processor" } else { "" }
+    );
+    if sources == 0 {
+        return Err("the loader found no source of randomness it trusts");
+    }
+    if w.iter().all(|&x| x == w[0]) {
+        return Err("the root task's secret is a repeated word");
+    }
+    Ok(())
+}
+
 const TESTS: &[(&str, fn() -> T)] = &[
+    ("entropy", t_entropy),
     ("sched", t_sched),
     ("console", t_console),
     ("syscall", t_syscall),
@@ -1656,6 +1679,10 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     }
     NEXT_SLOT.store(info.first_free_slot, SeqCst);
     CPUS.store(info.cpus, SeqCst);
+    for (i, w) in info.entropy.as_chunks::<8>().0.iter().enumerate() {
+        ENTROPY[i].store(u64::from_le_bytes(*w), SeqCst);
+    }
+    ENTROPY[4].store(info.entropy_sources, SeqCst);
     ROOT_BUFFER.store(info.ipc_buffer, SeqCst);
     let big = (0..info.untyped_count as usize).filter(|&i| info.untyped[i].kind == KIND_RAM).max_by_key(|&i| info.untyped[i].bits);
     let Some(big) = big else {

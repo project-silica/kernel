@@ -916,6 +916,7 @@ extern "C" fn kmain(info: u64) -> ! {
         clock: [freq, bi.loader_tsc, h.count0.get()],
         wall_clock: [bi.wall_secs, ((bi.wall_tsc.wrapping_sub(h.count0.get()) as i64 as i128 * 1_000_000_000) / freq as i128) as u64],
         entropy: bi.entropy,
+        entropy_sources: bi.entropy_sources,
         cmdline: cmdline.0,
         cpus: cpus as u64,
     };

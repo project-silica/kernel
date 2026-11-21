@@ -322,6 +322,7 @@ impl Machine {
             clock: [1_000_000_000, 0, 0],
             wall_clock: [0; 2],
             entropy: [7; 32],
+            entropy_sources: 0,
             cmdline: b"test=host",
             cpus: cpus as u64,
         };

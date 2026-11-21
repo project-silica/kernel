@@ -37,6 +37,45 @@ pub fn counter() -> u64 {
     (hi as u64) << 32 | lo as u64
 }
 
+/// 64 bits from the processor's generator: RDSEED (its entropy source)
+/// where there is one, else RDRAND (a generator reseeded from it). `None`
+/// when it has neither, or when it keeps reporting failure (a few tries
+/// cover a source momentarily drained by other processors).
+pub fn cpu_random() -> Option<u64> {
+    // SAFETY: CPUID only reads identification registers.
+    #[allow(unused_unsafe)]
+    let (l1, l7) = unsafe { (core::arch::x86_64::__cpuid(1), core::arch::x86_64::__cpuid_count(7, 0)) };
+    let step = |seed: bool| -> Option<u64> {
+        let (v, ok): (u64, u8);
+        // SAFETY: RDSEED and RDRAND only produce a value and the carry
+        // flag; their presence was checked with CPUID.
+        unsafe {
+            if seed {
+                asm!("rdseed {}", "setc {}", out(reg) v, out(reg_byte) ok, options(nomem, nostack));
+            } else {
+                asm!("rdrand {}", "setc {}", out(reg) v, out(reg_byte) ok, options(nomem, nostack));
+            }
+        }
+        (ok != 0).then_some(v)
+    };
+    if l7.ebx >> 18 & 1 != 0 {
+        for _ in 0..64 {
+            if let Some(v) = step(true) {
+                return Some(v);
+            }
+            core::hint::spin_loop();
+        }
+    }
+    if l1.ecx >> 30 & 1 != 0 {
+        for _ in 0..16 {
+            if let Some(v) = step(false) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 /// Nothing to set up: the serial port is always at COM1.
 pub fn console(_st: *const efi::SystemTable) {}
 /// Nothing to look up in ACPI.

@@ -16,6 +16,8 @@ name = "boot-uefi"
 version = "0.0.0"
 dependencies = [
  "kernel-core",
+ "silica-abi",
+ "silica-formats",
 ]
 
 [[package]]

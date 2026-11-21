@@ -29,6 +29,11 @@ pub const SLOT_FIRST_UNTYPED: u64 = 16;
 
 /// `RootInfo::magic`.
 pub const ROOT_MAGIC: u64 = 0x4F46_4E49_544F_4F52; // "ROOTINFO"
+/// `RootInfo::entropy_sources`: the firmware's random number protocol.
+pub const ENTROPY_FIRMWARE: u64 = 1;
+/// `RootInfo::entropy_sources`: the processor's own generator (RDSEED or
+/// RDRAND on x86, RNDRRS or RNDR on Arm).
+pub const ENTROPY_CPU: u64 = 2;
 /// Most Untyped descriptors in a [`RootInfo`].
 pub const MAX_UNTYPED: usize = 1000;
 
@@ -82,8 +87,16 @@ pub struct RootInfo {
     /// Wall-clock time from the firmware, in seconds since 1970, and the
     /// monotonic nanoseconds at which it was read (both 0 when unknown).
     pub wall_clock: [u64; 2],
-    /// 32 bytes from the firmware's random source (all zero when absent).
+    /// A 32-byte secret for the root task: every source of randomness the
+    /// loader found, hashed together (BLAKE2s), so it is unpredictable if
+    /// any one of them is. Independent of the kernel's own (its address
+    /// slide): knowing one says nothing about the other.
     pub entropy: [u8; 32],
+    /// Which sources went into `entropy` ([`ENTROPY_FIRMWARE`],
+    /// [`ENTROPY_CPU`]); timing jitter always does, and is never counted.
+    /// 0: no source the loader trusts was present, and `entropy` must not
+    /// be used for keys until something better (a device) is mixed in.
+    pub entropy_sources: u64,
     /// Number of processors. Threads start on the processor that created
     /// them and can be moved to any index below this.
     pub cpus: u64,

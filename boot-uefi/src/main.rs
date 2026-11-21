@@ -24,6 +24,8 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, KERNEL_BASE, PHYS_MAP_BASE, Region, RegionKind};
 use kernel_core::elf::{Elf, PF_W, PF_X};
+use silica_abi::root::{ENTROPY_CPU, ENTROPY_FIRMWARE};
+use silica_formats::blake2s::Blake2s;
 
 const PAGE: u64 = 4096;
 const HUGE: u64 = 2 << 20;
@@ -159,6 +161,53 @@ impl Tables<'_> {
     }
 }
 
+/// The boot seed: every source of randomness there is, hashed together,
+/// with the sources the loader trusts (`ENTROPY_` bits). No single source
+/// decides it: the firmware's protocol and the processor's generator are
+/// each taken as they come (either may be absent, broken or hostile), and
+/// timing jitter is always added but never counted, because on a virtual
+/// machine or a simple core it may be predictable.
+fn gather_entropy(boot: &Boot) -> ([u8; 32], u64) {
+    let mut h = Blake2s::new();
+    h.update(b"silica boot seed 1");
+    let mut sources = 0;
+    let mut fw = [0u8; 32];
+    if let Some(rng) = boot.locate::<efi::Rng>(&efi::RNG) {
+        // SAFETY: valid protocol; the buffer is 32 bytes.
+        if unsafe { ((*rng).get_rng)(rng, ptr::null(), 32, fw.as_mut_ptr()) } == efi::SUCCESS && fw != [0; 32] {
+            sources |= ENTROPY_FIRMWARE;
+        }
+    }
+    h.update(&fw);
+    // Four words of 64: as much as the seed holds.
+    let mut cpu = [0u64; 4];
+    let mut got = 0;
+    for w in cpu.iter_mut() {
+        if let Some(v) = arch::cpu_random() {
+            *w = v;
+            got += 1;
+        }
+    }
+    // A generator that answers with the same word every time is broken.
+    if got == cpu.len() && cpu.iter().any(|&w| w != cpu[0]) {
+        sources |= ENTROPY_CPU;
+    }
+    for w in cpu {
+        h.update(&w.to_le_bytes());
+    }
+    // Timing: how long each of many small, cache-dependent steps takes.
+    let mut x = arch::counter();
+    for i in 0..4096u64 {
+        let t = arch::counter();
+        x = x.rotate_left(7) ^ t ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        if i % 64 == 63 {
+            h.update(&x.to_le_bytes());
+        }
+    }
+    h.update(&arch::counter().to_le_bytes());
+    (h.finish(), sources)
+}
+
 fn unix_seconds(t: &efi::Time) -> u64 {
     if t.year < 1970 || t.month == 0 || t.month > 12 || t.day == 0 {
         return 0;
@@ -222,13 +271,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     HARNESS.store(words.split(|b| b.is_ascii_whitespace()).any(|w| w == b"exit=semihosting"), Ordering::Relaxed);
 
     // Entropy and time, while the firmware can still be asked.
-    let mut entropy = [0u8; 32];
-    if let Some(rng) = boot.locate::<efi::Rng>(&efi::RNG) {
-        // SAFETY: valid protocol; the buffer is 32 bytes.
-        if unsafe { ((*rng).get_rng)(rng, ptr::null(), 32, entropy.as_mut_ptr()) } != efi::SUCCESS {
-            entropy = [0; 32];
-        }
-    }
+    let (seed, entropy_sources) = gather_entropy(&boot);
     let mut time = efi::Time::default();
     // SAFETY: runtime services are valid; `time` outlives the call.
     let wall_secs = if unsafe { ((*rt).get_time)(&mut time, ptr::null_mut()) } == efi::SUCCESS { unix_seconds(&time) } else { 0 };
@@ -242,10 +285,14 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     if !elf.pie || lo != KERNEL_BASE || hi - lo > 64 << 20 {
         fail("kernel image is not position-independent at the kernel base, or is over 64 MiB");
     }
-    // KASLR: a 2 MiB-aligned slide inside the top 2 GiB, leaving 128 MiB at the top.
+    // KASLR: a 2 MiB-aligned slide inside the top 2 GiB, leaving 128 MiB at
+    // the top, from a value derived from the seed (the root task's secret
+    // is derived apart from it, so it does not reveal the slide).
     let slots = ((2u64 << 30) - (128 << 20) - (hi - lo)) / HUGE;
-    let rnd = u64::from_le_bytes([entropy[0], entropy[1], entropy[2], entropy[3], entropy[4], entropy[5], entropy[6], entropy[7]]);
-    let slide = if entropy == [0; 32] { 0 } else { (rnd % slots) * HUGE };
+    let rnd = Blake2s::keyed(&seed).update(b"kernel address slide").finish();
+    let rnd = u64::from_le_bytes([rnd[0], rnd[1], rnd[2], rnd[3], rnd[4], rnd[5], rnd[6], rnd[7]]);
+    let slide = (rnd % slots) * HUGE;
+    let entropy = Blake2s::keyed(&seed).update(b"root task").finish();
     let kphys = boot.pages(efi::MEM_SILICA_KERNEL, hi - lo, "out of memory for the kernel image");
     for s in elf.segments() {
         // SAFETY: the destination lies inside the pages just allocated
@@ -410,6 +457,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         fb_stride: fb.3,
         fb_format: fb.4,
         entropy,
+        entropy_sources,
         wall_secs,
         wall_tsc,
         loader_tsc,

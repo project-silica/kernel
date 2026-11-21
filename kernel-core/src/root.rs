@@ -52,8 +52,10 @@ pub struct RootSpec<'a> {
     pub clock: [u64; 3],
     /// Wall-clock time, as in [`RootInfo::wall_clock`].
     pub wall_clock: [u64; 2],
-    /// Firmware entropy.
+    /// As in [`RootInfo::entropy`] and [`RootInfo::entropy_sources`].
     pub entropy: [u8; 32],
+    /// See `entropy`.
+    pub entropy_sources: u64,
     /// Kernel command line.
     pub cmdline: &'a [u8],
     /// Number of processors.
@@ -239,6 +241,7 @@ impl<H: Hal> Kernel<H> {
         put(offset_of!(RootInfo, clock), &spec.clock);
         put(offset_of!(RootInfo, wall_clock), &spec.wall_clock);
         self.phys.write_bytes(info + offset_of!(RootInfo, entropy) as u64, &spec.entropy);
+        put(offset_of!(RootInfo, entropy_sources), &[spec.entropy_sources]);
         let cmd = &spec.cmdline[..spec.cmdline.len().min(256)];
         put(offset_of!(RootInfo, cmdline_len), &[cmd.len() as u64]);
         put(offset_of!(RootInfo, cpus), &[spec.cpus]);

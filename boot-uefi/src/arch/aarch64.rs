@@ -46,6 +46,37 @@ pub fn counter() -> u64 {
     v
 }
 
+/// 64 bits from the processor's generator (FEAT_RNG): RNDRRS, freshly
+/// reseeded from its entropy source, else RNDR. `None` when it has none,
+/// or when it keeps reporting failure.
+pub fn cpu_random() -> Option<u64> {
+    let isar0: u64;
+    // SAFETY: reading an identification register has no side effect.
+    unsafe { asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack, preserves_flags)) }
+    if isar0 >> 60 & 0xF == 0 {
+        return None;
+    }
+    let step = |reseed: bool| -> Option<u64> {
+        let (v, ok): (u64, u64);
+        // SAFETY: RNDRRS and RNDR (present: checked above) only produce a
+        // value and set Z on failure.
+        unsafe {
+            if reseed {
+                asm!("mrs {}, s3_3_c2_c4_1", "cset {}, ne", out(reg) v, out(reg) ok, options(nomem, nostack));
+            } else {
+                asm!("mrs {}, s3_3_c2_c4_0", "cset {}, ne", out(reg) v, out(reg) ok, options(nomem, nostack));
+            }
+        }
+        (ok != 0).then_some(v)
+    };
+    for i in 0..80 {
+        if let Some(v) = step(i < 64) {
+            return Some(v);
+        }
+    }
+    None
+}
+
 /// Print through the firmware's console until a UART is known.
 pub fn console(st: *const efi::SystemTable) {
     // SAFETY: the firmware's system table is valid while boot services run.

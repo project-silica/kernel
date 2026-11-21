@@ -88,8 +88,10 @@ pub struct BootInfo {
     pub fb_stride: u32,
     /// 0 none, 1 RGBX, 2 BGRX (8 bits each, byte order in memory).
     pub fb_format: u32,
-    /// Random bytes from the firmware; all zero when it has no source.
+    /// The root task's secret (`RootInfo::entropy`).
     pub entropy: [u8; 32],
+    /// `RootInfo::entropy_sources`.
+    pub entropy_sources: u64,
     /// Wall-clock time read from the firmware, seconds since 1970 (0 unknown).
     pub wall_secs: u64,
     /// Timestamp counter when `wall_secs` was read.

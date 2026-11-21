@@ -16,6 +16,7 @@ preempt
 fpu
 untyped
 caps
+irq
 inspect
 ipc_caps
 ipc_parked
@@ -25,3 +26,6 @@ smp_shootdown smp=2
 smp_stress smp=8
 smp_revoke smp=8
 smp_timeouts smp=8
+entropy
+sched
+console

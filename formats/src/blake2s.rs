@@ -73,7 +73,7 @@ impl Blake2s {
         buf[self.len..].fill(0);
         compress(&mut h, &buf, self.t + self.len as u64, true);
         let mut out = [0; 32];
-        for (o, w) in out.chunks_exact_mut(4).zip(h) {
+        for (o, w) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
             o.copy_from_slice(&w.to_le_bytes());
         }
         out
@@ -88,8 +88,8 @@ impl Default for Blake2s {
 
 fn compress(h: &mut [u32; 8], block: &[u8; 64], t: u64, last: bool) {
     let mut m = [0u32; 16];
-    for (w, b) in m.iter_mut().zip(block.chunks_exact(4)) {
-        *w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    for (w, b) in m.iter_mut().zip(block.as_chunks::<4>().0) {
+        *w = u32::from_le_bytes(*b);
     }
     let mut v = [0u32; 16];
     v[..8].copy_from_slice(h);
@@ -146,8 +146,14 @@ mod tests {
         let key: Vec<u8> = (0..32).collect();
         let input: Vec<u8> = (0..=255).collect();
         assert_eq!(hex(&Blake2s::keyed(&key).finish()), "48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49");
-        assert_eq!(hex(&Blake2s::keyed(&key).update(&input[..1]).finish()), "40d15fee7c328830166ac3f918650f807e7e01e177258cdc0a39b11f598066f1");
-        assert_eq!(hex(&Blake2s::keyed(&key).update(&input[..255]).finish()), "3fb735061abc519dfe979e54c1ee5bfad0a9d858b3315bad34bde999efd724dd");
+        assert_eq!(
+            hex(&Blake2s::keyed(&key).update(&input[..1]).finish()),
+            "40d15fee7c328830166ac3f918650f807e7e01e177258cdc0a39b11f598066f1"
+        );
+        assert_eq!(
+            hex(&Blake2s::keyed(&key).update(&input[..255]).finish()),
+            "3fb735061abc519dfe979e54c1ee5bfad0a9d858b3315bad34bde999efd724dd"
+        );
     }
 
     #[test]
