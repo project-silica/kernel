@@ -11,6 +11,10 @@
 #[path = "arch/x86_64.rs"]
 #[allow(unsafe_code)]
 mod arch;
+#[cfg(target_arch = "aarch64")]
+#[path = "arch/aarch64.rs"]
+#[allow(unsafe_code)]
+mod arch;
 
 mod buffer;
 
@@ -63,7 +67,7 @@ pub enum Wait {
     Until(u64),
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn sys(n: Syscall, a: [u64; 6]) -> Result<[u64; 6]> {
     let (status, out) = arch::syscall(n as u64, a);
     Error::result(status).map(|()| out)

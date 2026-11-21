@@ -10,9 +10,12 @@
 #![no_std]
 #![no_main]
 
-use core::arch::asm;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
+#[cfg_attr(target_arch = "x86_64", path = "arch/x86_64.rs")]
+#[cfg_attr(target_arch = "aarch64", path = "arch/aarch64.rs")]
+mod arch;
+
 use libsys::root::*;
 use libsys::*;
 
@@ -24,10 +27,7 @@ const RW: Rights = Rights(3);
 struct Serial;
 impl Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() {
-            while port_in(PORTS, 0x3FD, 1).unwrap_or(0x20) & 0x20 == 0 {}
-            let _ = port_out(PORTS, 0x3F8, 1, b as u32);
-        }
+        arch::console_write(s.as_bytes());
         Ok(())
     }
 }
@@ -36,7 +36,7 @@ macro_rules! println {
 }
 
 fn exit(ok: bool) -> ! {
-    let _ = port_out(PORTS, 0xF4, 1, if ok { 0x10 } else { 0x11 });
+    arch::exit_harness(ok);
     loop {
         yield_now();
     }
@@ -97,12 +97,7 @@ fn finish(arg: u64) -> ! {
     }
 }
 
-fn raw_syscall(n: u64) -> u64 {
-    let r: u64;
-    // SAFETY: a syscall with no arguments; it changes what a function call may change.
-    unsafe { asm!("syscall", inout("rax") n => r, clobber_abi("sysv64"), options(nostack)) }
-    r
-}
+use arch::raw_syscall;
 
 fn wait_for(flag: &AtomicU64, value: u64) -> T {
     for _ in 0..1_000_000 {
@@ -145,17 +140,13 @@ extern "C" fn do_fault(arg: u64) -> ! {
     unsafe {
         match arg & 0xFFFF_FFFF {
             1 => core::ptr::write_volatile(0x10 as *mut u8, 1),
-            2 => asm!("ud2"),
-            3 => asm!("cli"),
+            2 | 3 | 6 | 7 | 8 => arch::deliberate(arg & 0xFFFF_FFFF),
             4 => {
                 core::ptr::read_volatile(0xFFFF_8000_0010_0000 as *const u8);
             }
             5 => {
                 core::ptr::read_volatile(0xFFFF_FFFF_8000_0000 as *const u8);
             }
-            6 => asm!("hlt"),
-            7 => asm!("mov rax, cr3", out("rax") _),
-            8 => asm!("in al, dx", in("dx") 0x3F8u16, out("al") _),
             _ => {}
         }
     }
@@ -195,14 +186,14 @@ fn t_fault_page() -> T {
 
 fn t_fault_instruction() -> T {
     let m = fault_of(2)?;
-    (kind(&m) == Fault::Instruction as u64).then_some(()).ok_or("ud2 was not reported as an instruction fault")
+    (kind(&m) == Fault::Instruction as u64).then_some(()).ok_or("an undefined instruction was not reported as an instruction fault")
 }
 
 fn t_fault_privileged() -> T {
     for what in [3, 6, 7, 8] {
         let m = fault_of(what)?;
-        if kind(&m) != Fault::Exception as u64 || m.words[1] != 13 {
-            return Err("a privileged instruction (cli, hlt, mov from cr3, in) was not a general-protection fault");
+        if !arch::privileged_fault(kind(&m), &m) {
+            return Err("a privileged instruction was not reported as the architecture reports one");
         }
     }
     Ok(())
@@ -304,8 +295,9 @@ fn t_w_xor_x() -> T {
         return Err("a writable and executable mapping was accepted");
     }
     map(ASPACE, f, at, RW).map_err(|_| "cannot map")?;
-    // SAFETY: the page was just mapped read-write; 0xC3 is `ret`.
-    unsafe { core::ptr::write_volatile(at as *mut u8, 0xC3) };
+    // SAFETY: the page was just mapped read-write; RET is a return instruction.
+    unsafe { core::ptr::copy_nonoverlapping(arch::RET.as_ptr(), at as *mut u8, arch::RET.len()) };
+    arch::sync_code(at, arch::RET.len());
     // Executing it must fault (not executable) with the instruction-fetch bit.
     let ep = new(ObjectType::Endpoint, 0);
     let t = new(ObjectType::Thread, 0);
@@ -436,31 +428,7 @@ fn t_preempt() -> T {
     Ok(())
 }
 
-/// Spin for `ticks` of the timestamp counter with a value in SSE and AVX
-/// registers, making no system call, and return what the registers hold
-/// afterwards. Another thread running in between must not change them.
-fn hold_in_vector_registers(v: u64, ticks: u64) -> [u64; 3] {
-    let (a, b, c): (u64, u64, u64);
-    // SAFETY: only registers declared here are touched.
-    unsafe {
-        asm!(
-            "vmovq xmm0, {v}",
-            "vpbroadcastq ymm15, xmm0",
-            "vmovq xmm7, {v}",
-            "rdtsc", "shl rdx, 32", "lea {end}, [rax + rdx]", "add {end}, {ticks}",
-            "2: pause", "rdtsc", "shl rdx, 32", "add rax, rdx", "cmp rax, {end}", "jb 2b",
-            "vmovq {a}, xmm0",
-            "vmovq {b}, xmm7",
-            "vextracti128 xmm1, ymm15, 1",
-            "vpextrq {c}, xmm1, 1",
-            "vzeroupper",
-            v = in(reg) v, ticks = in(reg) ticks, end = out(reg) _, a = out(reg) a, b = out(reg) b, c = out(reg) c,
-            out("rax") _, out("rdx") _, out("xmm0") _, out("xmm1") _, out("xmm7") _, out("xmm15") _,
-            options(nostack),
-        );
-    }
-    [a, b, c]
-}
+use arch::hold_in_vector_registers;
 
 extern "C" fn fpu_worker(arg: u64) -> ! {
     let id = arg & 0xFFFF_FFFF;
@@ -479,16 +447,7 @@ extern "C" fn fpu_worker(arg: u64) -> ! {
 extern "C" fn fpu_secret_holder(arg: u64) -> ! {
     // Fill the vector registers with a recognisable value and yield, for ever.
     loop {
-        // SAFETY: only registers declared here are touched; `syscall` 4 is Yield.
-        unsafe {
-            asm!(
-                "vmovq xmm0, {v}", "vpbroadcastq ymm0, xmm0", "vmovdqa ymm1, ymm0", "vmovdqa ymm7, ymm0", "vmovdqa ymm15, ymm0",
-                "fld1",
-                "mov eax, 4", "syscall",
-                "fstp st(0)",
-                v = in(reg) 0x5EC2_E75E_C2E7_u64 | arg << 48, clobber_abi("sysv64"), options(nostack),
-            );
-        }
+        arch::yield_holding_secret(0x5EC2_E75E_C2E7_u64 | arg << 48);
         if SHARED[2].load(SeqCst) != 0 {
             finish(arg)
         }
@@ -527,40 +486,21 @@ fn t_fpu() -> T {
     SHARED[2].store(0, SeqCst);
     let _ = spawn(fpu_secret_holder, 1, Cap::NONE);
     for _ in 0..200 {
-        let (a, b, x87): (u64, u64, u16);
-        // SAFETY: only registers declared here are touched; `syscall` 4 is Yield.
-        unsafe {
-            asm!(
-                "mov eax, 4", "syscall",
-                "vextracti128 xmm2, ymm15, 1", "vpextrq r12, xmm2, 1", "vmovq r13, xmm7",
-                "fnstsw ax",
-                out("r12") a, out("r13") b, lateout("ax") x87, clobber_abi("sysv64"), options(nostack),
-            );
-        }
+        let (a, b, x87) = arch::vectors_after_yield();
         if a != 0 || b != 0 {
             SHARED[2].store(1, SeqCst);
             return Err("after a system call a thread saw another thread's vector registers");
         }
-        if x87 & 0x3800 != 0 {
+        if x87 {
             SHARED[2].store(1, SeqCst);
             return Err("after a system call a thread saw another thread's x87 stack");
         }
     }
     // 3. The control words are the thread's own across a switch.
-    let mxcsr_in = 0x1F80u32 | 0x6000; // round toward zero
-    let mut mxcsr_out = 0u32;
-    // SAFETY: loads and stores MXCSR around a Yield; restores the default.
-    unsafe {
-        asm!(
-            // Registers the system call preserves, so the pointers survive it.
-            "ldmxcsr [r12]", "mov eax, 4", "syscall", "stmxcsr [r13]", "ldmxcsr [r14]",
-            in("r12") &mxcsr_in, in("r13") &mut mxcsr_out, in("r14") &0x1F80u32,
-            clobber_abi("sysv64"), options(nostack),
-        );
-    }
+    let (mxcsr_in, mxcsr_out) = arch::fp_control_across_yield();
     SHARED[2].store(1, SeqCst);
     if mxcsr_out != mxcsr_in {
-        return Err("MXCSR was not preserved across a system call that switched threads");
+        return Err("the floating-point control word was not preserved across a system call that switched threads");
     }
     Ok(())
 }
@@ -622,10 +562,18 @@ fn t_caps() -> T {
     if cap_derive(SPACE, a, Cap(UNTYPED.load(SeqCst)), Rights::ALL, 0) != Err(Error::InUse) {
         return Err("an Untyped was copied");
     }
+    // A narrowed range of interrupt lines reaches only its lines (an
+    // acknowledgement checks the range and changes nothing on an unbound line).
+    cap_derive(SPACE, a, Cap(SLOT_IRQS), Rights::ALL, 4 | 5 << 32).map_err(|_| "narrow interrupt lines")?;
+    if irq_ack(Cap(a), 5) != Err(Error::BadArg) || irq_ack(Cap(a), 4).is_err() {
+        return Err("a narrowed interrupt-line capability did not confine its lines");
+    }
     // A narrowed port range reaches only its ports.
-    cap_derive(SPACE, a, PORTS, Rights::ALL, 0x3F8 | 0x400 << 32).map_err(|_| "narrow ports")?;
-    if port_in(Cap(a), 0xF4, 1) != Err(Error::BadArg) || port_in(Cap(a), 0x3FD, 1).is_err() {
-        return Err("a narrowed port capability did not confine port access");
+    if arch::HAS_PORTS {
+        cap_derive(SPACE, b, PORTS, Rights::ALL, 0x3F8 | 0x400 << 32).map_err(|_| "narrow ports")?;
+        if port_in(Cap(b), 0xF4, 1) != Err(Error::BadArg) || port_in(Cap(b), 0x3FD, 1).is_err() {
+            return Err("a narrowed port capability did not confine port access");
+        }
     }
     Ok(())
 }
@@ -735,6 +683,9 @@ fn t_ipc_parked() -> T {
 /// A device interrupt reaches userspace: the serial port's "transmitter
 /// empty" interrupt (ISA line 4), delivered as a notification.
 fn t_irq() -> T {
+    if !arch::HAS_PORTS {
+        return Err("no device here whose interrupt this test can raise on demand: the aarch64 version (B05) is not written yet");
+    }
     const LINES: Cap = Cap(SLOT_IRQS);
     let n = new(ObjectType::Notification, 0);
     let badged = slot();
@@ -806,7 +757,7 @@ fn t_inspect() -> T {
         "capabilities: {caps} (untyped {}, capspace {}, thread {}, address space {}, frame {}, endpoint {}, notification {}, hw {})",
         by_type[1], by_type[2], by_type[3], by_type[4], by_type[5], by_type[6], by_type[7], by_type[9]
     );
-    if threads < 2 || by_type[1] == 0 || by_type[9] != 2 {
+    if threads < 2 || by_type[1] == 0 || by_type[9] != arch::HW_CAPS {
         return Err("the walk of the CapSpace missed capabilities that are there");
     }
     if inspect_slot(SPACE, slots) != Err(Error::BadCap) || inspect_slot(ep, 1) != Err(Error::WrongType) {
@@ -1180,13 +1131,7 @@ const SAMPLES: usize = 20_000;
 const WARMUP: usize = 2_000;
 static mut SAMPLE: [u64; SAMPLES] = [0; SAMPLES];
 
-fn rdtsc() -> u64 {
-    let (lo, hi): (u32, u32);
-    // SAFETY: LFENCE and RDTSC read the timestamp counter after earlier
-    // instructions have finished.
-    unsafe { asm!("lfence", "rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)) }
-    (hi as u64) << 32 | lo as u64
-}
+use arch::counter as rdtsc;
 
 fn samples() -> &'static mut [u64; SAMPLES] {
     // SAFETY: only the benchmark's main thread uses the sample buffer.
@@ -1202,30 +1147,6 @@ fn report(name: &str, n: usize, div: u64) {
     println!("BENCH {name}_p99 {} ns", ns(s[n - n / 100 - 1]));
 }
 
-// Code for threads in other address spaces: position-independent, no stack,
-// no data. The first argument register holds the thread's argument.
-core::arch::global_asm!(
-    ".section .text.stubs, \"ax\"",
-    ".global stub_echo, stub_echo_end, stub_yield, stub_yield_end",
-    // An echo server on the endpoint in rdi: ReplyRecv for ever. The reply
-    // is the request, because the message registers are left as received.
-    "stub_echo:",
-    "mov r15, rdi",
-    "2: mov eax, 3",
-    "mov rdi, r15",
-    "syscall",
-    "jmp 2b",
-    "stub_echo_end:",
-    // Yield for ever with live AVX state.
-    "stub_yield:",
-    "mov r15, rdi",
-    "3: vmovq xmm0, r15",
-    "vpbroadcastq ymm15, xmm0",
-    "mov eax, 4",
-    "syscall",
-    "jmp 3b",
-    "stub_yield_end:",
-);
 unsafe extern "C" {
     static stub_echo: u8;
     static stub_echo_end: u8;
@@ -1253,6 +1174,7 @@ fn foreign_thread_on(cpu: usize, code: &[u8], arg: u64) -> Cap {
     // SAFETY: one page mapped read-write at `at`; `code` fits in it.
     unsafe {
         core::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, code.len());
+        arch::sync_code(at, code.len());
         unmap(frame).expect("unmap");
     }
     map(aspace, frame, 0x10_0000, Rights(5)).expect("map code in the new address space");
@@ -1306,21 +1228,7 @@ fn bench_ipc() {
 fn bench_ctx_switch() {
     let other = foreign_thread(stub(&raw const stub_yield, &raw const stub_yield_end), 7);
     for i in 0..SAMPLES + WARMUP {
-        let t: u64;
-        // SAFETY: loads AVX registers, then times one Yield syscall.
-        unsafe {
-            asm!(
-                "vmovq xmm0, {v}",
-                "vpbroadcastq ymm15, xmm0",
-                "lfence", "rdtsc", "shl rdx, 32", "lea r12, [rax + rdx]",
-                "mov eax, 4",
-                "syscall",
-                "lfence", "rdtsc", "shl rdx, 32", "add rax, rdx", "sub rax, r12",
-                v = in(reg) i as u64, out("r12") _,
-                lateout("rax") t, clobber_abi("sysv64"),
-                options(nostack),
-            );
-        }
+        let t = arch::timed_yield(i as u64);
         if i >= WARMUP {
             samples()[i - WARMUP] = t;
         }

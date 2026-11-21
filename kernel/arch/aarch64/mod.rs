@@ -1,21 +1,31 @@
 //! aarch64 architecture glue (component B05).
 //!
-//! Booting so far: the loader enters `_start` at EL1 with the MMU on (the
-//! kernel half in TTBR1, all RAM at `PHYS_MAP_BASE`, see
-//! `boot-uefi/src/arch/aarch64.rs`). The kernel takes its boot stack,
-//! installs exception vectors that report any exception as a kernel fault,
-//! maps the console UART the ACPI SPCR table names into its device window,
-//! checks the boot information and reports the machine. Not yet built: the
-//! GIC, the timer, user mode, system calls and the root task; the kernel
-//! says so and stops (`spec/MILESTONES.md` M2: aarch64 boots to the same
-//! tests as x86_64).
+//! The loader enters `_start` at EL1 with the MMU on (the kernel half in
+//! TTBR1, all RAM at `PHYS_MAP_BASE`, see `boot-uefi/src/arch/aarch64.rs`).
+//! The kernel takes its boot stack and vectors (`cpu.rs`), maps the console
+//! UART the ACPI SPCR table names and the GICv3 the MADT describes into its
+//! device window (`gic.rs`), sets up the EL1 virtual timer and starts the
+//! root task. User address spaces are TTBR0's; the kernel's mappings are
+//! TTBR1's and never change. Not yet: the other processors (PSCI), ASIDs
+//! (every address-space switch flushes the local TLB).
+
+mod cpu;
+mod gic;
 
 use core::arch::{asm, global_asm};
+use core::cell::Cell;
 use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use cpu::{PerCpu, percpu};
 use kernel_core::ExitStatus;
+use kernel_core::Kernel;
 use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, Cmdline, PHYS_MAP_BASE, Region};
+use kernel_core::hal::Hal;
+use kernel_core::lock::Presence;
+use kernel_core::mem::{Paddr, Phys};
+use kernel_core::root::RootSpec;
+use silica_abi::{FAULT_FETCH, FAULT_PRESENT, FAULT_WRITE, Fault, Rights};
 
 const BLOCK: u64 = 2 << 20;
 const STACK_SIZE: usize = 64 << 10;
@@ -46,25 +56,10 @@ _start:
     bl {kmain}
     b .
 
-// Exception vectors: 16 entries of 128 bytes. Until user mode exists every
-// exception is a kernel fault: report it with the entry it came through.
-.section .text, "ax"
-.balign 2048
-vectors:
-.irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-.balign 128
-    mov x3, #\n
-    mrs x0, esr_el1
-    mrs x1, elr_el1
-    mrs x2, far_el1
-    mov x4, x29
-    b {fault}
-.endr
 "#,
     stack = sym BOOT_STACK,
     size = const STACK_SIZE,
     kmain = sym kmain,
-    fault = sym kernel_fault,
 );
 
 // ---- console ---------------------------------------------------------------
@@ -148,6 +143,22 @@ fn image_phys(v: u64) -> u64 {
     v - IMAGE[0].load(Ordering::Relaxed) + IMAGE[1].load(Ordering::Relaxed)
 }
 
+/// Map `[phys, phys + len)` of device registers at consecutive virtual
+/// addresses and return the address of `phys`.
+fn map_device_range(phys: u64, len: u64) -> Option<u64> {
+    let first = phys & !(BLOCK - 1);
+    let blocks = (phys + len.max(1)).div_ceil(BLOCK) - first / BLOCK;
+    let va = map_device(first)?;
+    // Each further block, new or mapped before, must follow at the next
+    // virtual block.
+    for b in 1..blocks {
+        if map_device(first + b * BLOCK)? != va + b * BLOCK {
+            return None;
+        }
+    }
+    Some(va + (phys - first))
+}
+
 /// Map the device registers at physical `phys` (with the rest of their
 /// 2 MiB block) and return their virtual address. Boot processor, boot only.
 fn map_device(phys: u64) -> Option<u64> {
@@ -179,37 +190,81 @@ fn map_device(phys: u64) -> Option<u64> {
     }
 }
 
-/// The base of the UART the ACPI SPCR table names, if it is a PL011 or an
-/// SBSA generic UART in memory space.
-fn spcr_uart(rsdp: u64) -> Option<u64> {
-    let read8 = |p: u64| -> [u8; 8] {
-        // SAFETY: ACPI tables are in RAM the physical map covers; reads are
-        // bounded by the lengths the tables give.
-        unsafe { core::ptr::read_unaligned((PHYS_MAP_BASE + p) as *const [u8; 8]) }
-    };
-    let u64_at = |p: u64| u64::from_le_bytes(read8(p));
-    let u32_at = |p: u64| u64_at(p) as u32;
-    if rsdp == 0 || read8(rsdp) != *b"RSD PTR " {
+fn acpi8(p: u64) -> [u8; 8] {
+    // SAFETY: ACPI tables are in RAM the physical map covers; callers stay
+    // inside the lengths the tables give.
+    unsafe { core::ptr::read_unaligned((PHYS_MAP_BASE + p) as *const [u8; 8]) }
+}
+fn acpi64(p: u64) -> u64 {
+    u64::from_le_bytes(acpi8(p))
+}
+fn acpi32(p: u64) -> u32 {
+    acpi64(p) as u32
+}
+
+/// The physical address and length of the ACPI table with signature `sig`.
+fn acpi_table(rsdp: u64, sig: &[u8; 4]) -> Option<(u64, u64)> {
+    if rsdp == 0 || acpi8(rsdp) != *b"RSD PTR " {
         return None;
     }
-    let xsdt = u64_at(rsdp + 24);
-    if xsdt == 0 || read8(xsdt)[..4] != *b"XSDT" {
+    let xsdt = acpi64(rsdp + 24);
+    if xsdt == 0 || acpi8(xsdt)[..4] != *b"XSDT" {
         return None;
     }
-    let len = u32_at(xsdt + 4) as u64;
+    let len = acpi32(xsdt + 4) as u64;
     let mut at = xsdt + 36;
     while at + 8 <= xsdt + len {
-        let t = u64_at(at);
+        let t = acpi64(at);
         at += 8;
-        if t == 0 || read8(t)[..4] != *b"SPCR" || u32_at(t + 4) < 80 {
-            continue;
-        }
-        let (kind, space, base) = (read8(t + 36)[0], read8(t + 40)[0], u64_at(t + 44));
-        if matches!(kind, 0x03 | 0x0E) && space == 0 && base != 0 {
-            return Some(base);
+        if t != 0 && acpi8(t)[..4] == *sig {
+            return Some((t, acpi32(t + 4) as u64));
         }
     }
     None
+}
+
+/// The base of the UART the ACPI SPCR table names, if it is a PL011 or an
+/// SBSA generic UART in memory space.
+fn spcr_uart(rsdp: u64) -> Option<u64> {
+    let (t, len) = acpi_table(rsdp, b"SPCR")?;
+    let (kind, space, base) = (acpi8(t + 36)[0], acpi8(t + 40)[0], acpi64(t + 44));
+    (len >= 80 && matches!(kind, 0x03 | 0x0E) && space == 0 && base != 0).then_some(base)
+}
+
+/// What the MADT says about the GIC: the distributor, the redistributor
+/// region, and the boot processor's redistributor if it is given per
+/// processor instead.
+struct Madt {
+    gicd: u64,
+    gicr: (u64, u64),
+}
+
+fn madt(rsdp: u64) -> Option<Madt> {
+    let (t, len) = acpi_table(rsdp, b"APIC")?;
+    let mut m = Madt { gicd: 0, gicr: (0, 0) };
+    let me = gic::my_affinity();
+    let mut at = t + 44;
+    while at + 2 <= t + len {
+        let (kind, n) = (acpi8(at)[0], acpi8(at)[1] as u64);
+        if n < 2 {
+            break;
+        }
+        match kind {
+            0x0C if n >= 24 => m.gicd = acpi64(at + 8),
+            0x0E if n >= 16 => m.gicr = (acpi64(at + 4), acpi32(at + 12) as u64),
+            // A GICC entry with its own redistributor, used when there is
+            // no redistributor region.
+            0x0B if n >= 76 && m.gicr.0 == 0 && gic::affinity(acpi64(at + 68)) == me => {
+                let r = acpi64(at + 60);
+                if r != 0 {
+                    m.gicr = (r, 0x2_0000);
+                }
+            }
+            _ => {}
+        }
+        at += n;
+    }
+    (m.gicd != 0 && m.gicr.0 != 0).then_some(m)
 }
 
 // ---- faults and panics -------------------------------------------------------
@@ -266,6 +321,351 @@ extern "C" fn kernel_fault(esr: u64, elr: u64, far: u64, entry: u64, fp: u64) ->
     die()
 }
 
+// ---- the kernel's view of the machine ---------------------------------------
+
+/// What the aarch64 layer knows about the machine. Set by the boot
+/// processor before any other starts, then only read.
+pub struct Arm {
+    /// Counter value at monotonic time 0.
+    count0: Cell<u64>,
+    /// Nanoseconds per tick and ticks per nanosecond, 32.32 fixed point.
+    ns_per_tick: Cell<u64>,
+    ticks_per_ns: Cell<u64>,
+    /// An empty first-level table: TTBR0 when no user address space is loaded.
+    empty_root: Cell<u64>,
+}
+
+struct Global(Kernel<Arm>);
+// SAFETY: every processor enters the kernel through `Kernel::enter`, and
+// kernel-core's lock protocol decides what each may touch. The `Arm` fields
+// are written by the boot processor before any other starts.
+unsafe impl Sync for Global {}
+
+static KERNEL: Global = Global(Kernel::new(
+    Arm { count0: Cell::new(0), ns_per_tick: Cell::new(0), ticks_per_ns: Cell::new(0), empty_root: Cell::new(0) },
+    // SAFETY: the loader maps all RAM at PHYS_MAP_BASE and the kernel only
+    // uses addresses from the boot regions through it.
+    unsafe { Phys::new(PHYS_MAP_BASE as *mut u8) },
+));
+
+/// The kernel.
+pub fn kernel() -> &'static Kernel<Arm> {
+    &KERNEL.0
+}
+
+fn counter() -> u64 {
+    let v: u64;
+    // SAFETY: reading the virtual count; ISB keeps it in program order.
+    unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) }
+    v
+}
+
+fn ttbr0() -> u64 {
+    let v: u64;
+    // SAFETY: reading the translation table base.
+    unsafe { asm!("mrs {}, ttbr0_el1", out(reg) v, options(nomem, nostack, preserves_flags)) }
+    v & ADDR
+}
+
+/// Load `root` as the user address space and forget every cached user
+/// translation on this processor (there are no ASIDs yet).
+fn load_ttbr0(root: u64) {
+    // SAFETY: TTBR0 holds only user mappings; the kernel runs from TTBR1,
+    // which this does not touch.
+    unsafe { asm!("msr ttbr0_el1, {}", "isb", "tlbi vmalle1", "dsb nsh", "isb", in(reg) root, options(nostack, preserves_flags)) }
+}
+
+// Leaf attributes of user mappings.
+const PAGE_L3: u64 = 0b11;
+const BLOCK_L2: u64 = 0b01;
+const AP_EL0: u64 = 1 << 6;
+const AP_RO: u64 = 1 << 7;
+const SH_INNER: u64 = 3 << 8;
+const NG: u64 = 1 << 11;
+
+impl Hal for Arm {
+    const IP: usize = cpu::REG_PC;
+    const SP: usize = cpu::REG_SP;
+    const FLAGS: usize = cpu::REG_SPSR;
+    const SYS: usize = 8;
+    const ARG: [usize; 6] = [0, 1, 2, 3, 4, 5];
+    /// EL0, interrupts unmasked.
+    const FLAGS_INIT: u64 = 0;
+    const SYSCALL_LEN: u64 = 4;
+    const USER_TOP: u64 = 0x0000_7FFF_FFFF_F000;
+
+    fn pte_table(table: Paddr) -> u64 {
+        table | 0b11
+    }
+    fn pte_leaf(frame: Paddr, rights: Rights, level: u8, device: bool) -> u64 {
+        // User memory: EL0 access, not global (tagged by address space),
+        // never executable by the kernel.
+        let mut e = frame | AF | NG | AP_EL0 | SH_INNER | PXN;
+        e |= if level == 0 { PAGE_L3 } else { BLOCK_L2 };
+        if !rights.has(Rights::WRITE) {
+            e |= AP_RO;
+        }
+        if !rights.has(Rights::EXEC) {
+            e |= UXN;
+        }
+        if device {
+            e |= ATTR_DEVICE;
+        }
+        e
+    }
+    fn pte_present(pte: u64) -> bool {
+        pte & 1 != 0
+    }
+    fn pte_is_leaf(pte: u64, level: u8) -> bool {
+        level == 0 || pte & 0b10 == 0
+    }
+    fn pte_addr(pte: u64) -> Paddr {
+        pte & ADDR
+    }
+
+    /// The kernel lives in TTBR1: a user root starts empty.
+    fn init_root(&self, _phys: &Phys, _root: Paddr) {}
+    /// Retyped memory is zero: all vector registers zero, FPCR default.
+    fn init_thread(&self, _phys: &Phys, _thread: Paddr) {}
+
+    fn switch_thread(&self, phys: &Phys, from: Paddr, to: Paddr, root: Paddr) {
+        let k = kernel();
+        let area = |t: Paddr| phys.ptr(t + kernel_core::thread::FPU_OFFSET as u64);
+        // Vector state, as on x86: a thread that entered by SVC keeps only
+        // its control and status words (a system call clobbers the vector
+        // registers, as a call does) and finds them cleared; an interrupted
+        // or faulted thread gets a full save and restore.
+        //
+        // SAFETY: `from` and `to` are live Thread objects of 4 KiB, whose
+        // area from FPU_OFFSET has room for the 512 bytes of q0..q31.
+        unsafe {
+            if from != 0 {
+                let regs = k.regs(from);
+                if regs[cpu::REG_BY_SVC].get() == 0 {
+                    cpu::silica_simd_save(area(from));
+                }
+                regs[cpu::REG_FPCTL].set(cpu::silica_fp_control());
+            }
+            let to_regs = k.regs(to);
+            if to_regs[cpu::REG_BY_SVC].get() != 0 {
+                cpu::silica_simd_clear();
+            } else {
+                cpu::silica_simd_load(area(to));
+            }
+            cpu::silica_fp_set_control(to_regs[cpu::REG_FPCTL].get());
+            percpu().regs.set(to_regs.as_ptr() as u64);
+        }
+        let want = if root == 0 { self.empty_root.get() } else { root };
+        if ttbr0() != want {
+            load_ttbr0(want);
+        }
+    }
+
+    fn leave_aspace(&self, root: Paddr) {
+        if ttbr0() == root {
+            load_ttbr0(self.empty_root.get());
+        }
+    }
+
+    fn tlb_flush(&self, root: Paddr, vaddr: u64, len: u64) {
+        // Another root has nothing cached here: every switch flushes.
+        if ttbr0() != root {
+            return;
+        }
+        // SAFETY: TLB maintenance only drops cached translations.
+        unsafe {
+            if len > 32 * 4096 {
+                asm!("dsb ishst", "tlbi vmalle1", "dsb nsh", "isb", options(nostack, preserves_flags));
+                return;
+            }
+            asm!("dsb ishst", options(nostack, preserves_flags));
+            for page in (vaddr..vaddr + len).step_by(4096) {
+                asm!("tlbi vae1, {}", in(reg) page >> 12 & 0xFFF_FFFF_FFFF, options(nostack, preserves_flags));
+            }
+            asm!("dsb nsh", "isb", options(nostack, preserves_flags));
+        }
+    }
+
+    fn now(&self) -> u64 {
+        let ticks = counter().wrapping_sub(self.count0.get());
+        ((ticks as u128 * self.ns_per_tick.get() as u128) >> 32) as u64
+    }
+
+    fn set_timer(&self, deadline: u64) {
+        let me = percpu();
+        if deadline == u64::MAX {
+            me.deadline.set(u64::MAX);
+            // SAFETY: disabling the EL1 virtual timer.
+            unsafe { asm!("msr cntv_ctl_el0, xzr", "isb", options(nostack, preserves_flags)) }
+            return;
+        }
+        let ticks = (deadline as u128 * self.ticks_per_ns.get() as u128) >> 32;
+        let at = (self.count0.get() as u128 + ticks).min(u64::MAX as u128 - 1) as u64;
+        me.deadline.set(at);
+        // SAFETY: an absolute compare value, then enabled and unmasked.
+        unsafe {
+            asm!("msr cntv_cval_el0, {}", "msr cntv_ctl_el0, {one}", "isb", in(reg) at, one = in(reg) 1u64, options(nostack, preserves_flags))
+        }
+    }
+
+    fn irq_pending(&self) -> bool {
+        counter() >= percpu().deadline.get() || gic::pending()
+    }
+
+    fn idle_begin(&self) {
+        percpu().mode.idle();
+    }
+
+    fn idle(&self) {
+        // WFI wakes for a pending interrupt even while interrupts are
+        // masked, so none is lost between the decision to wait and the
+        // wait; it is then taken, briefly unmasked, by `kernel_irq`.
+        // SAFETY: masking state is restored before returning.
+        unsafe { asm!("dsb sy", "wfi", "msr daifclr, #2", "isb", "msr daifset, #2", options(nomem, nostack)) }
+        percpu().mode.enter_kernel();
+    }
+
+    fn cpu(&self) -> usize {
+        percpu().index
+    }
+
+    fn kick(&self, cpu: usize, wait: bool) {
+        let Some(them) = cpu::percpu_of(cpu) else { return };
+        if !them.online.load(Ordering::Acquire) || them.mode.in_kernel() {
+            return;
+        }
+        gic::kick(them.mpidr.load(Ordering::Relaxed));
+        while wait && them.mode.is_user() {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn tlb_reset(&self) {
+        load_ttbr0(self.empty_root.get());
+    }
+
+    fn tlb_forget(&self, _root: Paddr, _cpu: usize) {}
+
+    fn irq_route(&self, line: usize, cpu: usize, level: bool, active_low: bool) -> bool {
+        // GIC inputs are active-high; a platform with an active-low line
+        // inverts it before the GIC, so a request for one is an error here.
+        !active_low && cpu::percpu_of(cpu).is_some_and(|c| gic::route(line, c.mpidr.load(Ordering::Relaxed), level))
+    }
+
+    fn irq_mask(&self, line: usize, masked: bool) {
+        gic::mask(line, masked);
+    }
+
+    /// There is no I/O port space on aarch64; no port capability exists.
+    fn port_io(&self, _port: u16, _width: u8, _write: bool, _value: u32) -> u32 {
+        0
+    }
+
+    fn console(&self, bytes: &[u8]) {
+        write_bytes(bytes);
+    }
+}
+
+// ---- entry from user mode ----------------------------------------------------
+
+/// An exception from EL0: `kind` 0 synchronous (SVC or a fault), 1 interrupt.
+extern "C" fn user_trap(kind: u64) {
+    let k = kernel();
+    percpu().mode.enter_kernel();
+    k.enter();
+    let regs = k.regs(k.current());
+    if kind != 0 {
+        regs[cpu::REG_BY_SVC].set(0);
+        irq(true);
+        return;
+    }
+    let (esr, far): (u64, u64);
+    // SAFETY: reading the syndrome and fault address of this exception.
+    unsafe { asm!("mrs {}, esr_el1", "mrs {}, far_el1", out(reg) esr, out(reg) far, options(nomem, nostack, preserves_flags)) }
+    let class = esr >> 26 & 0x3F;
+    if class == 0x15 {
+        regs[cpu::REG_BY_SVC].set(1);
+        k.syscall();
+        return;
+    }
+    regs[cpu::REG_BY_SVC].set(0);
+    match class {
+        // Instruction abort (0x20) or data abort (0x24) from EL0. Fault
+        // status 0x0C-0x0F is a permission fault: something is mapped.
+        0x20 | 0x24 => {
+            let status = esr & 0x3F;
+            let access = if (0x0C..=0x0F).contains(&status) { FAULT_PRESENT } else { 0 }
+                | if class == 0x24 && esr >> 6 & 1 != 0 { FAULT_WRITE } else { 0 }
+                | if class == 0x20 { FAULT_FETCH } else { 0 };
+            k.fault(Fault::Page, far, access);
+        }
+        // Undefined instruction, illegal execution state, a trapped system
+        // register access: an instruction EL0 may not run.
+        0x00 | 0x0E | 0x18 => k.fault(Fault::Instruction, far, esr),
+        _ => k.fault(Fault::Exception, far, esr),
+    }
+}
+
+/// Interrupts for this processor until none is pending. `locked`: it
+/// interrupted user code and this processor holds its lock; otherwise it
+/// interrupted the idle wait, which looks at everything again when it has
+/// the lock.
+fn irq(locked: bool) {
+    let k = kernel();
+    loop {
+        let id = gic::acknowledge();
+        if id >= gic::SPECIAL {
+            return;
+        }
+        match id {
+            gic::PPI_TIMER => {
+                // One-shot: silence it until the scheduler arms it again.
+                // SAFETY: disabling the EL1 virtual timer.
+                unsafe { asm!("msr cntv_ctl_el0, xzr", "isb", options(nostack, preserves_flags)) }
+                percpu().deadline.set(u64::MAX);
+                gic::end(id);
+                if locked {
+                    k.on_timer();
+                }
+            }
+            gic::SGI_KICK => gic::end(id),
+            id if id >= gic::SPI_BASE => {
+                let line = (id - gic::SPI_BASE) as usize;
+                // A level-triggered line stays asserted until its driver has
+                // dealt with the device: hold it off until the driver says so.
+                if gic::is_level(line) {
+                    gic::mask(line, true);
+                }
+                gic::end(id);
+                if locked {
+                    k.irq(line);
+                } else {
+                    percpu().mode.enter_kernel();
+                    k.enter();
+                    k.irq(line);
+                    percpu().mode.idle();
+                    k.leave();
+                }
+            }
+            other => {
+                gic::end(other);
+                let _ = write!(Out, "kernel: unexpected interrupt {other} on processor {}\r\n", percpu().index);
+            }
+        }
+    }
+}
+
+extern "C" fn irq_idle() {
+    irq(false);
+}
+
+extern "C" fn schedule_rust() {
+    let k = kernel();
+    k.schedule();
+    percpu().mode.leave_to_user();
+    k.leave();
+}
+
 // ---- boot ------------------------------------------------------------------
 
 extern "C" fn kmain(info: u64) -> ! {
@@ -303,6 +703,85 @@ extern "C" fn kmain(info: u64) -> ! {
     if cmdline.get("panic") == Some(b"test") {
         panic!("deliberate panic (panic=test on the command line)");
     }
-    let _ = write!(Out, "ERROR: kernel: aarch64 has no interrupt controller, timer, user mode or root task yet (B05)\r\n");
-    die()
+    let k = kernel();
+    BOOT_CPU.kstack_top.store(BOOT_STACK.0.get() as u64 + STACK_SIZE as u64, Ordering::Relaxed);
+    BOOT_CPU.mpidr.store(gic::my_affinity(), Ordering::Relaxed);
+    // SAFETY: once, on the boot processor, with interrupts masked; the
+    // per-processor data is a static.
+    unsafe { cpu::install(&BOOT_CPU) };
+    k.set_cpu_count(1);
+
+    // The interrupt controller.
+    let Some(m) = madt(bi.rsdp) else {
+        let _ = write!(Out, "ERROR: kernel: the ACPI MADT describes no GICv3 distributor and redistributor\r\n");
+        die();
+    };
+    let (Some(gicd), Some(gicr_region)) = (map_device_range(m.gicd, 0x1_0000), map_device_range(m.gicr.0, m.gicr.1)) else {
+        let _ = write!(Out, "ERROR: kernel: the GIC does not fit the kernel's device window\r\n");
+        die();
+    };
+    gic::init_distributor(gicd);
+    let Some(gicr) = gic::find_redistributor(gicr_region, m.gicr.1, gic::my_affinity()) else {
+        let _ = write!(Out, "ERROR: kernel: no GIC redistributor for the boot processor\r\n");
+        die();
+    };
+    gic::init_processor(0, gicr);
+    BOOT_CPU.online.store(true, Ordering::Release);
+
+    // Time: the generic timer's counter.
+    let h = &k.hal;
+    h.count0.set(counter());
+    h.ns_per_tick.set(((1_000_000_000u128 << 32) / freq as u128) as u64);
+    h.ticks_per_ns.set((((freq as u128) << 32) / 1_000_000_000) as u64);
+    h.empty_root.set(image_phys(EMPTY_ROOT.0.get() as u64));
+    load_ttbr0(h.empty_root.get());
+    k.enter();
+
+    // SAFETY: loader memory, read-only until the root task owns it.
+    let ramdisk = unsafe { core::slice::from_raw_parts((PHYS_MAP_BASE + bi.ramdisk) as *const u8, bi.ramdisk_len as usize) };
+    let Some(image) = kernel_core::ramdisk::find(ramdisk, "root") else {
+        let _ = write!(Out, "ERROR: kernel: no root task: the ramdisk is missing, malformed, or has no entry named \"root\"\r\n");
+        die();
+    };
+    let top = regions.last().map_or(0, |r| r.base + r.len).max(4 << 30);
+    let uart = spcr_uart(bi.rsdp).unwrap_or(0) & !0xFFF;
+    let reserved = [(m.gicd, m.gicd + 0x1_0000), (m.gicr.0, m.gicr.0 + m.gicr.1), (uart, uart + 0x1000)];
+    let spec = RootSpec {
+        regions,
+        elf: image,
+        machine: kernel_core::elf::EM_AARCH64,
+        // The GIC and the kernel's console stay with the kernel.
+        reserved: &reserved,
+        device_top: top,
+        ports: false,
+        ramdisk: [bi.ramdisk, bi.ramdisk_len],
+        rsdp: bi.rsdp,
+        framebuffer: [bi.fb_base, bi.fb_width as u64, bi.fb_height as u64, bi.fb_stride as u64, bi.fb_format as u64],
+        clock: [freq, bi.loader_tsc, h.count0.get()],
+        wall_clock: [bi.wall_secs, ((bi.wall_tsc.wrapping_sub(h.count0.get()) as i64 as i128 * 1_000_000_000) / freq as i128) as u64],
+        entropy: bi.entropy,
+        cmdline: cmdline.0,
+        cpus: 1,
+    };
+    if let Err(e) = k.boot_root(&spec) {
+        let _ = write!(Out, "ERROR: kernel: cannot start the root task: {e:?}\r\n");
+        die();
+    }
+    // SAFETY: the vectors, the processor and the root thread are set up and
+    // the kernel is entered; this is the first exit to user mode.
+    unsafe { cpu::exit_to_user() }
 }
+
+/// The boot processor's data.
+static BOOT_CPU: PerCpu = PerCpu {
+    regs: Cell::new(0),
+    kstack_top: AtomicU64::new(0),
+    index: 0,
+    mpidr: AtomicU64::new(0),
+    mode: Presence::new(),
+    online: AtomicBool::new(false),
+    deadline: Cell::new(u64::MAX),
+};
+
+/// The first-level table TTBR0 holds while no user address space is loaded.
+static EMPTY_ROOT: Table = Table(UnsafeCell::new([0; 512]));
