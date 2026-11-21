@@ -14,6 +14,7 @@ bench = false
 
 [dependencies]
 libsys = { path = "../libsys" }
+silica-formats = { path = "../formats" }
 
 [lints]
 workspace = true

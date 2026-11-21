@@ -18,6 +18,7 @@ mod arch;
 
 use libsys::root::*;
 use libsys::*;
+use silica_formats::acpi;
 
 const PORTS: Cap = Cap(SLOT_PORTS);
 const SPACE: Cap = Cap(SLOT_CAPSPACE);
@@ -718,7 +719,7 @@ fn t_ipc_parked() -> T {
 /// empty" interrupt (ISA line 4), delivered as a notification.
 fn t_irq() -> T {
     if !arch::HAS_PORTS {
-        return Err("no device here whose interrupt this test can raise on demand: the aarch64 version (B05) is not written yet");
+        return t_irq_mmio();
     }
     const LINES: Cap = Cap(SLOT_IRQS);
     let n = new(ObjectType::Notification, 0);
@@ -749,6 +750,81 @@ fn t_irq() -> T {
     port_out(PORTS, 0x3F9, 1, 0x02).map_err(|_| "port")?;
     let quiet = recv(n, Wait::Until(CLOCK.now() + 20_000_000)) == Err(Error::Timeout);
     port_out(PORTS, 0x3F9, 1, 0).map_err(|_| "port")?;
+    quiet.then_some(()).ok_or("an unbound interrupt line still signalled")
+}
+
+/// [`t_irq`] where devices are in memory space: a PL011 UART the firmware
+/// describes (ACPI DSDT, `ARMH0011`) other than the kernel's console (SPCR),
+/// found, mapped and driven from here, its "transmit" interrupt bound to a
+/// notification.
+fn t_irq_mmio() -> T {
+    const LINES: Cap = Cap(SLOT_IRQS);
+    // SAFETY: INFO holds the kernel's start-up record.
+    let rsdp = unsafe { (*(INFO.load(SeqCst) as *const RootInfo)).rsdp };
+    let mut read = |a: u64, b: &mut [u8]| read_phys(a, b);
+    let (spcr, _) = acpi::find_table(&mut read, rsdp, b"SPCR").ok_or("the firmware has no SPCR table")?;
+    let mut w = [0u8; 8];
+    if !read_phys(spcr + 44, &mut w) {
+        return Err("cannot read the SPCR table");
+    }
+    let console = u64::from_le_bytes(w);
+    let (dsdt, len) = acpi::dsdt(&mut read, rsdp).ok_or("the firmware has no DSDT")?;
+    // SAFETY: only this test uses the buffer, from one thread.
+    let buf = unsafe { &mut *(&raw mut DSDT) };
+    let aml = buf.get_mut(..len as usize).ok_or("the DSDT is larger than 128 KiB")?;
+    if !read_phys(dsdt, aml) {
+        return Err("cannot read the DSDT");
+    }
+    let dev = acpi::devices(aml, b"ARMH0011")
+        .find(|r| r.mem.0 != console && r.mem.0 != 0 && r.irq.is_some_and(|i| i >= 32))
+        .ok_or("the firmware describes no PL011 UART besides the console (the harness gives the machine a second one)")?;
+    let line = dev.irq.unwrap_or(0) - 32;
+    println!("irq: a PL011 at {:#x} (the console is at {console:#x}) on interrupt line {line}", dev.mem.0);
+    let uart = phys_window(dev.mem.0).ok_or("the second UART's registers are not in memory handed to the root task")?;
+    let reg = |off: u64| (uart + off) as *mut u32;
+    // SAFETY: the UART's registers, mapped as device memory just above.
+    let (get, set) = (|off| unsafe { core::ptr::read_volatile(reg(off)) }, |off, v| unsafe { core::ptr::write_volatile(reg(off), v) });
+    const DR: u64 = 0x00;
+    const LCR_H: u64 = 0x2C;
+    const CR: u64 = 0x30;
+    const IMSC: u64 = 0x38;
+    const MIS: u64 = 0x40;
+    const ICR: u64 = 0x44;
+    const TX: u32 = 1 << 5;
+    set(IMSC, 0);
+    set(ICR, 0x7FF);
+    set(LCR_H, 0x60); // 8 bits, no FIFO: a written byte leaves at once
+    set(CR, 0x101); // enabled, transmitting
+
+    let n = new(ObjectType::Notification, 0);
+    let badged = slot();
+    cap_derive(SPACE, badged, n, Rights::ALL, 0x40).map_err(|_| "derive")?;
+    irq_bind(LINES, line, Cap(badged), 0).map_err(|_| "cannot bind the second UART's interrupt line")?;
+    if recv(n, Wait::Until(CLOCK.now() + 20_000_000)) != Err(Error::Timeout) {
+        return Err("an interrupt arrived before the device was asked for one");
+    }
+    set(IMSC, TX);
+    set(DR, b'.' as u32);
+    let m = recv(n, Wait::Until(CLOCK.now() + 1_000_000_000));
+    let cause = get(MIS);
+    set(IMSC, 0);
+    set(ICR, 0x7FF);
+    match m {
+        Ok(m) if m.badge == 0x40 => {}
+        Ok(_) => return Err("the interrupt was delivered with the wrong badge"),
+        Err(_) => return Err("the UART's interrupt never arrived as a notification"),
+    }
+    if cause & TX == 0 {
+        return Err("the notification came, but the UART does not say it raised its transmit interrupt");
+    }
+    irq_ack(LINES, line).map_err(|_| "ack")?;
+    // Unbound, the line is quiet again even if the device asks.
+    irq_unbind(LINES, line).map_err(|_| "unbind")?;
+    set(IMSC, TX);
+    set(DR, b'.' as u32);
+    let quiet = recv(n, Wait::Until(CLOCK.now() + 20_000_000)) == Err(Error::Timeout);
+    set(IMSC, 0);
+    set(ICR, 0x7FF);
     quiet.then_some(()).ok_or("an unbound interrupt line still signalled")
 }
 
@@ -819,6 +895,47 @@ fn t_inspect() -> T {
 static CPUS: AtomicU64 = AtomicU64::new(1);
 /// `RootInfo::entropy` as four words, and `entropy_sources`.
 static ENTROPY: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// The root task's start-up record, for tests that read the firmware's tables.
+static INFO: AtomicU64 = AtomicU64::new(0);
+/// Where each device or firmware Untyped is mapped (address + 1; 0: not yet).
+static WINDOWS: [AtomicU64; MAX_UNTYPED] = [const { AtomicU64::new(0) }; MAX_UNTYPED];
+
+/// The virtual address of physical address `phys` in device or firmware
+/// memory: the whole Untyped holding it becomes one Frame, mapped once.
+fn phys_window(phys: u64) -> Option<u64> {
+    // SAFETY: INFO holds the kernel's start-up record, read-only for ever.
+    let info = unsafe { &*(INFO.load(SeqCst) as *const RootInfo) };
+    let i = (0..info.untyped_count as usize).find(|&i| {
+        let d = info.untyped[i];
+        d.kind == KIND_DEVICE && phys >= d.base && phys - d.base < 1 << d.bits
+    })?;
+    let d = info.untyped[i];
+    let mut at = WINDOWS[i].load(SeqCst);
+    if at == 0 {
+        let f = slot();
+        retype(Cap(SLOT_FIRST_UNTYPED + i as u64), ObjectType::Frame, d.bits, SPACE, f, 1).ok()?;
+        let size = 1u64 << d.bits;
+        let base = (region(2 * size) as u64 + size - 1) & !(size - 1);
+        map(ASPACE, Cap(f), base as usize, RW).ok()?;
+        at = base + 1;
+        WINDOWS[i].store(at, SeqCst);
+    }
+    Some(at - 1 + (phys - d.base))
+}
+
+/// Read physical memory through [`phys_window`], a byte at a time (it may
+/// be mapped as device memory, where wider accesses must be aligned).
+fn read_phys(at: u64, buf: &mut [u8]) -> bool {
+    for (i, b) in buf.iter_mut().enumerate() {
+        let Some(v) = phys_window(at + i as u64) else { return false };
+        // SAFETY: phys_window mapped this byte readable.
+        *b = unsafe { core::ptr::read_volatile(v as *const u8) };
+    }
+    true
+}
+
+/// A copy of the DSDT, for [`t_irq`] on machines without I/O ports.
+static mut DSDT: [u8; 1 << 17] = [0; 1 << 17];
 static ROOT_BUFFER: AtomicU64 = AtomicU64::new(0);
 
 /// Like `spawn`, on processor `cpu`.
@@ -1683,6 +1800,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         ENTROPY[i].store(u64::from_le_bytes(*w), SeqCst);
     }
     ENTROPY[4].store(info.entropy_sources, SeqCst);
+    INFO.store(info as *const RootInfo as u64, SeqCst);
     ROOT_BUFFER.store(info.ipc_buffer, SeqCst);
     let big = (0..info.untyped_count as usize).filter(|&i| info.untyped[i].kind == KIND_RAM).max_by_key(|&i| info.untyped[i].bits);
     let Some(big) = big else {
