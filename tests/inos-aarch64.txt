@@ -1,7 +1,6 @@
 # In-OS tests of the aarch64 kernel (roottest/src/main.rs), as for x86_64.
-# Not yet on aarch64 (B05): irq (no device here whose interrupt the test can
-# raise on demand) and the smp_* tests (the other processors are not
-# started: PSCI CPU_ON is not written).
+# Not yet on aarch64 (B08): irq (no device here whose interrupt the test can
+# raise on demand).
 syscall
 fault_page
 fault_instruction
@@ -19,3 +18,9 @@ caps
 inspect
 ipc_caps
 ipc_parked
+smp_run smp=8
+smp_ipc smp=2
+smp_shootdown smp=2
+smp_stress smp=8
+smp_revoke smp=8
+smp_timeouts smp=8

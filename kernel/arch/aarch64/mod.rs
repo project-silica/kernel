@@ -11,6 +11,7 @@
 
 mod cpu;
 mod gic;
+mod smp;
 
 use core::arch::{asm, global_asm};
 use core::cell::Cell;
@@ -20,7 +21,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cpu::{PerCpu, percpu};
 use kernel_core::ExitStatus;
 use kernel_core::Kernel;
-use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, Cmdline, PHYS_MAP_BASE, Region};
+use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, Cmdline, PHYS_MAP_BASE, Region, RegionTable};
 use kernel_core::hal::Hal;
 use kernel_core::lock::Presence;
 use kernel_core::mem::{Paddr, Phys};
@@ -351,6 +352,20 @@ static KERNEL: Global = Global(Kernel::new(
 /// The kernel.
 pub fn kernel() -> &'static Kernel<Arm> {
     &KERNEL.0
+}
+
+fn counter_frequency() -> u64 {
+    let f: u64;
+    // SAFETY: reading the counter frequency.
+    unsafe { asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) }
+    f
+}
+
+impl Arm {
+    /// The table TTBR0 holds when no user address space is loaded.
+    pub fn empty_root(&self) -> u64 {
+        self.empty_root.get()
+    }
 }
 
 fn counter() -> u64 {
@@ -709,7 +724,7 @@ extern "C" fn kmain(info: u64) -> ! {
     // SAFETY: once, on the boot processor, with interrupts masked; the
     // per-processor data is a static.
     unsafe { cpu::install(&BOOT_CPU) };
-    k.set_cpu_count(1);
+    smp::LOW_ROOT.store(ttbr0(), Ordering::Relaxed);
 
     // The interrupt controller.
     let Some(m) = madt(bi.rsdp) else {
@@ -727,6 +742,18 @@ extern "C" fn kmain(info: u64) -> ! {
     };
     gic::init_processor(0, gicr);
     BOOT_CPU.online.store(true, Ordering::Release);
+
+    // The other processors' memory comes from the region table before the
+    // root task is given the rest. `cpus=1` on the command line keeps them asleep.
+    // SAFETY: the boot processor's table, during boot.
+    let table = unsafe { &mut *REGIONS.0.get() };
+    table.fill(regions);
+    let cpus = match cmdline.get("cpus") {
+        Some(b"1") => 1,
+        _ => smp::prepare(bi.rsdp, table, (gicr_region, m.gicr.1)),
+    };
+    k.set_cpu_count(cpus);
+    let regions = table.as_slice();
 
     // Time: the generic timer's counter.
     let h = &k.hal;
@@ -761,27 +788,25 @@ extern "C" fn kmain(info: u64) -> ! {
         wall_clock: [bi.wall_secs, ((bi.wall_tsc.wrapping_sub(h.count0.get()) as i64 as i128 * 1_000_000_000) / freq as i128) as u64],
         entropy: bi.entropy,
         cmdline: cmdline.0,
-        cpus: 1,
+        cpus: cpus as u64,
     };
     if let Err(e) = k.boot_root(&spec) {
         let _ = write!(Out, "ERROR: kernel: cannot start the root task: {e:?}\r\n");
         die();
     }
+    smp::launch(cpus);
     // SAFETY: the vectors, the processor and the root thread are set up and
     // the kernel is entered; this is the first exit to user mode.
     unsafe { cpu::exit_to_user() }
 }
 
+struct RegionCell(UnsafeCell<RegionTable>);
+// SAFETY: used by the boot processor alone, during boot.
+unsafe impl Sync for RegionCell {}
+static REGIONS: RegionCell = RegionCell(UnsafeCell::new(RegionTable::new()));
+
 /// The boot processor's data.
-static BOOT_CPU: PerCpu = PerCpu {
-    regs: Cell::new(0),
-    kstack_top: AtomicU64::new(0),
-    index: 0,
-    mpidr: AtomicU64::new(0),
-    mode: Presence::new(),
-    online: AtomicBool::new(false),
-    deadline: Cell::new(u64::MAX),
-};
+static BOOT_CPU: PerCpu = PerCpu::new(0, 0, 0);
 
 /// The first-level table TTBR0 holds while no user address space is loaded.
 static EMPTY_ROOT: Table = Table(UnsafeCell::new([0; 512]));

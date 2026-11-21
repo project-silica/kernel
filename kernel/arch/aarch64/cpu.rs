@@ -39,6 +39,21 @@ pub struct PerCpu {
     pub deadline: Cell<u64>,
 }
 
+impl PerCpu {
+    /// Processor `index`'s data, before it starts.
+    pub const fn new(index: usize, kstack_top: u64, mpidr: u64) -> PerCpu {
+        PerCpu {
+            regs: Cell::new(0),
+            kstack_top: AtomicU64::new(kstack_top),
+            index,
+            mpidr: AtomicU64::new(mpidr),
+            mode: Presence::new(),
+            online: AtomicBool::new(false),
+            deadline: Cell::new(u64::MAX),
+        }
+    }
+}
+
 // SAFETY: a processor's `Cell`s are used only by that processor, or by
 // another holding its lock (kernel-core's protocol); the rest is atomic or
 // written once before the processor starts.

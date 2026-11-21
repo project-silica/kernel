@@ -11,11 +11,12 @@
 //! not up yet runs when it arrives.
 
 use super::cpu::{self, Tables, cpuid, rdtsc, wrmsr};
-use super::{PTE_ADDR, PTE_P, PTE_W, RegionTable};
+use super::{PTE_ADDR, PTE_P, PTE_W};
 use core::arch::global_asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::boot::BootInfo;
+use kernel_core::boot::RegionTable;
 use kernel_core::mem::Phys;
 use kernel_core::smp::MAX_CPUS;
 

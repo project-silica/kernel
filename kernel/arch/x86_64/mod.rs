@@ -18,7 +18,7 @@ use core::fmt::Write;
 use core::sync::atomic::Ordering;
 use cpu::percpu;
 use cpu::{cpuid, rdmsr, rdtsc, wrmsr};
-use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, Cmdline, PHYS_MAP_BASE, Region, RegionKind};
+use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, Cmdline, PHYS_MAP_BASE, Region, RegionTable};
 use kernel_core::hal::Hal;
 use kernel_core::mem::{Paddr, Phys};
 use kernel_core::root::RootSpec;
@@ -543,58 +543,10 @@ pub fn irq(vector: u64, locked: bool) {
     unsafe { wrmsr(MSR_X2APIC_EOI, 0) }
 }
 
-/// The copy of the loader's memory map the kernel takes its own memory from
-/// before handing the rest to the root task.
-pub struct RegionTable {
-    r: [Region; 1100],
-    n: usize,
-}
-
-impl RegionTable {
-    fn as_slice(&self) -> &[Region] {
-        &self.r[..self.n]
-    }
-
-    /// Take `len` bytes aligned to `align` from free memory inside
-    /// `[min, max)`, as high as possible, and mark them the kernel's.
-    pub fn carve(&mut self, len: u64, align: u64, min: u64, max: u64) -> Option<u64> {
-        for i in (0..self.n).rev() {
-            let r = self.r[i];
-            if r.kind != RegionKind::Usable as u32 {
-                continue;
-            }
-            let (lo, hi) = (r.base.max(min), (r.base + r.len).min(max));
-            if hi < lo + len {
-                continue;
-            }
-            let at = (hi - len) & !(align - 1);
-            if at < lo || self.n + 2 > self.r.len() {
-                continue;
-            }
-            // Replace region i by up to three: before, the carved part, after.
-            let parts =
-                [(r.base, at - r.base, r.kind), (at, len, RegionKind::Kernel as u32), (at + len, r.base + r.len - at - len, r.kind)];
-            let keep = parts.iter().filter(|p| p.1 != 0).count();
-            self.r.copy_within(i + 1..self.n, i + keep);
-            let mut j = i;
-            for (base, len, kind) in parts {
-                if len != 0 {
-                    self.r[j] = Region { base, len, kind, reserved: 0 };
-                    j += 1;
-                }
-            }
-            self.n = self.n + keep - 1;
-            return Some(at);
-        }
-        None
-    }
-}
-
 struct RegionCell(core::cell::UnsafeCell<RegionTable>);
 // SAFETY: used by the boot processor alone, during boot.
 unsafe impl Sync for RegionCell {}
-static REGIONS: RegionCell =
-    RegionCell(core::cell::UnsafeCell::new(RegionTable { r: [Region { base: 0, len: 0, kind: 0, reserved: 0 }; 1100], n: 0 }));
+static REGIONS: RegionCell = RegionCell(core::cell::UnsafeCell::new(RegionTable::new()));
 
 /// Drop every cached translation on this processor, global ones too.
 fn flush_all() {
@@ -1022,8 +974,7 @@ pub extern "C" fn kmain(info: u64) -> ! {
     let (table, cmdline, ramdisk) = unsafe {
         let table = &mut *REGIONS.0.get();
         let from = core::slice::from_raw_parts(k.phys.ptr(bi.regions).cast::<Region>(), bi.region_count as usize);
-        table.n = from.len().min(table.r.len() - 64);
-        table.r[..table.n].copy_from_slice(&from[..table.n]);
+        table.fill(from);
         (table, k.phys.bytes(bi.cmdline, bi.cmdline_len), k.phys.bytes(bi.ramdisk, bi.ramdisk_len))
     };
     // The other processors: memory for each, taken before the root task is

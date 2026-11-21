@@ -117,3 +117,68 @@ impl<'a> Cmdline<'a> {
         None
     }
 }
+
+/// The copy of the loader's memory map the kernel takes its own memory from
+/// before handing the rest to the root task.
+pub struct RegionTable {
+    r: [Region; 1100],
+    n: usize,
+}
+
+impl RegionTable {
+    /// An empty table.
+    pub const fn new() -> RegionTable {
+        RegionTable { r: [Region { base: 0, len: 0, kind: 0, reserved: 0 }; 1100], n: 0 }
+    }
+
+    /// Copy the loader's regions in, leaving room for the splits `carve` makes.
+    pub fn fill(&mut self, from: &[Region]) {
+        self.n = from.len().min(self.r.len() - 64);
+        self.r[..self.n].copy_from_slice(&from[..self.n]);
+    }
+
+    /// The regions.
+    pub fn as_slice(&self) -> &[Region] {
+        &self.r[..self.n]
+    }
+
+    /// Take `len` bytes aligned to `align` from free memory inside
+    /// `[min, max)`, as high as possible, and mark them the kernel's.
+    pub fn carve(&mut self, len: u64, align: u64, min: u64, max: u64) -> Option<u64> {
+        for i in (0..self.n).rev() {
+            let r = self.r[i];
+            if r.kind != RegionKind::Usable as u32 {
+                continue;
+            }
+            let (lo, hi) = (r.base.max(min), (r.base + r.len).min(max));
+            if hi < lo + len {
+                continue;
+            }
+            let at = (hi - len) & !(align - 1);
+            if at < lo || self.n + 2 > self.r.len() {
+                continue;
+            }
+            // Replace region i by up to three: before, the carved part, after.
+            let parts =
+                [(r.base, at - r.base, r.kind), (at, len, RegionKind::Kernel as u32), (at + len, r.base + r.len - at - len, r.kind)];
+            let keep = parts.iter().filter(|p| p.1 != 0).count();
+            self.r.copy_within(i + 1..self.n, i + keep);
+            let mut j = i;
+            for (base, len, kind) in parts {
+                if len != 0 {
+                    self.r[j] = Region { base, len, kind, reserved: 0 };
+                    j += 1;
+                }
+            }
+            self.n = self.n + keep - 1;
+            return Some(at);
+        }
+        None
+    }
+}
+
+impl Default for RegionTable {
+    fn default() -> RegionTable {
+        RegionTable::new()
+    }
+}
