@@ -101,7 +101,7 @@ pub fn run(data: &[u8]) {
                 continue;
             }
             244..=247 => {
-                m.k.hal.now.set(m.k.hal.now.get() + 3_000_000 * (op as u64 - 243));
+                m.k.hal.now.set(m.k.hal.now.get().saturating_add(3_000_000 * (op as u64 - 243)));
                 m.tick();
                 continue;
             }
