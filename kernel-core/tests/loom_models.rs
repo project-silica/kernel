@@ -402,9 +402,12 @@ fn work_queued_for_an_idling_processor_is_never_missed() {
 
 /// The same with a processor that watches before it halts: whoever queues
 /// work for it pokes its presence word, and interrupts it only when the
-/// poke comes too late. The watcher halts only if it stopped watching
-/// before any poke, and then the interrupt is on its way: the work is
-/// never missed, whichever of the two compare-and-swaps comes first.
+/// poke comes too late. The watch opens a window for interrupts on every
+/// turn, and an interrupt taken there is gone: it does not end a later
+/// halt. So the processor must never be seen as "idle, interrupt me"
+/// before it has stopped watching; it says "watching" while it still holds
+/// its lock. The watcher halts only if it stopped watching before any poke,
+/// and then the interrupt is still to come: the work is never missed.
 #[test]
 fn work_queued_for_a_watching_processor_is_never_missed() {
     loom::model(|| {
@@ -412,10 +415,17 @@ fn work_queued_for_a_watching_processor_is_never_missed() {
             lock: Lock,
             presence: Presence,
             queue: UnsafeCell<u32>,
+            /// An interrupt has been sent and not yet taken.
+            pending: AtomicBool,
             interrupt: loom::sync::Notify,
         }
-        let s =
-            Arc::new(S { lock: Lock::new(), presence: Presence::new(), queue: UnsafeCell::new(0), interrupt: loom::sync::Notify::new() });
+        let s = Arc::new(S {
+            lock: Lock::new(),
+            presence: Presence::new(),
+            queue: UnsafeCell::new(0),
+            pending: AtomicBool::new(false),
+            interrupt: loom::sync::Notify::new(),
+        });
         let idler = {
             let s = s.clone();
             thread::spawn(move || {
@@ -426,11 +436,13 @@ fn work_queued_for_a_watching_processor_is_never_missed() {
                     if ran > 0 {
                         break;
                     }
-                    s.presence.idle();
-                    s.lock.unlock();
                     s.presence.watch();
-                    // One look (a real watch takes many; the model needs
-                    // only the two ways it can end).
+                    s.lock.unlock();
+                    // One turn of the watch (a real one takes many; the
+                    // model needs only the ways it can end): the window, in
+                    // which a pending interrupt is taken and forgotten,
+                    // then a look at the word.
+                    s.pending.swap(false, Ordering::AcqRel);
                     if s.presence.watching() {
                         thread::yield_now();
                     }
@@ -438,7 +450,9 @@ fn work_queued_for_a_watching_processor_is_never_missed() {
                         // Halt until an interrupt (any interrupt: a halt
                         // may end for one that has nothing to do with
                         // this work, and the processor then watches again).
-                        s.interrupt.wait();
+                        while !s.pending.swap(false, Ordering::AcqRel) {
+                            s.interrupt.wait();
+                        }
                     }
                     s.presence.enter_kernel();
                     s.lock.lock();
@@ -450,6 +464,9 @@ fn work_queued_for_a_watching_processor_is_never_missed() {
         s.lock.lock();
         s.queue.with_mut(|q| unsafe { *q += 1 });
         if !s.presence.in_kernel() && !s.presence.poke() {
+            // (A swap, not a store: the model checker orders a plain store
+            // against the idler's swaps more loosely than any machine does.)
+            s.pending.swap(true, Ordering::AcqRel);
             s.interrupt.notify();
         }
         s.lock.unlock();

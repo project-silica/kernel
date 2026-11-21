@@ -153,8 +153,12 @@ impl Presence {
     pub fn idle(&self) {
         self.0.store(IDLE, Ordering::Release);
     }
-    /// The idle processor (which has let go of its lock) will look at this
-    /// word for a while before it halts.
+    /// The processor is about to idle (it still holds its lock, and lets go
+    /// of it next), and will look at this word for a while before it halts.
+    /// Stored under the lock, like "idle", and for the same reason: whoever
+    /// then takes the lock and has work for this processor sees it. It must
+    /// not be stored over "idle" later: a processor that saw "idle" has
+    /// sent an interrupt, and a watch takes interrupts without ending.
     pub fn watch(&self) {
         self.0.store(WATCH, Ordering::Release);
     }

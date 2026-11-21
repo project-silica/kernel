@@ -374,7 +374,14 @@ impl Hal for X86 {
     }
 
     fn idle_begin(&self) {
-        percpu().mode.idle();
+        // "Watching" is said here, under the lock, and never over "idle":
+        // a processor that sees "idle" interrupts this one, and an
+        // interrupt taken in the watch's window does not end a later halt.
+        if kernel_core::sched::IDLE_WATCH_NS != 0 {
+            percpu().mode.watch();
+        } else {
+            percpu().mode.idle();
+        }
     }
 
     fn idle(&self, until: u64) {
@@ -393,10 +400,11 @@ impl Hal for X86 {
         // (the sender's interrupt and this processor's halt), and on any
         // machine the wake from a sleep state. Each turn opens a window
         // for a pending interrupt, handled on this stack as in the halt
-        // below; one that was taken ends the watch (it may have made
-        // something runnable), as does a poke or the deadline.
+        // below. A poke ends the watch, as does the deadline, and a device
+        // interrupt (its handler leaves the word at "idle"). Any other
+        // interrupt taken here carries no news: nobody sends this processor
+        // one for work while it says "watching" (`idle_begin`).
         if kernel_core::sched::IDLE_WATCH_NS != 0 {
-            me.mode.watch();
             let end = self.now().saturating_add(kernel_core::sched::IDLE_WATCH_NS);
             loop {
                 // SAFETY: STI takes effect after the next instruction, so

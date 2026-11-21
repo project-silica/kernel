@@ -634,14 +634,20 @@ impl Hal for Arm {
     }
 
     fn idle_begin(&self) {
-        percpu().mode.idle();
+        // "Watching" is said here, under the lock, and never over "idle":
+        // a processor that sees "idle" interrupts this one, and an
+        // interrupt taken in the watch's window does not end a later halt.
+        if kernel_core::sched::IDLE_WATCH_NS != 0 {
+            percpu().mode.watch();
+        } else {
+            percpu().mode.idle();
+        }
     }
 
     fn idle(&self, until: u64) {
         // Watch for work first, as on x86 (`IDLE_WATCH_NS`).
         if kernel_core::sched::IDLE_WATCH_NS != 0 {
             let me = percpu();
-            me.mode.watch();
             let end = self.now().saturating_add(kernel_core::sched::IDLE_WATCH_NS);
             loop {
                 // SAFETY: a window for a pending interrupt, taken by
