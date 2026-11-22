@@ -58,6 +58,57 @@ const MIN_RUN: u64 = crate::tuned(option_env!("SILICA_TUNE_MIN_RUN"), 100_000);
 /// helps a partner slower than a ping; that is decided with a workload
 /// that has one.
 pub const IDLE_WATCH_NS: u64 = crate::tuned(option_env!("SILICA_TUNE_IDLE_WATCH"), 5_000);
+/// The longest an idle processor watches ([`Watch`]): what Linux's guest
+/// halt polling allows by default (`guest_halt_poll_ns`), so the two are
+/// given the same technique (`spec/TESTING.md` section 4.1).
+pub const IDLE_WATCH_MAX_NS: u64 = crate::tuned(option_env!("SILICA_TUNE_IDLE_WATCH_MAX"), 200_000);
+
+/// How long this processor watches for work before it halts, learned from
+/// what came of its halts: a halt ended by work within
+/// [`IDLE_WATCH_MAX_NS`] means watching that long would have caught it, so
+/// the watch grows to cover it next time; a halt that lasted longer means
+/// the work it waits for is not coming soon, and the watch shrinks back
+/// towards [`IDLE_WATCH_NS`]. A processor waiting on a device (a disk read
+/// takes some 20 us) or a slower partner then keeps watching through the
+/// wait instead of halting for it, and a processor with nothing to do
+/// returns to the short watch within a few long halts. A halt that a
+/// deadline ended teaches nothing: the watch already stops at a deadline.
+/// One per processor, used by the architecture's idle wait only.
+pub struct Watch(Cell<u64>);
+
+impl Watch {
+    ctor! {
+        /// The short watch.
+        pub fn new() -> Watch {
+            Watch(Cell::new(IDLE_WATCH_NS))
+        }
+    }
+
+    /// How long to watch now, in nanoseconds.
+    pub fn length(&self) -> u64 {
+        self.0.get()
+    }
+
+    /// A halt that followed the watch was ended by work (an interrupt, a
+    /// poke turned interrupt) after `slept` nanoseconds.
+    pub fn woken_after(&self, slept: u64) {
+        let now = self.0.get();
+        self.0.set(if slept <= IDLE_WATCH_MAX_NS {
+            // Enough to have caught it, with a quarter to spare, and at
+            // least double: a wait that varies is covered in a step or two.
+            now.saturating_mul(2).max(slept + slept / 4).min(IDLE_WATCH_MAX_NS)
+        } else {
+            (now / 2).max(IDLE_WATCH_NS)
+        });
+    }
+}
+
+impl Default for Watch {
+    fn default() -> Watch {
+        Watch::new()
+    }
+}
+
 /// The share of a processor deadline reservations may take, in parts of 2^20.
 pub(crate) const DEADLINE_CAP: u64 = ((1 << 20) * 9u64).div_ceil(10);
 /// The shortest deadline period.

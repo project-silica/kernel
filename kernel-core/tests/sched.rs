@@ -209,3 +209,28 @@ fn a_thread_waking_beside_busy_ones_runs_at_once() {
     }
     assert!(worst <= MS / 10, "a waking thread ran {worst} ns after its deadline beside two busy ones");
 }
+
+/// The idle watch grows to cover halts that work ended soon, and shrinks
+/// back after halts that lasted.
+#[test]
+fn the_idle_watch_learns_how_long_to_watch() {
+    use kernel_core::sched::{IDLE_WATCH_MAX_NS, IDLE_WATCH_NS, Watch};
+    let w = Watch::new();
+    assert_eq!(w.length(), IDLE_WATCH_NS);
+    // A disk read every 20 us: one halt, and the watch covers the next.
+    w.woken_after(20_000);
+    assert_eq!(w.length(), 25_000);
+    // Never beyond the most a watch may cost.
+    for _ in 0..20 {
+        w.woken_after(IDLE_WATCH_MAX_NS);
+    }
+    assert_eq!(w.length(), IDLE_WATCH_MAX_NS);
+    // Long halts: back to the short watch within a handful.
+    for _ in 0..8 {
+        w.woken_after(10_000_000);
+    }
+    assert_eq!(w.length(), IDLE_WATCH_NS);
+    // Short wake-ups double it from there.
+    w.woken_after(1_000);
+    assert_eq!(w.length(), 2 * IDLE_WATCH_NS);
+}

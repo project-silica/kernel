@@ -41,6 +41,8 @@ pub struct PerCpu {
     /// next identifier to hand out in it (see `Arm::ttbr0_for`).
     pub asid_gen: Cell<u64>,
     pub asid_next: Cell<u64>,
+    /// How long this processor watches for work before it halts.
+    pub watch: kernel_core::sched::Watch,
 }
 
 impl PerCpu {
@@ -56,6 +58,7 @@ impl PerCpu {
             deadline: Cell::new(u64::MAX),
             asid_gen: Cell::new(1),
             asid_next: Cell::new(1),
+            watch: kernel_core::sched::Watch::new(),
         }
     }
 }

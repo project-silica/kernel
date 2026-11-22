@@ -443,7 +443,7 @@ impl Hal for X86 {
         // interrupt taken here carries no news: nobody sends this processor
         // one for work while it says "watching" (`idle_begin`).
         if kernel_core::sched::IDLE_WATCH_NS != 0 {
-            let end = self.now().saturating_add(kernel_core::sched::IDLE_WATCH_NS);
+            let end = self.now().saturating_add(me.watch.length());
             loop {
                 // SAFETY: STI takes effect after the next instruction, so
                 // the window is the NOP; the handler returns here.
@@ -470,13 +470,19 @@ impl Hal for X86 {
         let early = me.wake_ns.get();
         let armed = if until == u64::MAX { u64::MAX } else { until.saturating_sub(early).max(1) };
         self.set_timer(armed);
+        let halted = self.now();
         // SAFETY: STI takes effect after the next instruction, so no
         // interrupt can arrive between the decision to wait and HLT (one
         // that is already pending ends the HLT at once). The handler runs
         // on this stack and returns here.
         unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) }
+        // Work, not the deadline, ended the halt: the watch learns how long
+        // it would have had to be (`Watch`).
+        let now = self.now();
+        if now < armed && kernel_core::sched::IDLE_WATCH_NS != 0 {
+            me.watch.woken_after(now - halted);
+        }
         if until != u64::MAX {
-            let now = self.now();
             if now >= armed {
                 let late = (now - armed).min(WAKE_ADVANCE_MAX_NS);
                 me.wake_ns.set((early * 7 + late) / 8);

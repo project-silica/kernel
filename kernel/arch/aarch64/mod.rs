@@ -648,7 +648,7 @@ impl Hal for Arm {
         // Watch for work first, as on x86 (`IDLE_WATCH_NS`).
         if kernel_core::sched::IDLE_WATCH_NS != 0 {
             let me = percpu();
-            let end = self.now().saturating_add(kernel_core::sched::IDLE_WATCH_NS);
+            let end = self.now().saturating_add(me.watch.length());
             loop {
                 // SAFETY: a window for a pending interrupt, taken by
                 // `kernel_irq` as in the wait below; masking is restored.
@@ -672,11 +672,17 @@ impl Hal for Arm {
             }
         }
         self.set_timer(until);
+        let halted = self.now();
         // WFI wakes for a pending interrupt even while interrupts are
         // masked, so none is lost between the decision to wait and the
         // wait; it is then taken, briefly unmasked, by `kernel_irq`.
         // SAFETY: masking state is restored before returning.
         unsafe { asm!("dsb sy", "wfi", "msr daifclr, #2", "isb", "msr daifset, #2", options(nomem, nostack)) }
+        // Work, not the deadline, ended the halt: the watch learns from it.
+        let now = self.now();
+        if now < until && kernel_core::sched::IDLE_WATCH_NS != 0 {
+            percpu().watch.woken_after(now - halted);
+        }
         percpu().mode.enter_kernel();
     }
 

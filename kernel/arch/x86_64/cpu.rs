@@ -59,6 +59,8 @@ pub struct PerCpu {
     /// How long this processor takes to come out of an idle wait once its
     /// timer fires, in nanoseconds (a running average; see `X86::idle`).
     pub wake_ns: Cell<u64>,
+    /// How long this processor watches for work before it halts.
+    pub watch: kernel_core::sched::Watch,
 }
 const _: () = assert!(core::mem::offset_of!(PerCpu, index) == 40 && core::mem::offset_of!(PerCpu, lock) < 64);
 
@@ -115,6 +117,7 @@ impl Tables {
                 pcid_gen: Cell::new(0),
                 pcid_next: Cell::new(1),
                 wake_ns: Cell::new(0),
+                watch: kernel_core::sched::Watch::new(),
                 slot: 0,
                 lock: 0,
             },
