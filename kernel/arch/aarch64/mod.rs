@@ -689,17 +689,16 @@ impl Hal for Arm {
         if until != u64::MAX && self.count_at(until) < percpu().deadline.get() {
             self.set_timer(until);
         }
-        let was_armed = percpu().deadline.get() != u64::MAX;
         let halted = self.now();
         // WFI wakes for a pending interrupt even while interrupts are
         // masked, so none is lost between the decision to wait and the
         // wait; it is then taken, briefly unmasked, by `kernel_irq`.
         // SAFETY: masking state is restored before returning.
         unsafe { asm!("dsb sy", "wfi", "msr daifclr, #2", "isb", "msr daifset, #2", options(nomem, nostack)) }
-        // Work, not a timer, ended the halt: the watch learns from it.
+        // Woken before the deadline: work (or a timer armed sooner) ended the
+        // halt, and the watch learns from it.
         let now = self.now();
-        let fired = was_armed && percpu().deadline.get() == u64::MAX;
-        if !fired && kernel_core::sched::IDLE_WATCH_NS != 0 {
+        if now < until && kernel_core::sched::IDLE_WATCH_NS != 0 {
             percpu().watch.woken_after(now - halted);
         }
         percpu().mode.enter_kernel();

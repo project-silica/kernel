@@ -472,7 +472,6 @@ impl Hal for X86 {
         if self.tsc_at(armed) < me.deadline.get() {
             self.set_timer(armed);
         }
-        let was_armed = me.deadline.get() != u64::MAX;
         let halted = self.now();
         // SAFETY: STI takes effect after the next instruction, so no
         // interrupt can arrive between the decision to wait and HLT (one
@@ -481,15 +480,16 @@ impl Hal for X86 {
         unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) }
         // Work, not the deadline, ended the halt: the watch learns how long
         // it would have had to be (`Watch`).
+        // Woken before the armed time: work ended the halt (or a timer left
+        // from before, armed sooner, fired), and the watch learns from it.
+        // At or after it: the timer, late by the wake-up latency, which the
+        // next wait arms ahead by. (Asking whether the timer "fired" instead
+        // of comparing times got timer wakes wrong and cost 9 us a deadline.)
         let now = self.now();
-        let fired = was_armed && me.deadline.get() == u64::MAX;
-        if !fired {
-            if kernel_core::sched::IDLE_WATCH_NS != 0 {
-                me.watch.woken_after(now - halted);
-            }
-        } else if until != u64::MAX && now >= armed {
-            // The timer armed for `until` (not one left from before, which
-            // fires sooner and teaches nothing).
+        if now < armed && kernel_core::sched::IDLE_WATCH_NS != 0 {
+            me.watch.woken_after(now - halted);
+        }
+        if until != u64::MAX && now >= armed {
             let late = (now - armed).min(WAKE_ADVANCE_MAX_NS);
             me.wake_ns.set((early * 7 + late) / 8);
             while self.now() < until {
