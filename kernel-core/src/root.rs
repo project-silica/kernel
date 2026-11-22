@@ -146,7 +146,7 @@ impl<H: Hal> Kernel<H> {
                 // maps as memory, not as a device.
                 let flags = match kind {
                     KIND_RAM => 0,
-                    KIND_RAMDISK => FLAG_KEPT,
+                    KIND_RAMDISK | KIND_FIRMWARE => FLAG_KEPT,
                     _ => FLAG_DEVICE | FLAG_KEPT,
                 };
                 let cap = Cap { ty: ObjectType::Untyped, rights: Rights::ALL, bits, flags, obj: a, badge: 0 };
@@ -188,6 +188,8 @@ impl<H: Hal> Kernel<H> {
                 emit(a, b, KIND_RAMDISK);
             } else if r.kind == RegionKind::Firmware as u32 {
                 device(a, b, &mut emit);
+            } else if r.kind == RegionKind::FirmwareMemory as u32 {
+                emit(a, b, KIND_FIRMWARE);
             }
         }
         if spec.device_top > cursor {

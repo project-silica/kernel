@@ -234,7 +234,10 @@ fn kind_of(ty: u32) -> RegionKind {
         efi::MEM_LOADER_DATA => RegionKind::Loader,
         efi::MEM_SILICA_KERNEL => RegionKind::Kernel,
         efi::MEM_SILICA_RAMDISK => RegionKind::Ramdisk,
-        _ => RegionKind::Firmware,
+        efi::MEM_MMIO | efi::MEM_MMIO_PORT | efi::MEM_RESERVED => RegionKind::Firmware,
+        // ACPI tables and NVS, runtime services, persistent memory and the
+        // like: memory, the firmware's.
+        _ => RegionKind::FirmwareMemory,
     }
 }
 
@@ -339,7 +342,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     for i in 0..size / dsize {
         // SAFETY: the firmware wrote `size` bytes of descriptors of `dsize` bytes each.
         let d = unsafe { &*((map as usize + i * dsize) as *const efi::MemoryDescriptor) };
-        if kind_of(d.ty) != RegionKind::Firmware {
+        if !matches!(kind_of(d.ty), RegionKind::Firmware | RegionKind::FirmwareMemory) {
             top = top.max(d.phys + d.pages * PAGE);
         }
     }

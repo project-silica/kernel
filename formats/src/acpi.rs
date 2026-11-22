@@ -224,6 +224,17 @@ pub struct Power {
     /// The reset register, when the firmware offers one in I/O space: its
     /// port and the value to write.
     pub reset: Option<(u16, u8)>,
+    /// I/O ports of the PM1a and PM1b event blocks (0: none), and the
+    /// length of each: a status register, then an enable register, each
+    /// half of it. The fixed power button is bit 8 of both.
+    pub pm1_event: [u16; 2],
+    /// See `pm1_event`.
+    pub pm1_event_len: u8,
+    /// The general-purpose event block 0 (port, length: status registers,
+    /// then as many enable registers).
+    pub gpe0: (u16, u8),
+    /// The interrupt the ACPI events arrive on (a global system interrupt).
+    pub sci: u16,
 }
 
 /// The power registers of a FADT (the whole table).
@@ -238,6 +249,10 @@ pub fn power(fadt: &[u8]) -> Option<Power> {
         smi_command: port(48).unwrap_or(0),
         acpi_enable: *fadt.get(52)?,
         reset: None,
+        pm1_event: [port(56).unwrap_or(0), port(60).unwrap_or(0)],
+        pm1_event_len: *fadt.get(88)?,
+        gpe0: (port(80).unwrap_or(0), *fadt.get(92)?),
+        sci: u16::from_le_bytes(fadt.get(46..48)?.try_into().ok()?),
     };
     // ACPI 2.0 and later: the extended address of PM1a's control block, a
     // generic address in I/O space, when the 32-bit one is not given.
@@ -344,12 +359,29 @@ mod tests {
         f[48..52].copy_from_slice(&0xB2u32.to_le_bytes());
         f[52] = 0xF1;
         f[64..68].copy_from_slice(&0x604u32.to_le_bytes());
+        f[56..60].copy_from_slice(&0x600u32.to_le_bytes());
+        f[88] = 4;
+        f[80..84].copy_from_slice(&0x620u32.to_le_bytes());
+        f[92] = 16;
+        f[46..48].copy_from_slice(&9u16.to_le_bytes());
         f[112..116].copy_from_slice(&(1u32 << 10).to_le_bytes());
         f[116] = 1;
         f[120..128].copy_from_slice(&0xCF9u64.to_le_bytes());
         f[128] = 6;
         let p = power(&f).unwrap();
-        assert_eq!(p, Power { pm1_control: [0x604, 0], smi_command: 0xB2, acpi_enable: 0xF1, reset: Some((0xCF9, 6)) });
+        assert_eq!(
+            p,
+            Power {
+                pm1_control: [0x604, 0],
+                smi_command: 0xB2,
+                acpi_enable: 0xF1,
+                reset: Some((0xCF9, 6)),
+                pm1_event: [0x600, 0],
+                pm1_event_len: 4,
+                gpe0: (0x620, 16),
+                sci: 9,
+            }
+        );
         // No reset register offered: none used, whatever the address says.
         f[112..116].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(power(&f).unwrap().reset, None);

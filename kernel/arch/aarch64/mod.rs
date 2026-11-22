@@ -11,6 +11,7 @@
 
 mod cpu;
 mod gic;
+mod its;
 mod smp;
 
 use core::arch::{asm, global_asm};
@@ -240,11 +241,13 @@ fn spcr_uart(rsdp: u64) -> Option<u64> {
 struct Madt {
     gicd: u64,
     gicr: (u64, u64),
+    /// The first ITS's registers (0: none).
+    its: u64,
 }
 
 fn madt(rsdp: u64) -> Option<Madt> {
     let (t, len) = acpi_table(rsdp, b"APIC")?;
-    let mut m = Madt { gicd: 0, gicr: (0, 0) };
+    let mut m = Madt { gicd: 0, gicr: (0, 0), its: 0 };
     let me = gic::my_affinity();
     let mut at = t + 44;
     while at + 2 <= t + len {
@@ -254,6 +257,7 @@ fn madt(rsdp: u64) -> Option<Madt> {
         }
         match kind {
             0x0C if n >= 24 => m.gicd = acpi64(at + 8),
+            0x0F if n >= 20 && m.its == 0 => m.its = acpi64(at + 8),
             0x0E if n >= 16 => m.gicr = (acpi64(at + 4), acpi32(at + 12) as u64),
             // A GICC entry with its own redistributor, used when there is
             // no redistributor region.
@@ -736,6 +740,14 @@ impl Hal for Arm {
         write_bytes(bytes);
     }
 
+    fn msi_first(&self) -> usize {
+        if its::ready() { its::FIRST_LINE } else { usize::MAX }
+    }
+
+    fn msi_route(&self, line: usize, cpu: usize, source: u64) -> Option<(u64, u64)> {
+        its::route(line, cpu, source)
+    }
+
     fn power_off(&self, status: u64) {
         let code = if status == 0 { ExitStatus::Success } else { ExitStatus::Failure };
         if HARNESS.load(Ordering::Relaxed) {
@@ -800,7 +812,9 @@ fn irq(locked: bool) {
     let k = kernel();
     loop {
         let id = gic::acknowledge();
-        if id >= gic::SPECIAL {
+        // 1020 to 1023 say there is nothing (more) to take; LPIs, from
+        // 8192, are interrupts like any other and must be ended.
+        if (gic::SPECIAL..gic::SPECIAL + 4).contains(&id) {
             return;
         }
         match id {
@@ -816,7 +830,8 @@ fn irq(locked: bool) {
             }
             gic::SGI_KICK => gic::end(id),
             id if id >= gic::SPI_BASE => {
-                let line = (id - gic::SPI_BASE) as usize;
+                // An LPI is a message line; anything else a wire.
+                let line = its::line_of(id).unwrap_or((id - gic::SPI_BASE) as usize);
                 // A level-triggered line stays asserted until its driver has
                 // dealt with the device: hold it off until the driver says so.
                 if gic::is_level(line) {
@@ -928,6 +943,14 @@ extern "C" fn kmain(info: u64) -> ! {
         _ => smp::prepare(bi.rsdp, table, (gicr_region, m.gicr.1)),
     };
     k.set_cpu_count(cpus);
+    // Message-signalled interrupts, through the ITS when there is one.
+    smp::GICR_PHYS_BASE.store(m.gicr.0, Ordering::Relaxed);
+    let its_ok =
+        m.its != 0 && map_device_range(m.its, 0x2_0000).is_some_and(|its| its::init(its, m.its, cpus, table, |p| PHYS_MAP_BASE + p));
+    if m.its != 0 && !its_ok {
+        let _ = write!(Out, "kernel: the GIC's ITS cannot be used; devices have no message interrupts\r\n");
+    }
+    its::enable_processor(0, gicr, m.gicr.0 + (gicr - gicr_region));
     let regions = table.as_slice();
 
     // Time: the generic timer's counter.
@@ -946,9 +969,16 @@ extern "C" fn kmain(info: u64) -> ! {
         let _ = write!(Out, "ERROR: kernel: no root task: the ramdisk is missing, malformed, or has no entry named \"root\"\r\n");
         die();
     };
-    let top = regions.last().map_or(0, |r| r.base + r.len).max(4 << 30);
+    // Device memory is handed out as far as the processor's physical
+    // addresses go: firmware puts 64-bit device registers above all memory
+    // (QEMU's virt machine at 512 GiB).
+    let parange: u64;
+    // SAFETY: reading an ID register.
+    unsafe { asm!("mrs {}, id_aa64mmfr0_el1", out(reg) parange, options(nomem, nostack, preserves_flags)) }
+    let width = [32u32, 36, 40, 42, 44, 48, 52].get((parange & 0xF) as usize).copied().unwrap_or(48).min(48);
+    let top = regions.last().map_or(0, |r| r.base + r.len).max(1 << width);
     let uart = spcr_uart(bi.rsdp).unwrap_or(0) & !0xFFF;
-    let reserved = [(m.gicd, m.gicd + 0x1_0000), (m.gicr.0, m.gicr.0 + m.gicr.1), (uart, uart + 0x1000)];
+    let reserved = [(m.gicd, m.gicd + 0x1_0000), (m.gicr.0, m.gicr.0 + m.gicr.1), (uart, uart + 0x1000), (m.its, m.its + 0x2_0000)];
     let spec = RootSpec {
         regions,
         elf: image,

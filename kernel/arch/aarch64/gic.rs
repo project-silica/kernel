@@ -1,8 +1,9 @@
 //! The GICv3 interrupt controller.
 //!
 //! Interrupt identifiers: SGI 0 is the kick between processors, PPI 27 the
-//! EL1 virtual timer, and device line `n` (a Hw interrupt-line capability's
-//! number) is SPI `32 + n`. Everything is Group 1, non-secure, one priority.
+//! EL1 virtual timer, device line `n` below `its::FIRST_LINE` (a Hw
+//! interrupt-line capability's number) is SPI `32 + n`, and the lines from
+//! there up are message lines, LPIs (`its.rs`). Everything is Group 1, non-secure, one priority.
 //! The distributor and each processor's redistributor are found through the
 //! ACPI MADT; the CPU interface is reached through system registers.
 //!
@@ -21,7 +22,8 @@ pub const SGI_KICK: u32 = 0;
 pub const PPI_TIMER: u32 = 27;
 /// The first SPI: device line 0.
 pub const SPI_BASE: u32 = 32;
-/// Identifiers from here on are not interrupts (spurious, special).
+/// Identifiers 1020 to 1023 are not interrupts (spurious, special); those
+/// from 8192 on are LPIs (`its.rs`).
 pub const SPECIAL: u32 = 1020;
 
 const PRIORITY: u8 = 0x80;
@@ -162,7 +164,7 @@ fn affinity_for_typer(mpidr: u64) -> u64 {
     (mpidr >> 32 & 0xFF) << 24 | (mpidr & 0xFF_FFFF)
 }
 
-/// Take the highest-priority pending interrupt (`SPECIAL` and up: none).
+/// Take the highest-priority pending interrupt (`SPECIAL` to `SPECIAL + 3`: none).
 pub fn acknowledge() -> u32 {
     let id: u64;
     // SAFETY: reading the acknowledge register is how an interrupt is taken.
@@ -189,9 +191,10 @@ pub fn kick(mpidr: u64) {
     unsafe { asm!("dsb ishst", "msr icc_sgi1r_el1, {}", "isb", in(reg) v, options(nostack, preserves_flags)) }
 }
 
-/// Whether device line `line` exists.
+/// Whether device line `line` is a wire that exists (the message lines,
+/// from `its::FIRST_LINE`, are the ITS's).
 pub fn has_line(line: usize) -> bool {
-    line < IRQ_LINES as usize && (line as u64) < SPIS.load(Ordering::Relaxed)
+    line < super::its::FIRST_LINE.min(IRQ_LINES as usize) && (line as u64) < SPIS.load(Ordering::Relaxed)
 }
 
 /// Route device line `line` to the processor with affinity `mpidr`, with
@@ -217,6 +220,9 @@ pub fn route(line: usize, mpidr: u64, level: bool) -> bool {
 
 /// Disable or enable device line `line`.
 pub fn mask(line: usize, masked: bool) {
+    if line >= super::its::FIRST_LINE {
+        return super::its::mask(line, masked);
+    }
     let gicd = GICD.load(Ordering::Relaxed);
     if gicd == 0 || !has_line(line) {
         return;
@@ -236,5 +242,5 @@ pub fn pending() -> bool {
     let v: u64;
     // SAFETY: reading the highest pending interrupt changes nothing.
     unsafe { asm!("mrs {}, icc_hppir1_el1", out(reg) v, options(nomem, nostack, preserves_flags)) }
-    (v as u32 & 0xFF_FFFF) < SPECIAL
+    !(SPECIAL..SPECIAL + 4).contains(&(v as u32 & 0xFF_FFFF))
 }

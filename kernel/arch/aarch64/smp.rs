@@ -279,6 +279,8 @@ pub fn launch(cpus: usize, panic_secondary: bool) {
 
 static PANIC_SECONDARY: AtomicBool = AtomicBool::new(false);
 static GICR_REGION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// The redistributor region's physical address.
+pub static GICR_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn ap_main(index: usize) -> ! {
     // SAFETY: the page was filled for this processor before it was started.
@@ -293,7 +295,10 @@ extern "C" fn ap_main(index: usize) -> ! {
     super::reset_ttbr0(kernel().hal.empty_root());
     let region = (GICR_REGION[0].load(Ordering::Relaxed), GICR_REGION[1].load(Ordering::Relaxed));
     match gic::find_redistributor(region.0, region.1, gic::my_affinity()) {
-        Some(r) => gic::init_processor(index, r),
+        Some(r) => {
+            gic::init_processor(index, r);
+            super::its::enable_processor(index, r, GICR_PHYS_BASE.load(Ordering::Relaxed) + (r - region.0));
+        }
         None => {
             let _ = core::fmt::Write::write_str(&mut super::Out, "kernel: no GIC redistributor for a processor; it stops\r\n");
             loop {

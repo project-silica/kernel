@@ -64,6 +64,11 @@ pub const KIND_RAM: u8 = 0;
 /// Device or firmware memory: not zeroed, only retyped into frames or
 /// smaller untyped.
 pub const KIND_DEVICE: u8 = 1;
+/// Ordinary memory the firmware keeps data in (ACPI tables, runtime
+/// services): never zeroed, only frames and smaller untyped, mapped as
+/// ordinary memory. Its contents are the firmware's; reading the tables
+/// is what it is for.
+pub const KIND_FIRMWARE: u8 = 3;
 /// Ordinary memory holding the ramdisk archive: like device memory it is
 /// never zeroed and becomes only frames and smaller untyped, but those map
 /// as ordinary memory.

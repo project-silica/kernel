@@ -597,23 +597,21 @@ impl Hal for X86 {
         harness_exit(status);
         let Some(p) = power() else { return };
         let ([a, b], (ta, tb)) = (p.registers.pm1_control, p.s5);
-        // SAFETY: the ports the firmware's FADT names for this; nothing the
-        // kernel holds depends on the machine staying on.
-        unsafe {
-            if a == 0 {
-                return;
-            }
-            acpi_mode(&p.registers);
-            // SLP_TYP in bits 10 to 12, SLP_EN bit 13.
-            let off = |port: u16, typ: u8| {
-                let v = serial::inw(port);
-                serial::outw(port, (v & !(7 << 10)) | (typ as u16 & 7) << 10 | 1 << 13);
-            };
-            if b != 0 {
-                off(b, tb);
-            }
-            off(a, ta);
+        // The ports the firmware's FADT names for this; nothing the kernel
+        // holds depends on the machine staying on.
+        if a == 0 {
+            return;
         }
+        acpi_mode(&p.registers);
+        // SLP_TYP in bits 10 to 12, SLP_EN bit 13.
+        let off = |port: u16, typ: u8| {
+            let v = serial::inw(port);
+            serial::outw(port, (v & !(7 << 10)) | (typ as u16 & 7) << 10 | 1 << 13);
+        };
+        if b != 0 {
+            off(b, tb);
+        }
+        off(a, ta);
         // The machine takes a moment to go.
         let t = rdtsc();
         while rdtsc() - t < self.tsc_hz.get() {
@@ -687,22 +685,17 @@ fn init_power(bi: &BootInfo, phys: &Phys) {
     unsafe { *POWER.0.get() = Some(Power { registers, s5: s5.unwrap_or((0, 0)) }) };
 }
 
-/// Put the machine in ACPI mode if the firmware left it in legacy mode.
-///
-/// # Safety
-/// Port I/O to the registers the FADT names.
-unsafe fn acpi_mode(r: &kernel_core::acpi::Power) {
+/// Put the machine in ACPI mode if the firmware left it in legacy mode
+/// (port I/O to the registers the FADT names).
+fn acpi_mode(r: &kernel_core::acpi::Power) {
     // SCI_EN is bit 0 of PM1a's control register.
-    // SAFETY: the caller's.
-    unsafe {
-        if serial::inw(r.pm1_control[0]) & 1 == 0 && r.smi_command != 0 && r.acpi_enable != 0 {
-            serial::outb(r.smi_command, r.acpi_enable);
-            for _ in 0..1_000_000 {
-                if serial::inw(r.pm1_control[0]) & 1 != 0 {
-                    break;
-                }
-                core::hint::spin_loop();
+    if serial::inw(r.pm1_control[0]) & 1 == 0 && r.smi_command != 0 && r.acpi_enable != 0 {
+        serial::outb(r.smi_command, r.acpi_enable);
+        for _ in 0..1_000_000 {
+            if serial::inw(r.pm1_control[0]) & 1 != 0 {
+                break;
             }
+            core::hint::spin_loop();
         }
     }
 }

@@ -907,7 +907,7 @@ fn phys_window(phys: u64) -> Option<u64> {
     let info = unsafe { &*(INFO.load(SeqCst) as *const RootInfo) };
     let i = (0..info.untyped_count as usize).find(|&i| {
         let d = info.untyped[i];
-        d.kind == KIND_DEVICE && phys >= d.base && phys - d.base < 1 << d.bits
+        (d.kind == KIND_DEVICE || d.kind == KIND_FIRMWARE) && phys >= d.base && phys - d.base < 1 << d.bits
     })?;
     let d = info.untyped[i];
     let mut at = WINDOWS[i].load(SeqCst);

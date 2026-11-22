@@ -24,9 +24,15 @@ pub enum RegionKind {
     /// Loader data that is free once the kernel has read it (this structure,
     /// the region table, the command line).
     Loader = 4,
-    /// Firmware memory that must stay untouched (ACPI tables, runtime
-    /// services, reserved ranges). Handed to userspace as device memory.
+    /// Firmware ranges that must stay untouched and may not be memory at
+    /// all (memory-mapped I/O, reserved ranges). Handed to userspace as
+    /// device memory.
     Firmware = 5,
+    /// Firmware data in RAM that must stay untouched (ACPI tables, runtime
+    /// services). Handed to userspace as kept memory that maps as ordinary
+    /// memory: tables are read with ordinary loads, unaligned ones too
+    /// (on Arm a device mapping faults on those).
+    FirmwareMemory = 6,
 }
 
 /// One physical memory region. Regions do not overlap and are sorted by base.
