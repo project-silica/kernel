@@ -24,14 +24,12 @@ then `kernel-core/src/cap.rs` (slots and the derivation list), `untyped.rs`,
 `thread.rs`, `ipc.rs`, `vm.rs`, `kernel.rs` (the dispatcher) and `root.rs`.
 `kernel/arch/x86_64/cpu.rs` holds every way into and out of the kernel.
 
-## Testing
+## Tests
 
-From the workshop root:
-
-    ./tools/test.sh --fast            # host tests, builds, one boot, size gates
-    ./tools/test.sh --full            # adds every in-OS test, the boot matrix, Miri
-    ./tools/boot.sh --test ipc        # one in-OS test, serial on standard output
-    ./tools/fuzz.sh --repo kernel     # the syscall and ELF fuzzers
+Which test checks which kind of change, and when a tier is the right one, is
+in the workshop's `spec/TESTING.md` section 2. After a change to one in-OS
+path, `./tools/boot.sh --test <name>` from the workshop root runs that test
+alone with its serial output on standard output.
 
 `kernel-core/tests/objects.rs` are scenario tests through the syscall
 interface on a host machine (`tests/support`). `tests/model.rs` compares the
