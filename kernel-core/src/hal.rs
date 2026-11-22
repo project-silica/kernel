@@ -166,4 +166,9 @@ pub trait Hal {
     /// Turn the machine off, telling a test harness `status` (0: success).
     /// Returns only where that is not possible.
     fn power_off(&self, status: u64);
+    /// Reset the machine (a test harness is told `status`, as for
+    /// `power_off`). Returns only where that is not possible.
+    fn reset(&self, status: u64) {
+        let _ = status;
+    }
 }

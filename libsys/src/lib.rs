@@ -330,6 +330,15 @@ pub fn power_off(power: Cap, status: u64) -> Error {
     }
 }
 
+/// Reset the machine (a test harness is told `status`). Returns only on
+/// failure, with why.
+pub fn reboot(power: Cap, status: u64) -> Error {
+    match sys(Syscall::PowerOff, [power.0, status, 1, 0, 0, 0]) {
+        Ok(_) => Error::Unsupported,
+        Err(e) => e,
+    }
+}
+
 /// Write `width` bytes (1, 2 or 4) to an I/O port covered by `ports`.
 pub fn port_out(ports: Cap, port: u16, width: u8, value: u32) -> Result<()> {
     sys(Syscall::PortIo, [ports.0, port as u64, width as u64 | 0x100, value as u64, 0, 0]).map(|_| ())

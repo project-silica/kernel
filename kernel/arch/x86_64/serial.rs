@@ -19,6 +19,20 @@ pub fn inb(port: u16) -> u8 {
     v
 }
 
+/// Read a 16-bit word from an I/O port.
+pub fn inw(port: u16) -> u16 {
+    let v: u16;
+    // SAFETY: as for `outb`.
+    unsafe { asm!("in ax, dx", in("dx") port, out("ax") v, options(nomem, nostack, preserves_flags)) }
+    v
+}
+
+/// Write a 16-bit word to an I/O port.
+pub fn outw(port: u16, v: u16) {
+    // SAFETY: as for `outb`.
+    unsafe { asm!("out dx, ax", in("dx") port, in("ax") v, options(nomem, nostack, preserves_flags)) }
+}
+
 /// 115200 baud, 8 data bits, no parity, one stop bit, FIFOs on, no interrupts.
 pub fn init() {
     outb(COM1 + 1, 0x00);

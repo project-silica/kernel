@@ -125,6 +125,13 @@ pub fn system_off() {
     }
 }
 
+/// PSCI SYSTEM_RESET; returns only if the firmware has no PSCI.
+pub fn system_reset() {
+    if PSCI.load(Ordering::Relaxed) {
+        psci(0x8400_0009, 0, 0, 0);
+    }
+}
+
 fn psci(f: u64, a: u64, b: u64, c: u64) -> i64 {
     let r: u64;
     // SAFETY: a PSCI call to the firmware; CPU_ON does not touch this

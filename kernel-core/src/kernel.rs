@@ -742,7 +742,11 @@ impl<H: Hal> Kernel<H> {
                 if cap.flags & FLAG_POWER == 0 {
                     return Err(Error::WrongType);
                 }
-                self.hal.power_off(a[1]);
+                match a[2] {
+                    0 => self.hal.power_off(a[1]),
+                    1 => self.hal.reset(a[1]),
+                    _ => return Err(Error::BadArg),
+                }
                 Err(Error::Unsupported)
             }
             Syscall::PortIo => {

@@ -151,11 +151,15 @@ pub enum Syscall {
     /// logging service replaces it for everything else.
     Console = 19,
     /// `a0` power capability (the root task's [`root::SLOT_POWER`]), `a1`
-    /// status (0: success). Turns the machine off; a test harness (QEMU's
-    /// debug-exit device on x86_64, semihosting on aarch64 with
-    /// `exit=semihosting` on the kernel command line) is told the status.
-    /// Returns `Unsupported` where the machine cannot be turned off yet
-    /// (x86_64 outside a harness: that needs ACPI, M3).
+    /// status (0: success), `a2` 0 to turn the machine off, 1 to reset it.
+    /// A test harness (QEMU's debug-exit device on x86_64, semihosting on
+    /// aarch64 with `exit=semihosting` on the kernel command line) is told
+    /// the status instead. Turning off is ACPI S5 on x86_64 (the FADT's
+    /// control registers and the DSDT's `\_S5` values) and PSCI SYSTEM_OFF
+    /// on aarch64; resetting is the FADT's reset register on x86_64 and PSCI
+    /// SYSTEM_RESET on aarch64. Returns `Unsupported` where the firmware
+    /// describes no way to do it. Nothing is stopped or flushed first: that
+    /// is the caller's business (the shutdown service's).
     PowerOff = 20,
     /// `a0` SchedContext (write), `a1` class. [`SCHED_FAIR`]: `a2` weight
     /// (1 to [`SCHED_MAX_WEIGHT`]; a thread with none weighs

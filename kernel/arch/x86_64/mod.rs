@@ -588,14 +588,116 @@ impl Hal for X86 {
     }
 
     fn power_off(&self, status: u64) {
-        // QEMU's debug-exit device ends the emulation with this status
-        // (success 0x10, failure 0x11, as every test reports it). Turning a
-        // PC off takes ACPI's S5 sleep state, which comes with ACPI at M3;
-        // until then this returns and the caller is told Unsupported.
-        let code = if status == 0 { kernel_core::ExitStatus::Success } else { kernel_core::ExitStatus::Failure }.code();
-        // SAFETY: a write to the debug-exit port, the same the test harness
-        // has always used; on a machine without the device it is ignored.
-        unsafe { asm!("out dx, al", in("dx") 0xF4u16, in("al") code, options(nomem, nostack, preserves_flags)) }
+        harness_exit(status);
+        let Some(p) = power() else { return };
+        let ([a, b], (ta, tb)) = (p.registers.pm1_control, p.s5);
+        // SAFETY: the ports the firmware's FADT names for this; nothing the
+        // kernel holds depends on the machine staying on.
+        unsafe {
+            if a == 0 {
+                return;
+            }
+            acpi_mode(&p.registers);
+            // SLP_TYP in bits 10 to 12, SLP_EN bit 13.
+            let off = |port: u16, typ: u8| {
+                let v = serial::inw(port);
+                serial::outw(port, (v & !(7 << 10)) | (typ as u16 & 7) << 10 | 1 << 13);
+            };
+            if b != 0 {
+                off(b, tb);
+            }
+            off(a, ta);
+        }
+        // The machine takes a moment to go.
+        let t = rdtsc();
+        while rdtsc() - t < self.tsc_hz.get() {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn reset(&self, status: u64) {
+        harness_exit(status);
+        if let Some((port, value)) = power().and_then(|p| p.registers.reset) {
+            serial::outb(port, value);
+            let t = rdtsc();
+            while rdtsc() - t < self.tsc_hz.get() {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// QEMU's debug-exit device: a test harness learns the status from it. (On
+/// a machine without the device the write goes nowhere.)
+fn harness_exit(status: u64) {
+    let code = if status == 0 { kernel_core::ExitStatus::Success } else { kernel_core::ExitStatus::Failure }.code();
+    serial::outb(0xF4, code);
+}
+
+/// How to turn this machine off and reset it, read from its ACPI tables once
+/// at boot.
+#[derive(Clone, Copy)]
+struct Power {
+    registers: kernel_core::acpi::Power,
+    /// `\_S5`'s values for PM1a and PM1b.
+    s5: (u8, u8),
+}
+
+struct PowerCell(core::cell::UnsafeCell<Option<Power>>);
+// SAFETY: written by the boot processor before any other runs, then read.
+unsafe impl Sync for PowerCell {}
+static POWER: PowerCell = PowerCell(core::cell::UnsafeCell::new(None));
+
+fn power() -> Option<Power> {
+    // SAFETY: written once at boot, before any other processor starts.
+    unsafe { *POWER.0.get() }
+}
+
+/// Read the FADT and the DSDT's `\_S5` (boot processor, once).
+fn init_power(bi: &BootInfo, phys: &Phys) {
+    let Some(fadt) = acpi_table(bi, phys, b"FACP") else { return };
+    let Some(registers) = kernel_core::acpi::power(fadt) else { return };
+    let dsdt = {
+        let x = if fadt.len() >= 148 { u64::from_le_bytes(fadt[140..148].try_into().unwrap_or([0; 8])) } else { 0 };
+        let at = if x != 0 { x } else { u32::from_le_bytes(fadt[40..44].try_into().unwrap_or([0; 4])) as u64 };
+        let limit = bi.phys_map_len;
+        // SAFETY: the range is checked to lie in the physical map; ACPI
+        // tables are firmware memory nothing writes.
+        let header = (at != 0 && at + 36 <= limit).then(|| unsafe { phys.bytes(at, 36) });
+        header.filter(|h| &h[..4] == b"DSDT").and_then(|h| {
+            let len = u32::from_le_bytes(h[4..8].try_into().ok()?) as u64;
+            // SAFETY: as above.
+            (at + len <= limit).then(|| unsafe { phys.bytes(at, len) })
+        })
+    };
+    let s5 = dsdt.and_then(|d| kernel_core::acpi::sleep_type(d, b"_S5_"));
+    // Without \_S5's values the control registers are no use (reset may
+    // still be possible).
+    let registers = if s5.is_some() { registers } else { kernel_core::acpi::Power { pm1_control: [0, 0], ..registers } };
+    if s5.is_none() {
+        klog!(kernel(), "kernel: the firmware describes no soft-off state (\\_S5): the machine cannot be turned off");
+    }
+    // SAFETY: boot processor, alone.
+    unsafe { *POWER.0.get() = Some(Power { registers, s5: s5.unwrap_or((0, 0)) }) };
+}
+
+/// Put the machine in ACPI mode if the firmware left it in legacy mode.
+///
+/// # Safety
+/// Port I/O to the registers the FADT names.
+unsafe fn acpi_mode(r: &kernel_core::acpi::Power) {
+    // SCI_EN is bit 0 of PM1a's control register.
+    // SAFETY: the caller's.
+    unsafe {
+        if serial::inw(r.pm1_control[0]) & 1 == 0 && r.smi_command != 0 && r.acpi_enable != 0 {
+            serial::outb(r.smi_command, r.acpi_enable);
+            for _ in 0..1_000_000 {
+                if serial::inw(r.pm1_control[0]) & 1 != 0 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
     }
 }
 
@@ -1143,6 +1245,7 @@ pub extern "C" fn kmain(info: u64) -> ! {
     flush_all();
 
     ioapic::init(&bi, &k.phys);
+    init_power(&bi, &k.phys);
     let hz = tsc_frequency(&bi, &k.phys);
     k.hal.tsc_hz.set(hz);
     k.hal.tsc0.set(rdtsc());

@@ -738,6 +738,14 @@ impl Hal for Arm {
         // PSCI SYSTEM_OFF; it returns only if the firmware has no PSCI.
         smp::system_off();
     }
+
+    fn reset(&self, status: u64) {
+        let code = if status == 0 { ExitStatus::Success } else { ExitStatus::Failure };
+        if HARNESS.load(Ordering::Relaxed) {
+            stop(code);
+        }
+        smp::system_reset();
+    }
 }
 
 // ---- entry from user mode ----------------------------------------------------

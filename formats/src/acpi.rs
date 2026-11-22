@@ -173,6 +173,91 @@ fn crs(b: &[u8]) -> Option<Resources> {
     Some(r)
 }
 
+/// The sleep type values of the sleep state `name` (`b"_S5_"` for soft
+/// off), from the package the AML table `aml` declares under that name:
+/// `Name (_S5, Package () { a, b, ... })`, the first two elements being the
+/// values for the PM1a and PM1b control registers. Only constant elements
+/// (Zero, One, a byte, word or dword constant) are understood; `None` for
+/// anything else, or when the name is not declared.
+pub fn sleep_type(aml: &[u8], name: &[u8; 4]) -> Option<(u8, u8)> {
+    let mut from = 36.min(aml.len());
+    while let Some(at) = find(&aml[from..], name) {
+        let here = from + at;
+        from = here + 1;
+        // NameOp before the name (possibly with a root prefix), PackageOp after it.
+        let named = here >= 1 && (aml[here - 1] == 0x08 || (here >= 2 && aml[here - 1] == b'\\' && aml[here - 2] == 0x08));
+        if !named || aml.get(here + 4) != Some(&0x12) {
+            continue;
+        }
+        let rest = aml.get(here + 5..)?;
+        let (_, used) = pkg_len(rest)?;
+        let mut d = rest.get(used + 1..)?; // after the element count
+        let mut values = [0u8; 2];
+        for v in &mut values {
+            let (value, n) = match *d.first()? {
+                0x00 => (0, 1),
+                0x01 => (1, 1),
+                0xFF => (0xFF, 1),
+                0x0A => (*d.get(1)? as u64, 2),
+                0x0B => (u16::from_le_bytes(d.get(1..3)?.try_into().ok()?) as u64, 3),
+                0x0C => (u32::from_le_bytes(d.get(1..5)?.try_into().ok()?) as u64, 5),
+                _ => return None,
+            };
+            *v = value as u8;
+            d = d.get(n..)?;
+        }
+        return Some((values[0], values[1]));
+    }
+    None
+}
+
+/// What the FADT says about turning the machine off and resetting it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Power {
+    /// I/O ports of the PM1a and PM1b control registers (0: none).
+    pub pm1_control: [u16; 2],
+    /// The port to write `acpi_enable` to, to put the machine in ACPI mode
+    /// (0: it is in ACPI mode already, or cannot leave it).
+    pub smi_command: u16,
+    /// See `smi_command`.
+    pub acpi_enable: u8,
+    /// The reset register, when the firmware offers one in I/O space: its
+    /// port and the value to write.
+    pub reset: Option<(u16, u8)>,
+}
+
+/// The power registers of a FADT (the whole table).
+pub fn power(fadt: &[u8]) -> Option<Power> {
+    let u32_at = |at: usize| u32_at(fadt, at);
+    let port = |at: usize| u32_at(at).filter(|p| *p != 0 && *p < 0x1_0000).map(|p| p as u16);
+    if fadt.len() < 116 || &fadt[..4] != b"FACP" {
+        return None;
+    }
+    let mut p = Power {
+        pm1_control: [port(64).unwrap_or(0), port(68).unwrap_or(0)],
+        smi_command: port(48).unwrap_or(0),
+        acpi_enable: *fadt.get(52)?,
+        reset: None,
+    };
+    // ACPI 2.0 and later: the extended address of PM1a's control block, a
+    // generic address in I/O space, when the 32-bit one is not given.
+    if p.pm1_control[0] == 0 && fadt.len() >= 184 && fadt[172] == 1 {
+        let a = u64_at(fadt, 176)?;
+        if a != 0 && a < 0x1_0000 {
+            p.pm1_control[0] = a as u16;
+        }
+    }
+    // The reset register: flag RESET_REG_SUP, a generic address in I/O space.
+    let flags = u32_at(112)?;
+    if flags & 1 << 10 != 0 && fadt.len() >= 129 && fadt[116] == 1 {
+        let a = u64_at(fadt, 120)?;
+        if a != 0 && a < 0x1_0000 {
+            p.reset = Some((a as u16, fadt[128]));
+        }
+    }
+    Some(p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +318,42 @@ mod tests {
                 bad[i] = good[i];
             }
         }
+    }
+
+    #[test]
+    fn the_soft_off_sleep_type_is_read_from_its_package() {
+        // Name (_S5, Package (0x04) { 0x05, Zero, Zero, Zero }), as OVMF has it,
+        // after an unrelated _S4 declared with a word constant.
+        let mut body = b"\x08_S4_\x12\x08\x04\x0B\x06\x00\x00\x00\x00".to_vec();
+        body.extend_from_slice(b"\x08\\_S5_\x12\x06\x04\x0A\x05\x00\x00\x00");
+        let dsdt = table(b"DSDT", &body);
+        assert_eq!(sleep_type(&dsdt, b"_S5_"), Some((5, 0)));
+        assert_eq!(sleep_type(&dsdt, b"_S4_"), Some((6, 0)));
+        assert_eq!(sleep_type(&dsdt, b"_S3_"), None);
+        // A method computing it, or a name that is not a declaration, is not understood.
+        let odd = table(b"DSDT", b"\x14\x0A_S5_\x00\xA4\x0A\x05xx\x08_S5_\x0A\x05");
+        assert_eq!(sleep_type(&odd, b"_S5_"), None);
+        for cut in 0..dsdt.len() {
+            let _ = sleep_type(&dsdt[..cut], b"_S5_");
+        }
+    }
+
+    #[test]
+    fn the_power_registers_are_read_from_the_fadt() {
+        let mut f = table(b"FACP", &[0; 244 - 36]);
+        f[48..52].copy_from_slice(&0xB2u32.to_le_bytes());
+        f[52] = 0xF1;
+        f[64..68].copy_from_slice(&0x604u32.to_le_bytes());
+        f[112..116].copy_from_slice(&(1u32 << 10).to_le_bytes());
+        f[116] = 1;
+        f[120..128].copy_from_slice(&0xCF9u64.to_le_bytes());
+        f[128] = 6;
+        let p = power(&f).unwrap();
+        assert_eq!(p, Power { pm1_control: [0x604, 0], smi_command: 0xB2, acpi_enable: 0xF1, reset: Some((0xCF9, 6)) });
+        // No reset register offered: none used, whatever the address says.
+        f[112..116].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(power(&f).unwrap().reset, None);
+        assert_eq!(power(&f[..100]), None);
     }
 
     #[test]
