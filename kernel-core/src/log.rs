@@ -3,12 +3,68 @@
 use crate::hal::Hal;
 use crate::lock::Lock;
 use core::fmt;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 /// The writer whose line the console is in the middle of (0: none; a line
-/// ends with a newline). Kept with [`LINE`] held.
+/// ends with a newline). Kept with [`LINE`] held, as is everything below.
 static OPEN: AtomicU64 = AtomicU64::new(0);
 static LINE: Lock = Lock::new();
+
+/// The text of the open line so far, and the line another writer cut
+/// short, with its writer (0: none), shown again when that other line ends.
+static OPEN_TEXT: Text = Text::new();
+static CUT_TEXT: Text = Text::new();
+static CUT_BY: AtomicU64 = AtomicU64::new(0);
+
+/// Up to [`TEXT`] bytes of one line; a longer line is not kept (its length
+/// past the buffer) and so not shown again.
+struct Text {
+    bytes: [AtomicU8; TEXT],
+    len: AtomicUsize,
+}
+
+const TEXT: usize = 256;
+
+impl Text {
+    const fn new() -> Text {
+        Text { bytes: [const { AtomicU8::new(0) }; TEXT], len: AtomicUsize::new(0) }
+    }
+
+    fn clear(&self) {
+        self.len.store(0, Ordering::Relaxed);
+    }
+
+    fn add(&self, b: &[u8]) {
+        let len = self.len.load(Ordering::Relaxed);
+        for (to, from) in self.bytes.iter().skip(len).zip(b) {
+            to.store(*from, Ordering::Relaxed);
+        }
+        self.len.store(len.saturating_add(b.len()), Ordering::Relaxed);
+    }
+
+    fn set(&self, from: &Text) {
+        self.clear();
+        let len = from.len.load(Ordering::Relaxed);
+        for (to, b) in self.bytes.iter().zip(&from.bytes).take(len) {
+            to.store(b.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        self.len.store(len, Ordering::Relaxed);
+    }
+
+    /// Write it out, if it was kept whole.
+    fn show<H: Hal>(&self, hal: &H) -> bool {
+        let len = self.len.load(Ordering::Relaxed);
+        if len > TEXT {
+            return false;
+        }
+        let mut buf = [0u8; TEXT];
+        for (to, b) in buf.iter_mut().zip(&self.bytes).take(len) {
+            *to = b.load(Ordering::Relaxed);
+        }
+        hal.console(&buf[..len]);
+        true
+    }
+}
 
 /// The kernel's own lines, as a writer.
 pub const KERNEL: u64 = u64::MAX;
@@ -16,7 +72,10 @@ pub const KERNEL: u64 = u64::MAX;
 /// Write `bytes` for `writer` (the kernel, or a thread through its console
 /// capability), whole. A writer that finds the line left unfinished by
 /// another starts a fresh one, so a program's prompt and a kernel line never
-/// share a line, and every line a reader anchors on starts where it should.
+/// share a line, and every line a reader anchors on starts where it should;
+/// once the other's line is done, the line it cut short is shown again
+/// (a prompt and what was typed after it), so that its writer's next text
+/// continues it on the screen as on the line.
 pub fn write<H: Hal>(hal: &H, writer: u64, bytes: &[u8]) {
     write_parts(hal, writer, &[bytes]);
 }
@@ -28,11 +87,42 @@ pub fn write_parts<H: Hal>(hal: &H, writer: u64, parts: &[&[u8]]) {
     let open = OPEN.load(Ordering::Relaxed);
     if open != 0 && open != writer {
         hal.console(b"\r\n");
+        // One cut line is kept: the first, until it is shown again.
+        if CUT_BY.load(Ordering::Relaxed) == 0 {
+            CUT_TEXT.set(&OPEN_TEXT);
+            CUT_BY.store(open, Ordering::Relaxed);
+        }
+        OPEN_TEXT.clear();
+    }
+    if CUT_BY.load(Ordering::Relaxed) == writer {
+        // This writer's own line was cut: it goes on where it was.
+        CUT_TEXT.show(hal);
+        OPEN_TEXT.set(&CUT_TEXT);
+        CUT_BY.store(0, Ordering::Relaxed);
+    } else if open != writer {
+        OPEN_TEXT.clear();
     }
     for p in parts.iter().filter(|p| !p.is_empty()) {
         hal.console(p);
+        match p.iter().rposition(|b| *b == b'\n') {
+            Some(n) => {
+                OPEN_TEXT.clear();
+                OPEN_TEXT.add(&p[n + 1..]);
+            }
+            None => OPEN_TEXT.add(p),
+        }
     }
-    OPEN.store(if *last == b'\n' { 0 } else { writer }, Ordering::Relaxed);
+    let mut now = if *last == b'\n' { 0 } else { writer };
+    let cut_by = CUT_BY.load(Ordering::Relaxed);
+    if now == 0 && cut_by != 0 {
+        // The line done, the one it cut short again below it.
+        if CUT_TEXT.show(hal) {
+            OPEN_TEXT.set(&CUT_TEXT);
+            now = cut_by;
+        }
+        CUT_BY.store(0, Ordering::Relaxed);
+    }
+    OPEN.store(now, Ordering::Relaxed);
     LINE.unlock();
 }
 
