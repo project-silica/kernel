@@ -3,7 +3,7 @@
 //! architecture in `kernel/arch/` and once for the host tests.
 
 use crate::mem::{Paddr, Phys};
-use silica_abi::Rights;
+use silica_abi::{Error, Rights};
 
 /// Number of words in a thread's saved register frame.
 pub const NREGS: usize = 40;
@@ -48,6 +48,56 @@ pub trait Hal {
     fn pte_is_leaf(pte: u64, level: u8) -> bool;
     /// The physical address in a present entry.
     fn pte_addr(pte: u64) -> Paddr;
+
+    /// An entry of a device address space's table (the IOMMU's format)
+    /// pointing to the next-level table at `table`. Entries of device
+    /// address spaces are read with [`Hal::pte_present`],
+    /// [`Hal::pte_is_leaf`] and [`Hal::pte_addr`] like a processor's.
+    fn io_pte_table(table: Paddr) -> u64 {
+        Self::pte_table(table)
+    }
+    /// A leaf entry of a device address space: devices may read `frame`,
+    /// and write it with `Rights::WRITE`.
+    fn io_pte_leaf(frame: Paddr, rights: Rights, level: u8) -> u64 {
+        Self::pte_leaf(frame, rights, level, false)
+    }
+    /// One past the highest address a device address space translates; 0
+    /// when the machine has no IOMMU the kernel drives.
+    fn io_top(&self) -> u64 {
+        0
+    }
+    /// Whether a device address space maps 2 MiB with one entry.
+    fn io_large(&self) -> bool {
+        false
+    }
+    /// From now on the device with identity `id` reaches memory through the
+    /// device address space whose root table is `root` (0: reaches nothing),
+    /// and nothing it cached of its previous one remains. Returns the root
+    /// it was attached to before (0: none). Holding every lock.
+    fn io_attach(&self, _phys: &Phys, _id: u64, _root: Paddr) -> Result<Paddr, Error> {
+        Err(Error::Unsupported)
+    }
+    /// Mappings of the device address space `root` were removed: its
+    /// devices' cached translations are dropped before this returns.
+    fn io_flush(&self, _phys: &Phys, _root: Paddr) {}
+    /// A frame was mapped in the device address space `root`, which has
+    /// devices attached (an IOMMU that caches missing translations must be
+    /// told).
+    fn io_mapped(&self, _phys: &Phys, _root: Paddr) {}
+    /// The device address space `root` is going away: every device attached
+    /// to it reaches nothing from now on.
+    fn io_release(&self, _phys: &Phys, _root: Paddr) {}
+    /// The first interrupt line that is a message, not a wire.
+    fn msi_first(&self) -> usize {
+        usize::MAX
+    }
+    /// Deliver message line `line` (at least [`Hal::msi_first`]) to
+    /// processor `cpu`, raised only by the device with identity `source`
+    /// where the machine can enforce that. Returns the message's address
+    /// and data for the device's registers; `None` when the machine cannot.
+    fn msi_route(&self, _line: usize, _cpu: usize, _source: u64) -> Option<(u64, u64)> {
+        None
+    }
 
     /// Fill a new root table with the kernel's half of the address space.
     fn init_root(&self, phys: &Phys, root: Paddr);

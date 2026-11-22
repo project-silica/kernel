@@ -1238,3 +1238,113 @@ fn slice_end_saturates_near_the_end_of_time() {
 fn a_revoked_ipc_buffer_is_not_written_by_its_thread() {
     support::fuzz::run(include_bytes!("../fuzz/corpus/syscalls/buffer-written-after-its-frame-was-revoked"));
 }
+
+/// An address space made for devices: frames mapped in it are what the
+/// devices attached to it reach, a device reaches nothing before it is
+/// attached and nothing once the address space is gone, and removing a
+/// mapping drops what the IOMMU cached before the call returns.
+#[test]
+fn a_device_reaches_exactly_what_is_mapped_in_the_address_space_it_is_attached_to() {
+    use silica_abi::ASPACE_IO;
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    let (io, frame, large) = (FREE, FREE + 1, FREE + 3);
+    // The smallest address space has no room for the table a device one starts with.
+    assert_eq!(m.err(S::Retype, [ut, T::AddressSpace as u64, 13 | ASPACE_IO, SLOT_CAPSPACE, io, 1]), Error::BadArg);
+    m.retype(ut, T::AddressSpace, 16 | ASPACE_IO, io, 1);
+    m.retype(ut, T::Frame, 12, frame, 2);
+    m.retype(ut, T::Frame, 21, large, 1);
+    let space = m.cap(io).unwrap().obj;
+    // Device addresses go up to what the IOMMU translates, not to the top
+    // of a program's addresses; rights are read, or read and write.
+    assert_eq!(m.err(S::Map, [io, frame, 1 << 48, 3, 0, 0]), Error::BadArg);
+    assert_eq!(m.err(S::Map, [io, frame, 0x10_0000, 5, 0, 0]), Error::BadArg, "a device executes nothing");
+    assert_eq!(m.err(S::Map, [io, large, 0x10_1000, 3, 0, 0]), Error::BadArg, "large frame alignment");
+    m.ok(S::Map, [io, frame, 0xFFFF_FFFF_F000, 3, 0, 0]);
+    m.ok(S::Unmap, [frame, 0, 0, 0, 0, 0]);
+    assert_eq!(m.k.hal.io_flushes.get(), 0, "nothing is cached of an address space no device uses");
+    m.ok(S::Map, [io, frame, 0x10_0000, 3, 0, 0]);
+    m.ok(S::Map, [io, large, 0x4000_0000, 1, 0, 0]);
+    assert_eq!(m.k.translate(space, 0x10_0123), Some(m.cap(frame).unwrap().obj + 0x123));
+    assert_eq!(m.k.translate(space, 0x4012_3456), Some(m.cap(large).unwrap().obj + 0x12_3456));
+    // No thread runs in it, and a program's address space takes no device.
+    assert_eq!(m.err(S::ThreadConfigure, [SLOT_THREAD, KEEP, io, KEEP, KEEP, 0]), Error::BadArg);
+    assert_eq!(m.err(S::DeviceAttach, [SLOT_DEVICES, 0x18, SLOT_ASPACE, 0, 0, 0]), Error::WrongType);
+    // Attaching takes the authority over that device.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 4, SLOT_DEVICES, 15, 0x18 | 0x19 << 32, 0]);
+    assert_eq!(m.err(S::DeviceAttach, [FREE + 4, 0x20, io, 0, 0, 0]), Error::BadArg);
+    assert_eq!(m.err(S::DeviceAttach, [SLOT_IRQS, 0x18, io, 0, 0, 0]), Error::WrongType);
+    assert_eq!(m.err(S::DeviceAttach, [SLOT_DEVICES, 0x1_0018, io, 0, 0, 0]), Error::Unsupported, "a segment the IOMMU does not cover");
+    m.ok(S::DeviceAttach, [FREE + 4, 0x18, io, 0, 0, 0]);
+    m.ok(S::DeviceAttach, [SLOT_DEVICES, 0x20, io, 0, 0, 0]);
+    assert_eq!(m.k.hal.attached.borrow().get(&0x18), Some(&(space + 4096)));
+    assert_eq!(m.k.attached_to(space), 2);
+    // Removing a mapping reaches the IOMMU before the call returns.
+    let flushes = m.k.hal.io_flushes.get();
+    m.ok(S::Unmap, [frame, 0, 0, 0, 0, 0]);
+    assert_eq!(m.k.hal.io_flushes.get(), flushes + 1);
+    assert_eq!(m.k.translate(space, 0x10_0000), None);
+    // Moving a device to another address space, and detaching it.
+    m.retype(ut, T::AddressSpace, 14 | ASPACE_IO, FREE + 5, 1);
+    m.ok(S::DeviceAttach, [SLOT_DEVICES, 0x20, FREE + 5, 0, 0, 0]);
+    assert_eq!((m.k.attached_to(space), m.k.attached_to(m.cap(FREE + 5).unwrap().obj)), (1, 1));
+    m.ok(S::DeviceAttach, [SLOT_DEVICES, 0x20, 0, 0, 0, 0]);
+    assert_eq!(m.k.attached_to(m.cap(FREE + 5).unwrap().obj), 0);
+    m.ok(S::DeviceAttach, [SLOT_DEVICES, 0x20, 0, 0, 0, 0]);
+    // Destroying the address space (here: with everything else made from
+    // the Untyped, as when a driver is ended) leaves its device reaching nothing.
+    m.ok(S::CapRevoke, [ut, 0, 0, 0, 0, 0]);
+    assert!(m.k.hal.attached.borrow().is_empty());
+    // On a machine with no IOMMU there are no such address spaces, a device
+    // cannot be confined, and the holder of the device authority is told
+    // where a frame is; with one, nobody is.
+    m.retype(ut, T::Frame, 12, frame, 1);
+    assert_eq!(m.err(S::Inspect, [SLOT_DEVICES, frame, 0, 0, 0, 0]), Error::Unsupported);
+    m.k.hal.io_top.set(0);
+    assert_eq!(m.err(S::Retype, [ut, T::AddressSpace as u64, 16 | ASPACE_IO, SLOT_CAPSPACE, io, 1]), Error::Unsupported);
+    m.ok(S::Inspect, [SLOT_DEVICES, frame, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), m.cap(frame).unwrap().obj);
+    assert_eq!(m.err(S::Inspect, [SLOT_DEVICES, SLOT_ASPACE, 0, 0, 0, 0]), Error::WrongType);
+}
+
+/// An IOMMU without large pages maps a 2 MiB frame page by page, and the
+/// frame is unmapped the same way.
+#[test]
+fn a_large_frame_is_mapped_for_devices_page_by_page_where_the_iommu_has_no_large_pages() {
+    use silica_abi::ASPACE_IO;
+    let m = Machine::new(16);
+    m.k.hal.io_large.set(false);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 16 | ASPACE_IO, FREE, 1);
+    m.retype(ut, T::Frame, 21, FREE + 1, 1);
+    let space = m.cap(FREE).unwrap().obj;
+    m.ok(S::Map, [FREE, FREE + 1, 0x40_3000, 3, 0, 0]);
+    assert_eq!(m.k.translate(space, 0x60_2FFF), Some(m.cap(FREE + 1).unwrap().obj + 0x1F_FFFF));
+    m.ok(S::Unmap, [FREE + 1, 0, 0, 0, 0, 0]);
+    assert_eq!((m.k.translate(space, 0x40_3000), m.k.translate(space, 0x60_2FFF)), (None, None));
+}
+
+/// A message-signalled interrupt line: bound for one device, it returns the
+/// message that device's registers are given, and signals like a wire.
+#[test]
+fn a_message_interrupt_line_is_bound_for_one_device_and_returns_its_message() {
+    use silica_abi::{IRQ_LEVEL, IRQ_MSI};
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    assert_eq!(m.err(S::IrqBind, [SLOT_IRQS, 70, FREE, 0, SLOT_DEVICES, 0x18]), Error::BadArg, "a message line bound as a wire");
+    assert_eq!(m.err(S::IrqBind, [SLOT_IRQS, 70, FREE, IRQ_MSI | IRQ_LEVEL, SLOT_DEVICES, 0x18]), Error::BadArg);
+    assert_eq!(m.err(S::IrqBind, [SLOT_IRQS, 5, FREE, IRQ_MSI, SLOT_DEVICES, 0x18]), Error::BadArg, "a wire bound as a message");
+    assert_eq!(m.err(S::IrqBind, [SLOT_IRQS, 70, FREE, IRQ_MSI, SLOT_IRQS, 0x18]), Error::WrongType, "no authority over the device");
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, SLOT_DEVICES, 15, 0x18 | 0x19 << 32, 0]);
+    assert_eq!(m.err(S::IrqBind, [SLOT_IRQS, 70, FREE, IRQ_MSI, FREE + 1, 0x20]), Error::BadArg);
+    m.ok(S::IrqBind, [SLOT_IRQS, 70, FREE, IRQ_MSI, FREE + 1, 0x18]);
+    assert_eq!((m.arg(m.root, 0), m.arg(m.root, 1)), (0xFEE0_0000, 0x30 + 70));
+    assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "message 70 cpu0 from 0x18");
+    m.irq(70);
+    m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 1);
+    m.ok(S::IrqBind, [SLOT_IRQS, 70, 0, 0, 0, 0]);
+    m.irq(70);
+    assert_eq!(m.err(S::Recv, [FREE, 1, 0, 0, 0, 0]), Error::WouldBlock);
+}

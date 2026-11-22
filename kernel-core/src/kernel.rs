@@ -1,6 +1,6 @@
 //! The kernel state for one processor and the syscall dispatcher.
 
-use crate::cap::{Cap, FLAG_CONSOLE, FLAG_DEVICE, FLAG_PORTS, FLAG_POWER};
+use crate::cap::{Cap, FLAG_CONSOLE, FLAG_DEVICE, FLAG_DMA, FLAG_IO, FLAG_PORTS, FLAG_POWER};
 use crate::hal::Hal;
 use crate::mem::{Paddr, Phys};
 use crate::smp::Held;
@@ -442,6 +442,10 @@ impl<H: Hal> Kernel<H> {
                     if i == 3 && (cap.bits != PAGE_BITS || cap.flags & FLAG_DEVICE != 0 || !cap.rights.has(Rights(3))) {
                         return Err(Error::BadArg);
                     }
+                    // No thread runs in an address space made for devices.
+                    if i == 1 && cap.flags & FLAG_IO != 0 {
+                        return Err(Error::BadArg);
+                    }
                     src[i] = s;
                 }
                 // The thread may be running on another processor with the
@@ -563,8 +567,24 @@ impl<H: Hal> Kernel<H> {
                     q.bound.set(q.bound.get() - 1);
                 }
                 if to != 0 {
-                    if !self.hal.irq_route(line, self.hal.cpu(), a[3] & silica_abi::IRQ_LEVEL != 0, a[3] & silica_abi::IRQ_ACTIVE_LOW != 0)
-                    {
+                    if line >= self.hal.msi_first() {
+                        // A message, raised by one device.
+                        if a[3] != silica_abi::IRQ_MSI {
+                            return Err(Error::BadArg);
+                        }
+                        let source = self.device(t, a[4], a[5])?;
+                        let (address, data) = self.hal.msi_route(line, self.hal.cpu(), source).ok_or(Error::Unsupported)?;
+                        let r = &self.thread(t).regs;
+                        r[H::ARG[0]].set(address);
+                        r[H::ARG[1]].set(data);
+                    } else if a[3] & silica_abi::IRQ_MSI != 0 {
+                        return Err(Error::BadArg);
+                    } else if !self.hal.irq_route(
+                        line,
+                        self.hal.cpu(),
+                        a[3] & silica_abi::IRQ_LEVEL != 0,
+                        a[3] & silica_abi::IRQ_ACTIVE_LOW != 0,
+                    ) {
                         return Err(Error::Unsupported);
                     }
                     self.irqs[line].0.set(to);
@@ -608,6 +628,15 @@ impl<H: Hal> Kernel<H> {
                         [sc.class.get(), size, sc.period.get(), sc.remaining.get(), sc.consumed.get(), cpu]
                     }
                     ObjectType::CapSpace | ObjectType::Thread => return Err(Error::BadArg),
+                    // Where a device reaches a frame on a machine that
+                    // cannot confine DMA: its physical address.
+                    ObjectType::Hw if cap.flags & FLAG_DMA != 0 => {
+                        let (_, frame) = self.ccap(t, a[1], ObjectType::Frame, Rights::NONE)?;
+                        if self.hal.io_top() != 0 {
+                            return Err(Error::Unsupported);
+                        }
+                        [frame.obj, 0, 0, 0, 0, 0]
+                    }
                     _ => return Err(Error::WrongType),
                 };
                 for (i, v) in out.iter().enumerate() {
@@ -626,6 +655,20 @@ impl<H: Hal> Kernel<H> {
                     self.cpus.get(home).resched.set(true);
                     b = self.thread(b).sc_next.get();
                 }
+                Ok(Exit::Done)
+            }
+            Syscall::DeviceAttach => {
+                let id = self.device(t, a[0], a[1])?;
+                let space = if a[2] == 0 {
+                    0
+                } else {
+                    let (_, asp) = self.ccap(t, a[2], ObjectType::AddressSpace, Rights::WRITE)?;
+                    if asp.flags & FLAG_IO == 0 {
+                        return Err(Error::WrongType);
+                    }
+                    asp.obj
+                };
+                self.attach(id, space)?;
                 Ok(Exit::Done)
             }
             Syscall::Console => {
@@ -667,6 +710,19 @@ impl<H: Hal> Kernel<H> {
                 Ok(Exit::Done)
             }
         }
+    }
+
+    /// The device identity `id`, which the device-identity capability at
+    /// `index` must cover.
+    fn device(&self, t: Paddr, index: u64, id: u64) -> Result<u64, Error> {
+        let (_, hw) = self.ccap(t, index, ObjectType::Hw, Rights::WRITE)?;
+        if hw.flags & FLAG_DMA == 0 {
+            return Err(Error::WrongType);
+        }
+        if id < hw.obj || id >= hw.badge {
+            return Err(Error::BadArg);
+        }
+        Ok(id)
     }
 
     fn recv_any(&self, t: Paddr, index: u64, deadline: u64, park: u64) -> Result<Exit, Error> {

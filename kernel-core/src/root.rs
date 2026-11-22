@@ -5,7 +5,7 @@
 //! Untyped, so it owns and is accounted for its own memory.
 
 use crate::boot::{Region, RegionKind};
-use crate::cap::{Cap, FLAG_CONSOLE, FLAG_DEVICE, FLAG_IRQS, FLAG_KEPT, FLAG_PORTS, FLAG_POWER};
+use crate::cap::{Cap, FLAG_CONSOLE, FLAG_DEVICE, FLAG_DMA, FLAG_IRQS, FLAG_KEPT, FLAG_PORTS, FLAG_POWER};
 use crate::elf::{Elf, ElfError, PF_W, PF_X};
 use crate::hal::Hal;
 use crate::kernel::{Exit, Kernel};
@@ -131,10 +131,11 @@ impl<H: Hal> Kernel<H> {
         self.insert_root(slot(SLOT_IRQS), &hw(FLAG_IRQS, 256));
         self.insert_root(slot(SLOT_CONSOLE), &hw(FLAG_CONSOLE, 1));
         self.insert_root(slot(SLOT_POWER), &hw(FLAG_POWER, 1));
+        self.insert_root(slot(SLOT_DEVICES), &hw(FLAG_DMA, u32::MAX as u64));
         let asp = self.slot(slot(SLOT_ASPACE)).obj.get();
 
         // Every other piece of memory, as Untyped capabilities.
-        let info_slot = SLOT_FIRST_UNTYPED - 1;
+        let info_slot = SLOT_INFO;
         self.boot_retype(us, ObjectType::Frame, INFO_BITS, &cs, info_slot, 1)?;
         let info = self.slot(slot(info_slot)).obj.get();
         let mut count = 0u64;
@@ -244,7 +245,7 @@ impl<H: Hal> Kernel<H> {
         put(offset_of!(RootInfo, entropy_sources), &[spec.entropy_sources]);
         let cmd = &spec.cmdline[..spec.cmdline.len().min(256)];
         put(offset_of!(RootInfo, cmdline_len), &[cmd.len() as u64]);
-        put(offset_of!(RootInfo, cpus), &[spec.cpus]);
+        put(offset_of!(RootInfo, cpus), &[spec.cpus, self.hal.io_top(), (self.hal.msi_first() as u64).min(silica_abi::IRQ_LINES)]);
         self.phys.write_bytes(info + offset_of!(RootInfo, cmdline) as u64, cmd);
 
         // The thread: its CapSpace, address space and IPC buffer, then go.

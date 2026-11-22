@@ -21,9 +21,17 @@ pub const SLOT_IPCBUF: u64 = 6;
 pub const SLOT_CONSOLE: u64 = 8;
 /// Slot of the power capability: turns the machine off (`Syscall::PowerOff`).
 pub const SLOT_POWER: u64 = 9;
+/// Slot of the device-identity capability: every device of the machine, by
+/// PCI segment, bus, device and function (`Syscall::DeviceAttach`,
+/// `Syscall::IrqBind` with `IRQ_MSI`).
+pub const SLOT_DEVICES: u64 = 10;
 /// Slot of the Untyped the root task's own objects were made from; what is
 /// left of it is the root task's to use.
 pub const SLOT_BOOT_UNTYPED: u64 = 7;
+/// Slot of the frame holding the [`RootInfo`] itself, so the root task can
+/// hand the description of the machine on (read-only) to whoever manages
+/// its devices.
+pub const SLOT_INFO: u64 = 15;
 /// First slot of the Untyped capabilities listed in [`RootInfo::untyped`].
 pub const SLOT_FIRST_UNTYPED: u64 = 16;
 
@@ -100,6 +108,16 @@ pub struct RootInfo {
     /// Number of processors. Threads start on the processor that created
     /// them and can be moved to any index below this.
     pub cpus: u64,
+    /// One past the highest address a device can be given in an address
+    /// space made for devices, when the machine confines DMA (it has an
+    /// IOMMU the kernel drives): a device then reaches only what its driver
+    /// mapped for it. 0: it cannot, and a device that does DMA reaches all
+    /// of memory whatever its driver holds, so starting such a driver is
+    /// trusting it with the machine.
+    pub dma_top: u64,
+    /// Interrupt lines from this one up are message-signalled
+    /// (`IRQ_MSI`); below it they are wires, numbered as ACPI numbers them.
+    pub msi_first: u64,
     /// Length of the kernel command line in `cmdline`.
     pub cmdline_len: u64,
     /// The kernel command line.

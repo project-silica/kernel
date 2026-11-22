@@ -86,6 +86,14 @@ fn find(line: usize) -> Option<(u64, u32)> {
         .map(|a| (a.base, line as u32 - a.first))
 }
 
+/// One past the highest line that is a wire into an I/O APIC: the lines
+/// from here up are raised by messages.
+pub fn lines() -> usize {
+    // SAFETY: read-only after `init`.
+    let list = unsafe { &*IOAPICS.0.get() };
+    list[..COUNT.load(Ordering::Acquire)].iter().map(|a| (a.first + a.count) as usize).max().unwrap_or(0).min(IRQ_LINES as usize)
+}
+
 /// Deliver `line` to the processor with APIC identifier `apic_id` and unmask it.
 pub fn route(phys: &Phys, line: usize, apic_id: u32, level: bool, active_low: bool) -> bool {
     let Some((base, pin)) = find(line) else { return false };

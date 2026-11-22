@@ -35,6 +35,13 @@ pub const FLAG_POWER: u8 = 16;
 /// firmware tables, the ramdisk). It is never zeroed, so it becomes only
 /// frames and smaller Untyped, never kernel objects.
 pub const FLAG_KEPT: u8 = 32;
+/// AddressSpace flag: an address space for devices (`ASPACE_IO`). Its
+/// tables are the IOMMU's, and no thread runs in it.
+pub const FLAG_IO: u8 = 64;
+/// Hw capability flag: a range of device identities (PCI segment, bus,
+/// device, function), the authority to say what those devices reach by DMA
+/// and which message interrupts they raise.
+pub const FLAG_DMA: u8 = 128;
 
 /// One capability slot.
 ///
@@ -178,7 +185,7 @@ impl<H: Hal> Kernel<H> {
         if cap.ty == ObjectType::Frame {
             self.unmap_slot(s);
         }
-        if cap.ty == ObjectType::AddressSpace {
+        if cap.ty == ObjectType::AddressSpace && cap.flags & FLAG_IO == 0 {
             // It may be a running thread's own, on any processor: each
             // looks again at what it should have loaded.
             self.me().dirty.set(true);

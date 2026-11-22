@@ -9,6 +9,7 @@
 
 mod cpu;
 mod ioapic;
+mod iommu;
 mod serial;
 mod smp;
 
@@ -181,6 +182,43 @@ impl Hal for X86 {
     }
     fn pte_addr(pte: u64) -> Paddr {
         pte & PTE_ADDR
+    }
+
+    fn io_pte_table(table: Paddr) -> u64 {
+        table | PTE_P | PTE_W
+    }
+    fn io_pte_leaf(frame: Paddr, rights: Rights, level: u8) -> u64 {
+        // Read and write as a processor's present and writable bits; the
+        // IOMMU ignores or defines nothing else that is set here.
+        frame | PTE_P | if rights.has(Rights::WRITE) { PTE_W } else { 0 } | if level == 1 { PTE_PS } else { 0 }
+    }
+    fn io_top(&self) -> u64 {
+        iommu::top()
+    }
+    fn io_large(&self) -> bool {
+        iommu::large()
+    }
+    fn io_attach(&self, phys: &Phys, id: u64, root: Paddr) -> Result<Paddr, silica_abi::Error> {
+        iommu::attach(phys, id, root)
+    }
+    fn io_flush(&self, phys: &Phys, root: Paddr) {
+        iommu::flush(phys, root);
+    }
+    fn io_mapped(&self, phys: &Phys, root: Paddr) {
+        iommu::mapped(phys, root);
+    }
+    fn io_release(&self, phys: &Phys, root: Paddr) {
+        iommu::release(phys, root);
+    }
+    fn msi_first(&self) -> usize {
+        ioapic::lines()
+    }
+    fn msi_route(&self, line: usize, cpu: usize, _source: u64) -> Option<(u64, u64)> {
+        // The message a device writes to raise the line: to one processor,
+        // edge-triggered, at the line's vector. Without interrupt remapping
+        // the processor is named by eight bits, and nothing checks who sent it.
+        let apic = cpu::percpu_of(cpu)?.apic_id as u64;
+        (apic < 0xFF && line < silica_abi::IRQ_LINES as usize).then_some((0xFEE0_0000 | apic << 12, ioapic::FIRST_VECTOR + line as u64))
     }
 
     fn init_root(&self, phys: &Phys, root: Paddr) {
@@ -644,6 +682,7 @@ pub fn irq(vector: u64, locked: bool) {
         }
         TIMER_VECTOR => percpu().deadline.set(u64::MAX),
         KICK_VECTOR => {}
+        iommu::FAULT_VECTOR => iommu::fault(&k.phys),
         SPURIOUS_VECTOR => return,
         v if (ioapic::FIRST_VECTOR..ioapic::FIRST_VECTOR + silica_abi::IRQ_LINES).contains(&v) => {
             let line = (v - ioapic::FIRST_VECTOR) as usize;
@@ -1153,9 +1192,20 @@ pub extern "C" fn kmain(info: u64) -> ! {
         _ => smp::prepare(&bi, &k.phys, table, root, apic_id),
     };
     k.set_cpu_count(cpus);
+    // The I/O APIC and local APIC stay with the kernel, and so do the
+    // IOMMUs' registers: from here on a device reaches only what a driver
+    // maps for it.
+    let mut reserved = [(0u64, 0u64); 17];
+    reserved[0] = (0xFEC0_0000, 0xFEF0_0000);
+    if Cmdline(cmdline).get("iommu") != Some(b"off") {
+        iommu::init(&bi, &k.phys, table, &mut reserved);
+    }
     let regions = table.as_slice();
     let usable: u64 = regions.iter().filter(|r| r.kind == 1).map(|r| r.len).sum();
     klog!(k, "silica: {} MiB free, {} processors, clock {} Hz, kernel slide {:#x}", usable >> 20, cpus, hz, bi.kernel_slide);
+    if iommu::top() == 0 {
+        klog!(k, "kernel: no IOMMU in use: a device that does DMA reaches all of memory, whatever its driver holds");
+    }
     let m = k.hal.mitigations.get();
     if m & 8 != 0 {
         klog!(
@@ -1180,13 +1230,15 @@ pub extern "C" fn kmain(info: u64) -> ! {
         klog!(k, "ERROR: kernel: no root task: the ramdisk is missing, malformed, or has no entry named \"root\"");
         die();
     };
-    let top = regions.last().map_or(0, |r| r.base + r.len).max(4 << 30);
+    // Device memory is handed out as far as the processor's addresses go:
+    // firmware puts 64-bit device registers above all memory.
+    let width = if cpuid(0x8000_0000, 0)[0] >= 0x8000_0008 { (cpuid(0x8000_0008, 0)[0] & 0xFF) as u64 } else { 36 };
+    let top = regions.last().map_or(0, |r| r.base + r.len).max(1 << width.clamp(32, 46));
     let spec = RootSpec {
         regions,
         elf: image,
         machine: kernel_core::elf::EM_X86_64,
-        // The I/O APIC and local APIC stay with the kernel.
-        reserved: &[(0xFEC0_0000, 0xFEF0_0000)],
+        reserved: &reserved,
         device_top: top,
         ports: true,
         ramdisk: [bi.ramdisk, bi.ramdisk_len],

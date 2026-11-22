@@ -6,12 +6,12 @@
 //! becomes an object; the zeroing is done in pieces and remembered, so an
 //! interrupt can preempt a large `Retype` without repeating finished work.
 
-use crate::cap::{Cap, FLAG_KEPT};
+use crate::cap::{Cap, FLAG_IO, FLAG_KEPT};
 use crate::hal::Hal;
 use crate::kernel::{Exit, Kernel};
 use crate::mem::Paddr;
 use crate::vm::AsHeader;
-use silica_abi::{Error, ObjectType, PAGE_BITS, RETYPE_MAX, Rights};
+use silica_abi::{ASPACE_IO, ASPACE_MIN_BITS, Error, ObjectType, PAGE_BITS, RETYPE_MAX, Rights};
 
 /// Bytes zeroed between checks for a pending interrupt.
 const ZERO_CHUNK: u64 = 1 << 18;
@@ -32,6 +32,15 @@ impl<H: Hal> Kernel<H> {
             return Err(Error::BadArg);
         }
         if count == 0 || count > RETYPE_MAX {
+            return Err(Error::BadArg);
+        }
+        // An address space for devices: one more page than the smallest,
+        // for the table it starts with, and only where an IOMMU exists.
+        let io = ty == ObjectType::AddressSpace && bits & ASPACE_IO != 0;
+        if io && self.hal.io_top() == 0 {
+            return Err(Error::Unsupported);
+        }
+        if io && obits == ASPACE_MIN_BITS as u64 {
             return Err(Error::BadArg);
         }
         // A child Untyped is strictly smaller than its parent, which bounds
@@ -82,7 +91,12 @@ impl<H: Hal> Kernel<H> {
                 ObjectType::SchedContext => self.init_sched(obj),
                 ObjectType::AddressSpace => {
                     self.phys.obj::<AsHeader>(obj).bits.set(obits);
-                    self.hal.init_root(&self.phys, obj + (1 << PAGE_BITS));
+                    if io {
+                        cap.flags |= FLAG_IO;
+                        self.init_io_space(obj);
+                    } else {
+                        self.hal.init_root(&self.phys, obj + (1 << PAGE_BITS));
+                    }
                 }
                 _ => {}
             }

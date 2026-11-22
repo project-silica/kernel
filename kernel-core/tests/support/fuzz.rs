@@ -6,9 +6,11 @@
 //! - the kernel did not panic and every syscall returned or blocked;
 //! - after every step, each processor's timer list is well formed;
 //! - the derivation list around every capability is consistent;
+//! - an address space made for devices counts the devices attached to it right;
 //! - after the root task revokes the Untyped everything was made from, no
-//!   capability to memory inside it is left anywhere (nothing leaks), and
-//!   the Untyped can be retyped whole again (it balances).
+//!   capability to memory inside it is left anywhere (nothing leaks), no
+//!   device still reaches memory through tables inside it, and the Untyped
+//!   can be retyped whole again (it balances).
 //!
 //! Used by the cargo-fuzz target `syscalls` and, on fixed pseudo-random
 //! inputs, by the host tests.
@@ -34,13 +36,13 @@ impl Src<'_> {
         let b = self.byte()?;
         Some(match b >> 4 {
             0..=6 => WINDOW + (b & 15) as u64,
-            7 => [SLOT_CAPSPACE, SLOT_ASPACE, SLOT_PORTS, SLOT_IPCBUF][b as usize & 3],
+            7 => [SLOT_CAPSPACE, SLOT_ASPACE, SLOT_PORTS, SLOT_IPCBUF, SLOT_DEVICES, SLOT_IRQS, SLOT_DEVICES, SLOT_ASPACE][b as usize & 7],
             8 => ut,
             9 => THREADS + (b & 3) as u64,
             10 => (b & 15) as u64,
             11 => [12, 13, 16, 21, 6, 3, 2, 1][b as usize & 7],
             12 => VADDRS[b as usize % VADDRS.len()],
-            13 => [KEEP, 0, 1, 3, 5, 7, 15, 0x105, 0x401, 0x800, 0x9f4][b as usize % 11],
+            13 => [KEEP, 0, 1, 3, 5, 7, 15, 0x105, 0x401, 0x800, 0x9f4, 0x10e, 0x110, 64, 65][b as usize % 15],
             14 => (WINDOW + (b & 15) as u64) | NONBLOCK,
             _ => {
                 // A wild value, including the root task's own vital slots.
@@ -51,6 +53,22 @@ impl Src<'_> {
                 v
             }
         })
+    }
+}
+
+/// Each address space made for devices that the root CapSpace holds counts
+/// its devices right. (One held only in another CapSpace is not looked at
+/// here; the check after the final revocation covers every one.)
+fn check_devices(m: &Machine) {
+    let attached = m.k.hal.attached.borrow();
+    if attached.is_empty() {
+        return;
+    }
+    for i in 1..4096 {
+        if let Some(c) = m.cap(i).filter(|c| c.ty == T::AddressSpace && c.flags & kernel_core::cap::FLAG_IO != 0) {
+            let n = attached.values().filter(|r| **r == c.obj + 4096).count() as u64;
+            assert_eq!(m.k.attached_to(c.obj), n, "the device count of the address space at {:#x}", c.obj);
+        }
     }
 }
 
@@ -131,7 +149,7 @@ pub fn run(data: &[u8]) {
             }
             _ => {}
         }
-        let mut n = op as u64 % 21;
+        let mut n = op as u64 % S::COUNT;
         let mut a = [0u64; 6];
         for x in &mut a {
             let Some(v) = src.arg(ut) else { break };
@@ -152,6 +170,7 @@ pub fn run(data: &[u8]) {
             }
         }
         m.raw(n, a);
+        check_devices(&m);
         if let Err(what) = m.k.check_runqueues() {
             panic!("run queues: {what}");
         }
@@ -212,6 +231,9 @@ pub fn run(data: &[u8]) {
         if let Some(v) = m.k.view(s) {
             assert!(v.cap.obj < lo || v.cap.obj >= hi, "the root thread still uses {:?} from the revoked Untyped", v.cap);
         }
+    }
+    for (id, root) in m.k.hal.attached.borrow().iter() {
+        assert!(*root < lo || *root >= hi, "device {id:#x} still reaches memory through tables in the revoked Untyped");
     }
     let v = m.k.view(ut_addr).unwrap();
     assert_eq!((v.watermark.0, v.next == 0 || m.k.view(v.next).unwrap().depth == 0), (0, true), "the revoked Untyped is not empty");

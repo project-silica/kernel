@@ -47,6 +47,13 @@ pub struct TestHal {
     pub forgets: Cell<u64>,
     /// What the kernel asked of the interrupt controller, in order.
     pub irq_log: RefCell<Vec<String>>,
+    /// The machine's IOMMU: how far device addresses reach (0: no IOMMU),
+    /// whether it maps 2 MiB with one entry, which device identity is
+    /// attached to which root table, and how often its cache was flushed.
+    pub io_top: Cell<u64>,
+    pub io_large: Cell<bool>,
+    pub attached: RefCell<std::collections::BTreeMap<u64, Paddr>>,
+    pub io_flushes: Cell<u64>,
 }
 
 const ADDR: u64 = 0x000F_FFFF_FFFF_F000;
@@ -89,6 +96,42 @@ impl Hal for TestHal {
     }
     fn pte_addr(pte: u64) -> Paddr {
         pte & ADDR
+    }
+    fn io_pte_table(table: Paddr) -> u64 {
+        table | 3
+    }
+    fn io_pte_leaf(frame: Paddr, rights: Rights, level: u8) -> u64 {
+        frame | 1 | if rights.has(Rights::WRITE) { 2 } else { 0 } | if level == 1 { 0x80 } else { 0 }
+    }
+    fn io_top(&self) -> u64 {
+        self.io_top.get()
+    }
+    fn io_large(&self) -> bool {
+        self.io_large.get()
+    }
+    fn io_attach(&self, _phys: &Phys, id: u64, root: Paddr) -> Result<Paddr, Error> {
+        if self.io_top.get() == 0 || id >> 16 != 0 {
+            return Err(Error::Unsupported);
+        }
+        // Whatever the device had cached of its previous address space goes.
+        self.io_flushes.set(self.io_flushes.get() + 1);
+        let mut attached = self.attached.borrow_mut();
+        let old = if root == 0 { attached.remove(&id) } else { attached.insert(id, root) };
+        Ok(old.unwrap_or(0))
+    }
+    fn io_flush(&self, _phys: &Phys, root: Paddr) {
+        assert!(self.attached.borrow().values().any(|r| *r == root), "a flush for an address space no device uses");
+        self.io_flushes.set(self.io_flushes.get() + 1);
+    }
+    fn io_release(&self, _phys: &Phys, root: Paddr) {
+        self.attached.borrow_mut().retain(|_, r| *r != root);
+    }
+    fn msi_first(&self) -> usize {
+        64
+    }
+    fn msi_route(&self, line: usize, cpu: usize, source: u64) -> Option<(u64, u64)> {
+        self.irq_log.borrow_mut().push(format!("message {line} cpu{cpu} from {source:#x}"));
+        Some((0xFEE0_0000 | (cpu as u64) << 12, 0x30 + line as u64))
     }
     fn init_root(&self, phys: &Phys, root: Paddr) {
         phys.write_val(root + 511 * 8, &0xDEAD_0000_0000_0003u64);
@@ -298,6 +341,10 @@ impl Machine {
             resets: Cell::new(0),
             forgets: Cell::new(0),
             irq_log: RefCell::new(Vec::new()),
+            io_top: Cell::new(1 << 48),
+            io_large: Cell::new(true),
+            attached: RefCell::new(std::collections::BTreeMap::new()),
+            io_flushes: Cell::new(0),
         };
         let base = ram.ptr.wrapping_sub(RAM_BASE as usize);
         // SAFETY: every physical address the kernel is told about lies in

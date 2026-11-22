@@ -67,6 +67,10 @@ pub enum Syscall {
     /// `a0` slot. Deletes every capability derived from this one.
     CapRevoke = 9,
     /// `a0` address space, `a1` frame, `a2` virtual address, `a3` rights.
+    /// In an address space made for devices ([`ASPACE_IO`]) the address is
+    /// the one the attached devices use to reach the frame, `READ` lets them
+    /// read it and `WRITE` write it; it must lie below the machine's
+    /// `RootInfo::dma_top`.
     Map = 10,
     /// `a0` frame. Removes this capability's mapping.
     Unmap = 11,
@@ -88,10 +92,18 @@ pub enum Syscall {
     /// bit 8 set for a write, `a3` value. Returns `a0` value read.
     PortIo = 15,
     /// `a0` interrupt-line capability, `a1` line, `a2` notification (0:
-    /// unbind), `a3` flags ([`IRQ_LEVEL`], [`IRQ_ACTIVE_LOW`]). From now on
-    /// an interrupt on the line signals the notification with the
-    /// capability's badge, on the processor of the calling thread. A
+    /// unbind), `a3` flags ([`IRQ_LEVEL`], [`IRQ_ACTIVE_LOW`], [`IRQ_MSI`]).
+    /// From now on an interrupt on the line signals the notification with
+    /// the capability's badge, on the processor of the calling thread. A
     /// level-triggered line is held off after each interrupt until `IrqAck`.
+    ///
+    /// With [`IRQ_MSI`] the line is not a wire: a device raises it by
+    /// writing a message, and the call returns that message (`a0` the
+    /// address, `a1` the data) for the driver to put in its device's MSI or
+    /// MSI-X registers. `a4` is then a device-identity capability and `a5`
+    /// the identity of the one device allowed to raise the line (enforced
+    /// where the machine remaps interrupts). `BadArg` for a line that is a
+    /// wire, `Unsupported` where the machine has no message interrupts.
     IrqBind = 16,
     /// `a0` interrupt-line capability, `a1` line. The device has been dealt
     /// with: let the line interrupt again.
@@ -104,6 +116,12 @@ pub enum Syscall {
     /// `a0` a Thread and `a1` 0: returns `a0` state (the `THREAD_` values),
     /// `a1` processor, `a2` instruction pointer, `a3` stack pointer, `a4`
     /// the identity of what it waits on.
+    /// `a0` a device-identity capability and `a1` a Frame, on a machine
+    /// that cannot confine DMA (`RootInfo::dma_top` is 0): returns `a0` the
+    /// frame's physical address, which is the address a device reaches it
+    /// at. `Unsupported` on a machine that confines DMA: there a device's
+    /// addresses are the ones its driver mapped, and physical addresses are
+    /// nobody's business.
     /// `a0` a SchedContext: returns `a0` class, `a1` weight (fair) or
     /// budget (deadline), `a2` period, `a3` budget left this period, `a4`
     /// nanoseconds charged to it so far, `a5` processor (deadline).
@@ -137,11 +155,22 @@ pub enum Syscall {
     /// change the class, or a deadline context's processor, while threads
     /// are bound to it.
     SchedConfigure = 21,
+    /// `a0` device-identity capability, `a1` a device's identity (its PCI
+    /// segment, bus, device and function: `segment << 16 | bus << 8 |
+    /// device << 3 | function`), `a2` an address space made for devices
+    /// ([`ASPACE_IO`]; write), or 0. From now on the device reaches exactly
+    /// the frames mapped in that address space, at the addresses they are
+    /// mapped at, and nothing else; with 0 it reaches nothing, which is how
+    /// every device starts and what it returns to when the address space is
+    /// destroyed. `Unsupported` on a machine that cannot confine DMA
+    /// (`RootInfo::dma_top` is 0) or for a device its IOMMU does not cover;
+    /// `NoMemory` when the kernel's device tables are full.
+    DeviceAttach = 22,
 }
 
 impl Syscall {
     /// One past the highest syscall number.
-    pub const COUNT: u64 = 19;
+    pub const COUNT: u64 = 23;
 
     /// Decode a syscall number.
     pub const fn from_u64(n: u64) -> Option<Syscall> {
@@ -168,6 +197,7 @@ impl Syscall {
             19 => Syscall::Console,
             20 => Syscall::PowerOff,
             21 => Syscall::SchedConfigure,
+            22 => Syscall::DeviceAttach,
             _ => return None,
         })
     }
@@ -177,6 +207,12 @@ impl Syscall {
 pub const IRQ_LEVEL: u64 = 1;
 /// `IrqBind` flag: the line is active low (default: active high).
 pub const IRQ_ACTIVE_LOW: u64 = 2;
+/// `IrqBind` flag: a message-signalled interrupt (MSI, MSI-X).
+pub const IRQ_MSI: u64 = 4;
+/// `Retype` of an AddressSpace, added to the size in bits: an address space
+/// for devices. Frames are mapped in it for the devices attached to it
+/// (`DeviceAttach`) to reach by DMA; no thread can run in it.
+pub const ASPACE_IO: u64 = 1 << 8;
 /// Number of interrupt lines the kernel can route.
 pub const IRQ_LINES: u64 = 192;
 
@@ -217,8 +253,9 @@ pub enum ObjectType {
     /// Processor time: a weighted fair share or a deadline reservation,
     /// which threads bound to it run on (`SchedConfigure`, `ThreadControl`).
     SchedContext = 8,
-    /// A range of hardware resources that are not memory: I/O ports or
-    /// interrupt lines. Created at boot, narrowed by `CapCopy`.
+    /// A range of hardware resources that are not memory: I/O ports,
+    /// interrupt lines or device identities. Created at boot, narrowed by
+    /// `CapCopy`.
     Hw = 9,
     /// A virtual CPU (M9).
     Vcpu = 10,
@@ -233,7 +270,7 @@ impl ObjectType {
             Self::Untyped if (SLOT_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => Ok(bits as u8),
             Self::Frame if (PAGE_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => Ok(bits as u8),
             Self::CapSpace if (1..=32).contains(&bits) => Ok(bits as u8 + SLOT_BITS),
-            Self::AddressSpace if (ASPACE_MIN_BITS as u64..=30).contains(&bits) => Ok(bits as u8),
+            Self::AddressSpace if (ASPACE_MIN_BITS as u64..=30).contains(&(bits & !ASPACE_IO)) => Ok(bits as u8),
             Self::Thread => Ok(THREAD_BITS),
             Self::Endpoint | Self::Notification => Ok(ENDPOINT_BITS),
             Self::SchedContext => Ok(SCHED_BITS),

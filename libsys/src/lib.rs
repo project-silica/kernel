@@ -23,9 +23,9 @@ use silica_abi::NONBLOCK;
 pub use silica_abi::Syscall;
 pub use silica_abi::root;
 pub use silica_abi::{
-    Error, FAULT_FETCH, FAULT_LABEL, FAULT_MAP, FAULT_PRESENT, FAULT_RESUME, FAULT_WRITE, Fault, IRQ_ACTIVE_LOW, IRQ_LEVEL, KEEP, MsgInfo,
-    ObjectType, Rights, SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING,
-    THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
+    ASPACE_IO, Error, FAULT_FETCH, FAULT_LABEL, FAULT_MAP, FAULT_PRESENT, FAULT_RESUME, FAULT_WRITE, Fault, IRQ_ACTIVE_LOW, IRQ_LEVEL,
+    IRQ_LINES, IRQ_MSI, KEEP, LARGE_BITS, MsgInfo, ObjectType, PAGE_BITS, Rights, SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_FAIR,
+    SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
 };
 
 /// Platform API level (`spec/CI_RELEASE.md` section 7).
@@ -312,6 +312,41 @@ pub fn port_out(ports: Cap, port: u16, width: u8, value: u32) -> Result<()> {
 /// line is held off until [`irq_ack`].
 pub fn irq_bind(lines: Cap, line: u32, notification: Cap, flags: u64) -> Result<()> {
     sys(Syscall::IrqBind, [lines.0, line as u64, notification.0, flags, 0, 0]).map(|_| ())
+}
+
+/// As [`irq_bind`] for a message-signalled line (one from
+/// `RootInfo::msi_first` up): only the device with identity `device`, which
+/// the device-identity capability `devices` must cover, may raise it. Returns
+/// the message (address, data) for the device's MSI or MSI-X registers.
+pub fn irq_bind_msi(lines: Cap, line: u32, notification: Cap, devices: Cap, device: u32) -> Result<(u64, u64)> {
+    sys(Syscall::IrqBind, [lines.0, line as u64, notification.0, IRQ_MSI, devices.0, device as u64]).map(|r| (r[0], r[1]))
+}
+
+/// A new address space for devices, with `2^bits` bytes for its tables (at
+/// least 14), in slot `slot` of `space`. Frames mapped in it ([`map`]; the
+/// address is the device's) are what the devices attached to it
+/// ([`device_attach`]) reach by DMA. `Unsupported` on a machine that cannot
+/// confine DMA.
+pub fn retype_io_space(untyped: Cap, bits: u8, space: Cap, slot: u64) -> Result<()> {
+    sys(Syscall::Retype, [untyped.0, ObjectType::AddressSpace as u64, bits as u64 | ASPACE_IO, space.0, slot, 1]).map(|_| ())
+}
+
+/// From now on the device with identity `device` (covered by `devices`)
+/// reaches exactly what is mapped in the device address space `io_space`.
+pub fn device_attach(devices: Cap, device: u32, io_space: Cap) -> Result<()> {
+    sys(Syscall::DeviceAttach, [devices.0, device as u64, io_space.0, 0, 0, 0]).map(|_| ())
+}
+
+/// From now on the device with identity `device` reaches no memory.
+pub fn device_detach(devices: Cap, device: u32) -> Result<()> {
+    sys(Syscall::DeviceAttach, [devices.0, device as u64, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// The physical address of `frame`, on a machine that cannot confine DMA,
+/// for the holder of authority over devices: where a device reaches it.
+/// `Unsupported` on a machine that confines DMA.
+pub fn frame_address(devices: Cap, frame: Cap) -> Result<u64> {
+    sys(Syscall::Inspect, [devices.0, frame.0, 0, 0, 0, 0]).map(|r| r[0])
 }
 
 /// Stop delivering interrupt line `line`.

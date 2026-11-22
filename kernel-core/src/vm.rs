@@ -4,6 +4,12 @@
 //! An AddressSpace object of `2^bits` bytes is a header page, the root
 //! table, and `2^(bits-12) - 2` pages that become page tables on demand.
 //! When they run out, `Map` fails with `NoMemory`.
+//!
+//! An address space made for devices (`ASPACE_IO`) is the same object with
+//! tables in the IOMMU's format: the frames mapped in it are what the
+//! devices attached to it reach by DMA, at the addresses they are mapped
+//! at. Its first table page is put under the root's entry 0 when it is
+//! made, so an IOMMU that walks one level less can be pointed at it.
 
 use crate::cap::{FLAG_DEVICE, MAPPED};
 use crate::hal::Hal;
@@ -21,6 +27,10 @@ pub struct AsHeader {
     pub(crate) used: Cell<u64>,
     /// First slot in the list of frame capabilities mapped here.
     pub(crate) maps: Cell<Paddr>,
+    /// Not 0: an address space for devices.
+    pub(crate) io: Cell<u64>,
+    /// Devices attached to it (a device address space).
+    pub(crate) attached: Cell<u64>,
 }
 impl KObj for AsHeader {}
 
@@ -29,6 +39,35 @@ const PAGE: u64 = 1 << PAGE_BITS;
 impl<H: Hal> Kernel<H> {
     pub(crate) fn aspace(&self, a: Paddr) -> &AsHeader {
         self.phys.obj(a)
+    }
+
+    /// Make the new AddressSpace object at `a` one for devices.
+    pub(crate) fn init_io_space(&self, a: Paddr) {
+        let h = self.aspace(a);
+        h.io.set(1);
+        h.used.set(1);
+        self.phys.word(a + PAGE).set(H::io_pte_table(a + 2 * PAGE));
+    }
+
+    /// The level frames of `2^bits` bytes are mapped at in an address
+    /// space (`io`: one for devices), and the bytes one entry there maps.
+    fn leaf(&self, bits: u8, io: bool) -> (u8, u64) {
+        if bits >= LARGE_BITS && (!io || self.hal.io_large()) { (1, 1 << LARGE_BITS) } else { (0, PAGE) }
+    }
+
+    /// The device with identity `id` reaches memory through the device
+    /// address space `a` from now on (0: reaches nothing).
+    pub(crate) fn attach(&self, id: u64, a: Paddr) -> Result<(), Error> {
+        let old = self.hal.io_attach(&self.phys, id, if a == 0 { 0 } else { a + PAGE })?;
+        if old != 0 {
+            let h = self.aspace(old - PAGE);
+            h.attached.set(h.attached.get() - 1);
+        }
+        if a != 0 {
+            let h = self.aspace(a);
+            h.attached.set(h.attached.get() + 1);
+        }
+        Ok(())
     }
 
     /// Walk to the requested level, stopping at a missing entry or a leaf.
@@ -94,14 +133,17 @@ impl<H: Hal> Kernel<H> {
             // W^X: no mapping is both writable and executable.
             return Err(if cap.rights.has(rights) { Error::BadArg } else { Error::NoRights });
         }
-        let (level, step) = if cap.bits >= LARGE_BITS { (1u8, 1u64 << LARGE_BITS) } else { (0u8, PAGE) };
+        let h = self.aspace(a);
+        let io = h.io.get() != 0;
+        let (level, step) = self.leaf(cap.bits, io);
         let size = 1u64 << cap.bits;
-        if !vaddr.is_multiple_of(step) || vaddr >= H::USER_TOP || size > H::USER_TOP - vaddr {
+        let top = if io { self.hal.io_top() } else { H::USER_TOP };
+        // Executing means nothing to a device.
+        if !vaddr.is_multiple_of(step) || vaddr >= top || size > top - vaddr || (io && rights.has(Rights::EXEC)) {
             return Err(Error::BadArg);
         }
         self.check_map(a, vaddr, vaddr + size, level)?;
         let device = cap.flags & FLAG_DEVICE != 0;
-        let h = self.aspace(a);
         for i in 0..size / step {
             let va = vaddr + i * step;
             let (mut entry, at) = self.walk(a, va, level);
@@ -110,10 +152,14 @@ impl<H: Hal> Kernel<H> {
                 let page = a + (used + 2) * PAGE;
                 self.phys.zero(page, PAGE);
                 h.used.set(used + 1);
-                entry.set(H::pte_table(page));
+                entry.set(if io { H::io_pte_table(page) } else { H::pte_table(page) });
                 entry = self.phys.word(page + ((va >> (PAGE_BITS + 9 * child)) & 511) * 8);
             }
-            entry.set(H::pte_leaf(cap.obj + i * step, rights, level, device));
+            let frame = cap.obj + i * step;
+            entry.set(if io { H::io_pte_leaf(frame, rights, level) } else { H::pte_leaf(frame, rights, level, device) });
+        }
+        if io && h.attached.get() != 0 {
+            self.hal.io_mapped(&self.phys, a + PAGE);
         }
         slot.badge.set(vaddr | MAPPED);
         slot.aux.set(a);
@@ -134,15 +180,24 @@ impl<H: Hal> Kernel<H> {
             return;
         }
         let (a, vaddr) = (slot.aux.get(), slot.badge.get() & !(PAGE - 1));
-        let (level, step) = if cap.bits >= LARGE_BITS { (1u8, 1u64 << LARGE_BITS) } else { (0u8, PAGE) };
+        let h = self.aspace(a);
+        let io = h.io.get() != 0;
+        let (level, step) = self.leaf(cap.bits, io);
         let size = 1u64 << cap.bits;
         for i in 0..size / step {
             let (entry, at) = self.walk(a, vaddr + i * step, level);
             debug_assert_eq!(at, level);
             entry.set(0);
         }
-        self.hal.tlb_flush(a + PAGE, vaddr, size);
-        self.shoot_down(a + PAGE);
+        if io {
+            // Nothing is cached of an address space no device uses.
+            if h.attached.get() != 0 {
+                self.hal.io_flush(&self.phys, a + PAGE);
+            }
+        } else {
+            self.hal.tlb_flush(a + PAGE, vaddr, size);
+            self.shoot_down(a + PAGE);
+        }
         let (p, n) = (slot.mprev.get(), slot.mnext.get());
         if p != 0 {
             self.slot(p).mnext.set(n);
@@ -171,6 +226,14 @@ impl<H: Hal> Kernel<H> {
             slot.mnext.set(0);
             s = n;
         }
+        if h.io.get() != 0 {
+            // Its devices reach nothing from here on: the memory of its
+            // tables and of the frames that were mapped can be reused.
+            if h.attached.replace(0) != 0 {
+                self.hal.io_release(&self.phys, a + PAGE);
+            }
+            return;
+        }
         self.hal.leave_aspace(a + PAGE);
         let me = self.me();
         if me.loaded_root.get() == a + PAGE {
@@ -197,6 +260,11 @@ impl<H: Hal> Kernel<H> {
                 self.hal.tlb_forget(root, i);
             }
         }
+    }
+
+    /// How many devices are attached to the device address space `a`, for tests.
+    pub fn attached_to(&self, a: Paddr) -> u64 {
+        self.aspace(a).attached.get()
     }
 
     /// The physical address `vaddr` maps to in `a`, for tests and the loader of the root task.
