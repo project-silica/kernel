@@ -1226,3 +1226,15 @@ fn deadline_max_waits_for_ever() {
 fn slice_end_saturates_near_the_end_of_time() {
     support::fuzz::run(include_bytes!("../fuzz/corpus/syscalls/slice-end-overflows-near-time-max"));
 }
+
+/// Found by the syscall fuzzer, and a mistake of its own: it went on
+/// writing a thread's message words into the frame that had been the
+/// thread's IPC buffer after the frame was revoked and its memory made
+/// into CapSpaces, which no thread can do (its mapping goes with the
+/// frame). The write now goes to the buffer the kernel holds for the
+/// thread, if any; the sequence is kept because it revokes buffers and
+/// reuses their memory while messages are in flight.
+#[test]
+fn a_revoked_ipc_buffer_is_not_written_by_its_thread() {
+    support::fuzz::run(include_bytes!("../fuzz/corpus/syscalls/buffer-written-after-its-frame-was-revoked"));
+}

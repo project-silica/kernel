@@ -58,15 +58,14 @@ impl Src<'_> {
 pub fn run(data: &[u8]) {
     let m = Machine::with_cpus(8, 2);
     let (ut, d) = m.big_untyped();
+    let mut threads = vec![m.root];
     for i in 0..3 {
-        m.spawn(ut, THREADS + i);
+        threads.push(m.spawn(ut, THREADS + i));
     }
     // Every thread has an IPC buffer, so messages can carry capabilities.
-    let mut buffers = vec![m.cap(SLOT_IPCBUF).unwrap().obj];
     for i in 0..3 {
         m.retype(ut, T::Frame, 12, THREADS + 4 + i, 1);
         m.ok(S::ThreadConfigure, [THREADS + i, KEEP, KEEP, KEEP, THREADS + 4 + i, 0]);
-        buffers.push(m.cap(THREADS + 4 + i).unwrap().obj);
     }
     // One of them starts out on the second processor.
     m.ok(S::ThreadControl, [THREADS + 2, 2, 1, 0, 0, 0]);
@@ -117,10 +116,17 @@ pub fn run(data: &[u8]) {
             252..=255 => {
                 let (Some(b), Some(v)) = (src.byte(), src.arg(ut)) else { break };
                 let base = if b & 4 == 0 { silica_abi::IPC_CAPS } else { silica_abi::IPC_RECV };
-                let buffer = buffers[op as usize & 3];
-                // The buffer may have been unmapped or freed by now; the
-                // write goes to machine memory either way, as a thread's would.
-                m.k.phys.write_val(buffer + (base + (b as usize >> 3 & 3) * 8) as u64, &(v | (b as u64 >> 6) << 60));
+                // The write goes to the frame the kernel holds as that
+                // thread's buffer now. A thread whose buffer was revoked
+                // has no mapping of it left to write through (the frame's
+                // memory may be another object by then), and a thread that
+                // was itself destroyed writes nothing.
+                let t = threads[op as usize & 3];
+                let alive = (0..4)
+                    .any(|i| m.cap(if i == 0 { SLOT_THREAD } else { THREADS + i - 1 }).is_some_and(|c| c.ty == T::Thread && c.obj == t));
+                if alive && let Some(f) = m.k.view(m.k.thread_view(t).slots[3]).filter(|f| f.cap.ty == T::Frame) {
+                    m.k.phys.write_val(f.cap.obj + (base + (b as usize >> 3 & 3) * 8) as u64, &(v | (b as u64 >> 6) << 60));
+                }
                 continue;
             }
             _ => {}

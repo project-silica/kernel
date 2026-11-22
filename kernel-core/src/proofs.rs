@@ -102,6 +102,7 @@ impl Hal for ProofHal {
         0
     }
     fn console(&self, _: &[u8]) {}
+    fn power_off(&self, _: u64) {}
 }
 
 /// A kernel over `mem`.
