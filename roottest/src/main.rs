@@ -1319,6 +1319,8 @@ unsafe extern "C" {
     static stub_echo_end: u8;
     static stub_yield: u8;
     static stub_yield_end: u8;
+    static stub_spin: u8;
+    static stub_spin_end: u8;
 }
 
 fn stub(start: *const u8, end: *const u8) -> &'static [u8] {
@@ -1490,6 +1492,49 @@ fn bench_timer() {
     println!("BENCH timer_overshoot_p99 {} ns", s[count - count / 100 - 1]);
 }
 
+/// Wake-up latencies of the scheduling benchmark, in 100 ns steps up to
+/// 2 ms (the last bucket holds everything later; the maximum is kept apart).
+static LATENCY: [AtomicU64; 20_001] = [const { AtomicU64::new(0) }; 20_001];
+
+/// Scheduling latency under load (spec/TESTING.md section 4.2): every
+/// processor busy with a thread of its own address space that computes and
+/// never waits, and on processor 0, beside its load, a thread that sleeps
+/// 1 ms at a time for `seconds` seconds, timing how late it runs again.
+/// Both at the same (fair) priority, as the Linux baseline's are. Prints
+/// the 99.9th percentile and the maximum.
+fn bench_sched(seconds: u64) {
+    let cpus = CPUS.load(SeqCst).min(64) as usize;
+    let mut hogs = [Cap(0); 64];
+    for (cpu, h) in hogs.iter_mut().enumerate().take(cpus) {
+        *h = foreign_thread_on(cpu, stub(&raw const stub_spin, &raw const stub_spin_end), 0);
+    }
+    let n = new(ObjectType::Notification, 0);
+    for b in &LATENCY {
+        b.store(0, SeqCst);
+    }
+    let (end, mut count, mut max) = (CLOCK.now() + seconds * 1_000_000_000, 0u64, 0u64);
+    while CLOCK.now() < end {
+        let at = CLOCK.now() + 1_000_000;
+        let _ = recv(n, Wait::Until(at));
+        let late = CLOCK.now().saturating_sub(at);
+        max = max.max(late);
+        LATENCY[(late / 100).min(20_000) as usize].fetch_add(1, SeqCst);
+        count += 1;
+    }
+    for &h in &hogs[..cpus] {
+        // SAFETY: the load threads are used by nothing else.
+        let _ = unsafe { cap_delete(h) };
+    }
+    let mut seen = 0;
+    let want = count - count / 1000;
+    let p999 = LATENCY.iter().position(|b| {
+        seen += b.load(SeqCst);
+        seen >= want
+    });
+    println!("BENCH sched_latency_p999 {} ns", p999.unwrap_or(20_000) as u64 * 100 + 100);
+    println!("BENCH sched_latency_max {max} ns");
+}
+
 static GO: AtomicU64 = AtomicU64::new(0);
 static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
@@ -1568,6 +1613,8 @@ fn bench() -> ! {
             println!("BENCH ipc_cross_scaling {}.{:02} x", four / one, four * 100 / one % 100);
         }
     }
+    // Two minutes a boot: five boots make the ten minutes the gate asks for.
+    bench_sched(120);
     println!("BENCH DONE");
     exit(true)
 }
@@ -1822,6 +1869,11 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
             Some(i) => (&arg[..i], core::str::from_utf8(&arg[i + 1..]).ok().and_then(|n| n.parse().ok()).unwrap_or(0)),
             None => (arg, 1),
         };
+        if name == b"sched" {
+            bench_sched(times);
+            println!("BENCH DONE");
+            exit(true)
+        }
         let f: fn() = match name {
             b"null" => bench_null_syscall,
             b"ipc" => bench_ipc,
@@ -1831,7 +1883,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
             b"pairs8" => || println!("BENCH ipc_pairs8 {} ops/s", bench_pairs(8, false)),
             b"cross1" => || println!("BENCH ipc_cross_pairs1 {} ops/s", bench_pairs(1, true)),
             _ => {
-                println!("ERROR: roottest: no benchmark of that name (null, ipc, ctx, fault, timer, pairs8, cross1)");
+                println!("ERROR: roottest: no benchmark of that name (null, ipc, ctx, fault, timer, pairs8, cross1; sched:<seconds>)");
                 exit(false)
             }
         };

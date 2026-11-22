@@ -194,7 +194,7 @@ pub fn timed_yield(v: u64) -> u64 {
 // no data. x0 holds the thread's argument.
 core::arch::global_asm!(
     ".section .text.stubs, \"ax\"",
-    ".global stub_echo, stub_echo_end, stub_yield, stub_yield_end",
+    ".global stub_echo, stub_echo_end, stub_yield, stub_yield_end, stub_spin, stub_spin_end",
     // An echo server on the endpoint in x0: ReplyRecv (3) for ever. The
     // reply is the request, because the message registers are left as received.
     "stub_echo:",
@@ -213,4 +213,9 @@ core::arch::global_asm!(
     "svc #0",
     "b 3b",
     "stub_yield_end:",
+    // Compute for ever, never entering the kernel: a processor's load.
+    "stub_spin:",
+    "4: yield",
+    "b 4b",
+    "stub_spin_end:",
 );
