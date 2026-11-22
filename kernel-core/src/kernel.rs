@@ -726,7 +726,7 @@ impl<H: Hal> Kernel<H> {
                 if cap.flags & FLAG_CONSOLE == 0 {
                     return Err(Error::WrongType);
                 }
-                let n = a[1] as usize;
+                let (n, more) = ((a[1] & !silica_abi::CONSOLE_MORE) as usize, a[1] & silica_abi::CONSOLE_MORE != 0);
                 if n > 32 {
                     return Err(Error::BadArg);
                 }
@@ -734,9 +734,27 @@ impl<H: Hal> Kernel<H> {
                 for (i, w) in a[2..6].iter().enumerate() {
                     bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
                 }
-                // A thread object is aligned: its address with the low bit set is
-                // never 0 nor the kernel.
-                crate::log::write(&self.hal, t | 1, &bytes[..n]);
+                let th = self.thread(t);
+                let mut line = [0u8; crate::thread::LINE_WORDS * 8];
+                let held = th.line_len.get() as usize;
+                for (i, w) in th.line.iter().enumerate() {
+                    line[i * 8..i * 8 + 8].copy_from_slice(&w.get().to_le_bytes());
+                }
+                // A thread object is aligned: its address with the low bit
+                // set is never 0 nor the kernel.
+                let writer = t | 1;
+                if more && held + n <= line.len() {
+                    // Held until the last piece, so the whole reaches the
+                    // console together.
+                    line[held..held + n].copy_from_slice(&bytes[..n]);
+                    for (i, w) in th.line.iter().enumerate() {
+                        w.set(u64::from_le_bytes(line[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8])));
+                    }
+                    th.line_len.set((held + n) as u64);
+                } else {
+                    crate::log::write_parts(&self.hal, writer, &[&line[..held], &bytes[..n]]);
+                    th.line_len.set(0);
+                }
                 Ok(Exit::Done)
             }
             Syscall::PowerOff => {

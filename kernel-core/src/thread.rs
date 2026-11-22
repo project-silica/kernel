@@ -87,8 +87,15 @@ pub struct Thread {
     /// capability slot it named it through.
     pub(crate) listen: Cell<Paddr>,
     pub(crate) listen_slot: Cell<Paddr>,
+    /// Console text the thread has written with more to follow
+    /// (`Syscall::Console`), written out whole with the last piece.
+    pub(crate) line: [Cell<u64>; LINE_WORDS],
+    pub(crate) line_len: Cell<u64>,
 }
 impl KObj for Thread {}
+
+/// Words of a thread's console line (`Thread::line`): 192 bytes.
+pub const LINE_WORDS: usize = 24;
 const _: () = assert!(core::mem::size_of::<Thread>() <= FPU_OFFSET);
 
 impl Thread {

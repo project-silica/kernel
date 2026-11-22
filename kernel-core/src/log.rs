@@ -18,16 +18,21 @@ pub const KERNEL: u64 = u64::MAX;
 /// another starts a fresh one, so a program's prompt and a kernel line never
 /// share a line, and every line a reader anchors on starts where it should.
 pub fn write<H: Hal>(hal: &H, writer: u64, bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
+    write_parts(hal, writer, &[bytes]);
+}
+
+/// [`write()`] of `parts`, one after another, with nobody else's text among them.
+pub fn write_parts<H: Hal>(hal: &H, writer: u64, parts: &[&[u8]]) {
+    let Some(last) = parts.iter().rev().find_map(|p| p.last()) else { return };
     LINE.lock();
     let open = OPEN.load(Ordering::Relaxed);
     if open != 0 && open != writer {
         hal.console(b"\r\n");
     }
-    hal.console(bytes);
-    OPEN.store(if bytes.last() == Some(&b'\n') { 0 } else { writer }, Ordering::Relaxed);
+    for p in parts.iter().filter(|p| !p.is_empty()) {
+        hal.console(p);
+    }
+    OPEN.store(if *last == b'\n' { 0 } else { writer }, Ordering::Relaxed);
     LINE.unlock();
 }
 

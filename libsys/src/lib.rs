@@ -322,14 +322,17 @@ pub fn port_in(ports: Cap, port: u16, width: u8) -> Result<u32> {
 }
 
 /// Write `bytes` to the kernel's console through a console capability, 32
-/// bytes per system call.
+/// bytes per system call. Up to 224 bytes reach the console whole, with
+/// nobody else's text among them (`Syscall::Console`).
 pub fn console_write(console: Cap, bytes: &[u8]) -> Result<()> {
-    for chunk in bytes.chunks(32) {
+    let pieces = bytes.len().div_ceil(32);
+    for (k, chunk) in bytes.chunks(32).enumerate() {
         let mut w = [0u64; 4];
         for (i, b) in chunk.iter().enumerate() {
             w[i / 8] |= (*b as u64) << (i % 8 * 8);
         }
-        sys(Syscall::Console, [console.0, chunk.len() as u64, w[0], w[1], w[2], w[3]])?;
+        let more = if k + 1 < pieces { silica_abi::CONSOLE_MORE } else { 0 };
+        sys(Syscall::Console, [console.0, chunk.len() as u64 | more, w[0], w[1], w[2], w[3]])?;
     }
     Ok(())
 }

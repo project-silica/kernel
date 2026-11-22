@@ -144,11 +144,16 @@ pub enum Syscall {
     /// (`a2` must otherwise be 0.)
     Inspect = 18,
     /// `a0` console capability (the root task's [`root::SLOT_CONSOLE`] or
-    /// one derived from it), `a1` number of bytes (at most 32), `a2` to `a5`
+    /// one derived from it), `a1` number of bytes (at most 32), with
+    /// [`CONSOLE_MORE`] when more of the same text follows, `a2` to `a5`
     /// the bytes, eight to a register, lowest address in the low byte.
-    /// Writes them to the console the kernel logs to, so a program's lines
-    /// and the kernel's never tear each other. For bring-up and panics; the
-    /// logging service replaces it for everything else.
+    /// Writes them to the console the kernel logs to. A piece with more to
+    /// follow is held (up to 192 bytes) and written out with the piece
+    /// that ends the text, so text of up to 224 bytes reaches the console
+    /// whole: nobody else's (a kernel line, another program's) comes in
+    /// between, and a writer that finds another's line unfinished starts a
+    /// fresh one. For bring-up and panics; the logging service replaces it
+    /// for everything else.
     Console = 19,
     /// `a0` power capability (the root task's [`root::SLOT_POWER`]), `a1`
     /// status (0: success), `a2` 0 to turn the machine off, 1 to reset it.
@@ -230,6 +235,9 @@ pub const IRQ_MSI: u64 = 4;
 /// for devices. Frames are mapped in it for the devices attached to it
 /// (`DeviceAttach`) to reach by DMA; no thread can run in it.
 pub const ASPACE_IO: u64 = 1 << 8;
+/// `Console`: more of the same text follows this piece (bit 63 of `a1`).
+pub const CONSOLE_MORE: u64 = 1 << 63;
+
 /// Number of interrupt lines the kernel can route.
 pub const IRQ_LINES: u64 = 192;
 
