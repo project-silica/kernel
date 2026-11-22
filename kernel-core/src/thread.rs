@@ -331,6 +331,11 @@ impl<H: Hal> Kernel<H> {
                         th.regs[H::ARG[1]].set(0);
                         th.regs[H::ARG[2]].set(0);
                     }
+                    // A `SignalRecv` waiting here has signalled already:
+                    // made again, it must only receive.
+                    if th.regs[H::SYS].get() == Syscall::SignalRecv as u64 {
+                        th.regs[H::SYS].set(Syscall::Recv as u64);
+                    }
                 }
             }
             REPLY => {

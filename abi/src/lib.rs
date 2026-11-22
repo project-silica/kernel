@@ -34,12 +34,8 @@ pub enum Syscall {
     /// `a0` endpoint or notification (its low 32 bits), `a1` deadline in
     /// monotonic nanoseconds (0 or `u64::MAX`: wait for ever, 1: do not
     /// block), `a2` for an endpoint: a notification to park the next call on
-    /// (0: none), `a3` a notification to signal first, as `Send` does (0:
-    /// none; the signal is made even if the receive then fails): the
-    /// wake-up a thread gives its peer before waiting for the answer, in
-    /// the same kernel entry. Returns `a0` badge, `a1` [`MsgInfo`],
-    /// `a2..a5` words. For a notification `a0` is the pending word,
-    /// cleared by the read.
+    /// (0: none). Returns `a0` badge, `a1` [`MsgInfo`], `a2..a5` words.
+    /// For a notification `a0` is the pending word, cleared by the read.
     ///
     /// Receiving on an endpoint can listen on a notification as well: bits
     /// 32 to 62 of `a0` name it (0: none; [`LISTEN_SHIFT`]). If it has been
@@ -192,11 +188,20 @@ pub enum Syscall {
     /// (`RootInfo::dma_top` is 0) or for a device its IOMMU does not cover;
     /// `NoMemory` when the kernel's device tables are full.
     DeviceAttach = 22,
+    /// Signal the notification `a3` as `Send` does, then `Recv` with
+    /// `a0..a2` as `Recv` takes them: the wake-up a thread gives its peer
+    /// and its own wait for the answer, in one kernel entry, so a peer on
+    /// the same processor runs at once. A signal that cannot be made (not a
+    /// notification, not writable) fails the call before anything else; once
+    /// made it stands, and a receive made again (preempted, restarted) is a
+    /// plain `Recv`. A call of its own rather than an argument of `Recv`, so
+    /// that every other receive pays nothing for it.
+    SignalRecv = 23,
 }
 
 impl Syscall {
     /// One past the highest syscall number.
-    pub const COUNT: u64 = 23;
+    pub const COUNT: u64 = 24;
 
     /// Decode a syscall number.
     pub const fn from_u64(n: u64) -> Option<Syscall> {
@@ -224,6 +229,7 @@ impl Syscall {
             20 => Syscall::PowerOff,
             21 => Syscall::SchedConfigure,
             22 => Syscall::DeviceAttach,
+            23 => Syscall::SignalRecv,
             _ => return None,
         })
     }

@@ -717,6 +717,44 @@ fn a_server_stopped_in_reply_recv_after_replying_only_receives_when_it_runs_agai
 }
 
 #[test]
+fn a_signal_recv_made_again_only_receives() {
+    let (m, t) = two_processors();
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE + 3, 1);
+    // t, on processor 1, signals the notification and waits on the endpoint.
+    m.on(1);
+    assert!(m.raw(S::SignalRecv as u64, [FREE, 0, 0, FREE + 3, 0, 0]).blocked);
+    let ip = m.k.regs(t)[0].get();
+    m.on(0);
+    m.ok(S::Recv, [FREE + 3, 1, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 1, "signalled once");
+    // Moved while it waits, its call is made again: as a receive alone.
+    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    let r = m.k.regs(t);
+    assert_eq!((r[0].get(), r[3].get(), m.arg(t, 0)), (ip - 2, S::Recv as u64, FREE));
+    assert_eq!(m.arg(t, 3), FREE + 3, "the notification is still in its registers");
+    // Running again, the call it makes from its registers waits on the
+    // endpoint and signals nothing.
+    for _ in 0..1000 {
+        if m.k.current() == t {
+            break;
+        }
+        m.k.regs(m.k.current())[TestHal::SYS].set(S::Yield as u64);
+        m.k.enter();
+        m.k.syscall();
+        m.k.schedule();
+        m.k.leave();
+    }
+    assert_eq!(m.k.current(), t);
+    m.k.enter();
+    m.k.syscall();
+    m.k.leave();
+    assert_ne!(m.k.thread_view(t).blocked_on, 0, "waiting on the endpoint again");
+    m.on(0);
+    assert_eq!(m.err(S::Recv, [FREE + 3, 1, 0, 0, 0, 0]), Error::WouldBlock, "not signalled a second time");
+}
+
+#[test]
 fn a_system_call_overtaken_while_it_waits_for_a_lock_is_made_again() {
     // Thread t, on processor 1, has entered a system call and waits for its
     // lock, which processor 0 holds to stop it: the call has not happened.
@@ -1550,26 +1588,26 @@ fn a_receive_can_signal_a_notification_first() {
     let peer = m.spawn(ut, FREE + 3);
     assert!(m.sys_as(peer, S::Recv, [theirs, 0, 0, 0, 0, 0]).blocked);
     // Signal `theirs` (badge 0b100), then look at `mine` without waiting.
-    assert_eq!(m.err(S::Recv, [mine, 1, 0, FREE + 2, 0, 0]), Error::WouldBlock, "then the receive found nothing");
+    assert_eq!(m.err(S::SignalRecv, [mine, 1, 0, FREE + 2, 0, 0]), Error::WouldBlock, "then the receive found nothing");
     assert_eq!((m.k.thread_view(peer).state, m.arg(peer, 0)), (RUNNABLE, 0b100), "the peer was woken first");
     // Waiting: the signal, then the wait, which the peer's own signal ends.
-    assert!(m.sys(S::Recv, [mine, 0, 0, FREE + 2, 0, 0]).blocked);
+    assert!(m.sys(S::SignalRecv, [mine, 0, 0, FREE + 2, 0, 0]).blocked);
     m.sys_as(peer, S::Send, [mine, 0, 0, 0, 0, 0]);
     assert_eq!((m.k.thread_view(m.root).state, m.status(m.root), m.arg(m.root, 0)), (RUNNABLE, 0, 1));
     m.ok(S::Recv, [theirs, 1, 0, 0, 0, 0]);
     assert_eq!(m.arg(m.root, 0), 0b100, "the second wait signalled the peer's notification too");
     // A signal already pending on `mine` is received at once, after the signal.
     m.ok(S::Send, [mine, 0, 0, 0, 0, 0]);
-    m.ok(S::Recv, [mine, 1, 0, FREE + 2, 0, 0]);
+    m.ok(S::SignalRecv, [mine, 1, 0, FREE + 2, 0, 0]);
     assert_eq!(m.arg(m.root, 0), 1);
     m.ok(S::Recv, [theirs, 1, 0, 0, 0, 0]);
     assert_eq!(m.arg(m.root, 0), 0b100);
     // The notification to signal must be one, and writable: otherwise
     // nothing is signalled and nothing received.
     m.ok(S::Send, [mine, 0, 0, 0, 0, 0]);
-    assert_eq!(m.err(S::Recv, [mine, 1, 0, FREE + 9, 0, 0]), Error::BadCap);
+    assert_eq!(m.err(S::SignalRecv, [mine, 1, 0, FREE + 9, 0, 0]), Error::BadCap);
     m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 9, theirs, 1, 0, 0]);
-    assert_eq!(m.err(S::Recv, [mine, 1, 0, FREE + 9, 0, 0]), Error::NoRights);
+    assert_eq!(m.err(S::SignalRecv, [mine, 1, 0, FREE + 9, 0, 0]), Error::NoRights);
     m.ok(S::Recv, [mine, 1, 0, 0, 0, 0]);
     assert_eq!(m.arg(m.root, 0), 1, "the failed receives took nothing");
 }

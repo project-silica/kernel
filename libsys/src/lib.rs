@@ -162,14 +162,16 @@ pub fn recv_with(from: Cap, notification: Cap, wait: Wait, park: Cap) -> Result<
 /// does: in one kernel entry, the wake-up a thread gives its peer and its
 /// wait for the answer. A peer on the same processor then runs at once,
 /// with nobody left to share the processor with. The signal is made even
-/// when the receive then fails.
+/// when the receive then fails. With `wake` [`Cap::NONE`] nothing is
+/// signalled: it is the receive alone (`Recv`, not `SignalRecv`).
 pub fn signal_recv(wake: Cap, from: Cap, notification: Cap, wait: Wait) -> Result<Message> {
     let deadline = match wait {
         Wait::Forever => 0,
         Wait::Poll => 1,
         Wait::Until(t) => t.max(2),
     };
-    sys(Syscall::Recv, [from.0 | notification.0 << LISTEN_SHIFT, deadline, 0, wake.0, 0, 0]).map(message)
+    let call = if wake == Cap::NONE { Syscall::Recv } else { Syscall::SignalRecv };
+    sys(call, [from.0 | notification.0 << LISTEN_SHIFT, deadline, 0, wake.0, 0, 0]).map(message)
 }
 
 /// Receive from an endpoint; if what arrives is a call, park it on the

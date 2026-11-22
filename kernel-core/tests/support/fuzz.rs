@@ -162,7 +162,7 @@ pub fn run(data: &[u8]) {
             // never waits, and it does not stop or restart itself.
             match S::from_u64(n) {
                 Some(S::Call) => n = S::Send as u64,
-                Some(S::Recv) => a[1] = 1,
+                Some(S::Recv | S::SignalRecv) => a[1] = 1,
                 Some(S::ReplyRecv) => a[0] = 0,
                 Some(S::ThreadStart | S::ThreadControl) if a[0] == SLOT_THREAD => continue,
                 _ => {}

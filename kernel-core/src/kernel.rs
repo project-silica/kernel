@@ -208,12 +208,8 @@ impl<H: Hal> Kernel<H> {
             Syscall::Yield | Syscall::PortIo | Syscall::Map | Syscall::Console | Syscall::PowerOff => true,
             // Passing capabilities changes capability slots.
             Syscall::Call | Syscall::Send => MsgInfo(a[1]).caps() == 0 && queue(a[0] & !NONBLOCK),
-            Syscall::Recv => {
-                queue(crate::ipc::recv_slot(a[0]))
-                    && self.park_is_local(h, t, a[2])
-                    && self.listen_is_local(h, t, a[0])
-                    && (a[3] == 0 || queue(a[3]))
-            }
+            Syscall::Recv => queue(crate::ipc::recv_slot(a[0])) && self.park_is_local(h, t, a[2]) && self.listen_is_local(h, t, a[0]),
+            Syscall::SignalRecv => self.signal_recv_is_local(h, t, a),
             Syscall::ReplyRecv => {
                 // The reply unlinks the caller from the endpoint its call came through.
                 let c = self.thread(t).caller.get();
@@ -225,42 +221,85 @@ impl<H: Hal> Kernel<H> {
         }
     }
 
+    /// For [`Kernel::partner`], of the queue in slot `index`: its owner, or
+    /// (the queue being this processor's) the home of the thread at its head
+    /// or of that thread's caller.
+    #[inline(always)]
+    fn queue_partner(&self, t: Paddr, index: u64, me: u64) -> Option<usize> {
+        let other = |cpu: u64| (cpu != me).then_some(cpu as usize);
+        let cap = self.cslot(t, index).ok().and_then(|slot| self.slot(slot).cap())?;
+        if !matches!(cap.ty, ObjectType::Endpoint | ObjectType::Notification) {
+            return None;
+        }
+        let q = self.queue(cap.obj);
+        match q.owner.get() {
+            0 => return None,
+            o if o != me + 1 => return Some(o as usize - 1),
+            _ => {}
+        }
+        let head = q.head.get();
+        if head == 0 {
+            return None;
+        }
+        let th = self.thread(head);
+        if th.cpu.get() != me {
+            return other(th.cpu.get());
+        }
+        if q.kind.get() == crate::ipc::PARKED {
+            return self.queue(th.via.get()).owner.get().checked_sub(1).and_then(other);
+        }
+        let c = th.caller.get();
+        if c != 0 { other(self.thread(c).cpu.get()) } else { None }
+    }
+
+    // `SignalRecv`, out of line in each of the three places it is decided
+    // and made: inlined, the dispatch's code around it cost every path
+    // through it for the registers it took (16 instructions a page fault).
+
+    /// [`Kernel::is_local`] of `SignalRecv`: `Recv`'s, and the
+    /// notification it signals.
+    #[inline(never)]
+    fn signal_recv_is_local(&self, h: Held, t: Paddr, a: &[u64; 6]) -> bool {
+        let queue = |index: u64| match self.cslot(t, index).ok().and_then(|slot| self.slot(slot).cap()) {
+            Some(cap) => self.queue_is_local(h, t, &cap),
+            None => true, // BadCap, reported without touching anything
+        };
+        queue(crate::ipc::recv_slot(a[0])) && self.park_is_local(h, t, a[2]) && self.listen_is_local(h, t, a[0]) && queue(a[3])
+    }
+
+    /// [`Kernel::partner`] of `SignalRecv`.
+    #[inline(never)]
+    fn signal_recv_partner(&self, t: Paddr, a: &[u64; 6]) -> Option<usize> {
+        let me = self.hal.cpu() as u64;
+        self.queue_partner(t, crate::ipc::recv_slot(a[0]), me).or_else(|| self.queue_partner(t, a[3], me))
+    }
+
+    /// `SignalRecv`: the signal, then the receive. The wake-up a waiter
+    /// gives before it waits, in the same kernel entry, so the thread it
+    /// wakes on this processor finds it gone, not still running.
+    #[inline(never)]
+    fn signal_recv(&self, t: Paddr, a: &[u64; 6]) -> Result<Exit, Error> {
+        let (_, n) = self.ccap(t, a[3], ObjectType::Notification, Rights::WRITE)?;
+        self.notify(t, n.obj, n.badge.max(1))?;
+        let r = self.recv_any(t, a[0], a[1], a[2]);
+        if r == Ok(Exit::Preempted) {
+            // The signal is made; what runs again is the receive alone.
+            self.thread(t).regs[H::SYS].set(Syscall::Recv as u64);
+        }
+        r
+    }
+
     /// For a syscall that is not local: the one other processor whose lock
     /// would make it so, if what can be read under this processor's lock
     /// names one. A guess, checked by `is_local` once both locks are held.
     fn partner(&self, s: Syscall, t: Paddr, a: &[u64; 6]) -> Option<usize> {
         let me = self.hal.cpu() as u64;
         let other = |cpu: u64| (cpu != me).then_some(cpu as usize);
-        // Of a queue: its owner, or (the queue being this processor's) the
-        // home of the thread at its head or of that thread's caller.
-        let of_queue = |index: u64| -> Option<usize> {
-            let cap = self.cslot(t, index).ok().and_then(|slot| self.slot(slot).cap())?;
-            if !matches!(cap.ty, ObjectType::Endpoint | ObjectType::Notification) {
-                return None;
-            }
-            let q = self.queue(cap.obj);
-            match q.owner.get() {
-                0 => return None,
-                o if o != me + 1 => return Some(o as usize - 1),
-                _ => {}
-            }
-            let head = q.head.get();
-            if head == 0 {
-                return None;
-            }
-            let th = self.thread(head);
-            if th.cpu.get() != me {
-                return other(th.cpu.get());
-            }
-            if q.kind.get() == crate::ipc::PARKED {
-                return self.queue(th.via.get()).owner.get().checked_sub(1).and_then(other);
-            }
-            let c = th.caller.get();
-            if c != 0 { other(self.thread(c).cpu.get()) } else { None }
-        };
+        let of_queue = |index: u64| self.queue_partner(t, index, me);
         match s {
             Syscall::Call | Syscall::Send if MsgInfo(a[1]).caps() == 0 => of_queue(a[0] & !NONBLOCK),
-            Syscall::Recv => of_queue(crate::ipc::recv_slot(a[0])).or_else(|| if a[3] != 0 { of_queue(a[3]) } else { None }),
+            Syscall::Recv => of_queue(crate::ipc::recv_slot(a[0])),
+            Syscall::SignalRecv => self.signal_recv_partner(t, a),
             Syscall::ReplyRecv if MsgInfo(a[1]).caps() == 0 => {
                 let c = self.thread(t).caller.get();
                 let of_caller = if c == 0 {
@@ -393,16 +432,8 @@ impl<H: Hal> Kernel<H> {
                     _ => Err(Error::WrongType),
                 }
             }
-            Syscall::Recv => {
-                // A notification to signal first: one kernel entry for the
-                // wake-up a waiter gives before it waits, so the thread it
-                // wakes on this processor finds it gone, not still running.
-                if a[3] != 0 {
-                    let (_, n) = self.ccap(t, a[3], ObjectType::Notification, Rights::WRITE)?;
-                    self.notify(t, n.obj, n.badge.max(1))?;
-                }
-                self.recv_any(t, a[0], a[1], a[2])
-            }
+            Syscall::Recv => self.recv_any(t, a[0], a[1], a[2]),
+            Syscall::SignalRecv => self.signal_recv(t, &a),
             Syscall::ReplyRecv => {
                 let caller = self.thread(t).caller.get();
                 let replied = self.reply(t)?;
