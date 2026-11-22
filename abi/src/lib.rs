@@ -34,8 +34,12 @@ pub enum Syscall {
     /// `a0` endpoint or notification (its low 32 bits), `a1` deadline in
     /// monotonic nanoseconds (0 or `u64::MAX`: wait for ever, 1: do not
     /// block), `a2` for an endpoint: a notification to park the next call on
-    /// (0: none). Returns `a0` badge, `a1` [`MsgInfo`], `a2..a5` words. For
-    /// a notification `a0` is the pending word, cleared by the read.
+    /// (0: none), `a3` a notification to signal first, as `Send` does (0:
+    /// none; the signal is made even if the receive then fails): the
+    /// wake-up a thread gives its peer before waiting for the answer, in
+    /// the same kernel entry. Returns `a0` badge, `a1` [`MsgInfo`],
+    /// `a2..a5` words. For a notification `a0` is the pending word,
+    /// cleared by the read.
     ///
     /// Receiving on an endpoint can listen on a notification as well: bits
     /// 32 to 62 of `a0` name it (0: none; [`LISTEN_SHIFT`]). If it has been

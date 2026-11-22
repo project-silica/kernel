@@ -156,6 +156,22 @@ pub fn recv_with(from: Cap, notification: Cap, wait: Wait, park: Cap) -> Result<
     sys(Syscall::Recv, [from.0 | notification.0 << LISTEN_SHIFT, deadline, park.0, 0, 0, 0]).map(message)
 }
 
+/// Signal `wake` (as [`signal`] does), then receive from `from` (an
+/// endpoint, listening on `notification` as well when it is not
+/// [`Cap::NONE`], or a notification) as [`recv_listening`] or [`recv`]
+/// does: in one kernel entry, the wake-up a thread gives its peer and its
+/// wait for the answer. A peer on the same processor then runs at once,
+/// with nobody left to share the processor with. The signal is made even
+/// when the receive then fails.
+pub fn signal_recv(wake: Cap, from: Cap, notification: Cap, wait: Wait) -> Result<Message> {
+    let deadline = match wait {
+        Wait::Forever => 0,
+        Wait::Poll => 1,
+        Wait::Until(t) => t.max(2),
+    };
+    sys(Syscall::Recv, [from.0 | notification.0 << LISTEN_SHIFT, deadline, 0, wake.0, 0, 0]).map(message)
+}
+
 /// Receive from an endpoint; if what arrives is a call, park it on the
 /// notification `park` instead of holding it on this thread. A parked call
 /// is answered, by any thread and at any later time, with [`answer`]; until

@@ -448,7 +448,7 @@ fn fault_without_an_endpoint_stops_the_thread_and_is_logged() {
     m.k.schedule();
     assert_eq!(m.k.thread_view(t).state, INACTIVE);
     assert_eq!(m.k.current(), m.root);
-    let log = String::from_utf8(m.k.hal.console.borrow().clone()).unwrap();
+    let log = String::from_utf8_lossy(&m.k.hal.console.borrow()).into_owned();
     assert!(log.contains("Exception fault") && log.contains("no fault endpoint"), "{log}");
 }
 
@@ -1533,4 +1533,43 @@ fn a_server_loop_replies_receives_and_hears_interrupts_in_one_call() {
     assert_eq!((m.arg(t, 0), m.arg(t, 1)), (0b10, MsgInfo::NOTIFIED.0));
     assert_eq!(m.k.check_runqueues(), Ok(()));
     assert_eq!(m.k.check_queue(m.cap(n).unwrap().obj, true), Ok(()));
+}
+
+/// A receive that signals first: the waiter's wake-up of its peer and its
+/// own wait in one entry. The peer waiting on the other notification runs
+/// with the signal's badge; the receiver then waits as a plain receive
+/// does; a signal that cannot be made fails the receive before it waits.
+#[test]
+fn a_receive_can_signal_a_notification_first() {
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    // Two notifications: `mine` the root task waits on, `theirs` the peer does.
+    let (mine, theirs) = (FREE, FREE + 1);
+    m.retype(ut, T::Notification, 0, mine, 2);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2, theirs, 2, 0b100, 0]);
+    let peer = m.spawn(ut, FREE + 3);
+    assert!(m.sys_as(peer, S::Recv, [theirs, 0, 0, 0, 0, 0]).blocked);
+    // Signal `theirs` (badge 0b100), then look at `mine` without waiting.
+    assert_eq!(m.err(S::Recv, [mine, 1, 0, FREE + 2, 0, 0]), Error::WouldBlock, "then the receive found nothing");
+    assert_eq!((m.k.thread_view(peer).state, m.arg(peer, 0)), (RUNNABLE, 0b100), "the peer was woken first");
+    // Waiting: the signal, then the wait, which the peer's own signal ends.
+    assert!(m.sys(S::Recv, [mine, 0, 0, FREE + 2, 0, 0]).blocked);
+    m.sys_as(peer, S::Send, [mine, 0, 0, 0, 0, 0]);
+    assert_eq!((m.k.thread_view(m.root).state, m.status(m.root), m.arg(m.root, 0)), (RUNNABLE, 0, 1));
+    m.ok(S::Recv, [theirs, 1, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 0b100, "the second wait signalled the peer's notification too");
+    // A signal already pending on `mine` is received at once, after the signal.
+    m.ok(S::Send, [mine, 0, 0, 0, 0, 0]);
+    m.ok(S::Recv, [mine, 1, 0, FREE + 2, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 1);
+    m.ok(S::Recv, [theirs, 1, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 0b100);
+    // The notification to signal must be one, and writable: otherwise
+    // nothing is signalled and nothing received.
+    m.ok(S::Send, [mine, 0, 0, 0, 0, 0]);
+    assert_eq!(m.err(S::Recv, [mine, 1, 0, FREE + 9, 0, 0]), Error::BadCap);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 9, theirs, 1, 0, 0]);
+    assert_eq!(m.err(S::Recv, [mine, 1, 0, FREE + 9, 0, 0]), Error::NoRights);
+    m.ok(S::Recv, [mine, 1, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 1, "the failed receives took nothing");
 }

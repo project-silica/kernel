@@ -208,7 +208,12 @@ impl<H: Hal> Kernel<H> {
             Syscall::Yield | Syscall::PortIo | Syscall::Map | Syscall::Console | Syscall::PowerOff => true,
             // Passing capabilities changes capability slots.
             Syscall::Call | Syscall::Send => MsgInfo(a[1]).caps() == 0 && queue(a[0] & !NONBLOCK),
-            Syscall::Recv => queue(crate::ipc::recv_slot(a[0])) && self.park_is_local(h, t, a[2]) && self.listen_is_local(h, t, a[0]),
+            Syscall::Recv => {
+                queue(crate::ipc::recv_slot(a[0]))
+                    && self.park_is_local(h, t, a[2])
+                    && self.listen_is_local(h, t, a[0])
+                    && (a[3] == 0 || queue(a[3]))
+            }
             Syscall::ReplyRecv => {
                 // The reply unlinks the caller from the endpoint its call came through.
                 let c = self.thread(t).caller.get();
@@ -255,7 +260,7 @@ impl<H: Hal> Kernel<H> {
         };
         match s {
             Syscall::Call | Syscall::Send if MsgInfo(a[1]).caps() == 0 => of_queue(a[0] & !NONBLOCK),
-            Syscall::Recv => of_queue(crate::ipc::recv_slot(a[0])),
+            Syscall::Recv => of_queue(crate::ipc::recv_slot(a[0])).or_else(|| if a[3] != 0 { of_queue(a[3]) } else { None }),
             Syscall::ReplyRecv if MsgInfo(a[1]).caps() == 0 => {
                 let c = self.thread(t).caller.get();
                 let of_caller = if c == 0 {
@@ -388,7 +393,16 @@ impl<H: Hal> Kernel<H> {
                     _ => Err(Error::WrongType),
                 }
             }
-            Syscall::Recv => self.recv_any(t, a[0], a[1], a[2]),
+            Syscall::Recv => {
+                // A notification to signal first: one kernel entry for the
+                // wake-up a waiter gives before it waits, so the thread it
+                // wakes on this processor finds it gone, not still running.
+                if a[3] != 0 {
+                    let (_, n) = self.ccap(t, a[3], ObjectType::Notification, Rights::WRITE)?;
+                    self.notify(t, n.obj, n.badge.max(1))?;
+                }
+                self.recv_any(t, a[0], a[1], a[2])
+            }
             Syscall::ReplyRecv => {
                 let caller = self.thread(t).caller.get();
                 let replied = self.reply(t)?;
