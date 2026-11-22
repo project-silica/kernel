@@ -491,35 +491,50 @@ pub fn fault(phys: &Phys) {
     // SAFETY: under `LOCK`.
     let s = unsafe { &*STATE.0.get() };
     for u in &s.units[..s.n] {
-        for i in 0..u.fault_count {
-            let at = u.fault_regs + i * 16;
-            let hi = r64(phys, u.base, at + 8);
-            if hi >> 63 == 0 {
-                continue;
-            }
-            let (address, sid, reason, read) = (r64(phys, u.base, at) & !0xFFF, hi & 0xFFFF, hi >> 32 & 0xFF, hi >> 62 & 1 != 0);
-            w64(phys, u.base, at + 8, 1 << 63);
-            let n = REPORTED.fetch_add(1, Ordering::Relaxed);
-            if n < FAULT_LINES {
-                klog!(
-                    super::kernel(),
-                    "kernel: device {:02x}:{:02x}.{} was refused a {} at {:#x} (IOMMU fault reason {})",
-                    sid >> 8,
-                    sid >> 3 & 31,
-                    sid & 7,
-                    if read { "read" } else { "write" },
-                    address,
-                    reason
-                );
-            } else {
-                if n == FAULT_LINES {
-                    klog!(super::kernel(), "kernel: further refused device accesses are not reported");
+        // Until a pass finds no fault recorded: one recorded while an
+        // earlier record was still pending raised no interrupt of its own
+        // (the unit interrupts when its first pending fault appears).
+        let mut found = true;
+        while found {
+            found = false;
+            for i in 0..u.fault_count {
+                let at = u.fault_regs + i * 16;
+                let hi = r64(phys, u.base, at + 8);
+                if hi >> 63 == 0 {
+                    continue;
                 }
-                w32(phys, u.base, FECTL, 1 << 31);
+                found = true;
+                let (address, sid, reason, read) = (r64(phys, u.base, at) & !0xFFF, hi & 0xFFFF, hi >> 32 & 0xFF, hi >> 62 & 1 != 0);
+                w64(phys, u.base, at + 8, 1 << 63);
+                let n = REPORTED.fetch_add(1, Ordering::Relaxed);
+                if n < FAULT_LINES {
+                    klog!(
+                        super::kernel(),
+                        "kernel: device {:02x}:{:02x}.{} was refused a {} at {:#x} (IOMMU fault reason {})",
+                        sid >> 8,
+                        sid >> 3 & 31,
+                        sid & 7,
+                        if read { "read" } else { "write" },
+                        address,
+                        reason
+                    );
+                } else {
+                    if n == FAULT_LINES {
+                        klog!(super::kernel(), "kernel: further refused device accesses are not reported");
+                    }
+                    w32(phys, u.base, FECTL, 1 << 31);
+                    found = false;
+                }
             }
         }
-        // Overflow and pending bits are cleared by writing them back.
-        w32(phys, u.base, FSTS, r32(phys, u.base, FSTS));
+        // Overflow and pending bits are cleared by writing them back. A
+        // unit whose records were all full dropped the faults after them
+        // (QEMU's has one record): said, so a missing line is explained.
+        let status = r32(phys, u.base, FSTS);
+        if status & 1 != 0 && REPORTED.load(Ordering::Relaxed) < FAULT_LINES {
+            klog!(super::kernel(), "kernel: the IOMMU's fault records overflowed: refused accesses went unreported");
+        }
+        w32(phys, u.base, FSTS, status);
     }
     LOCK.unlock();
 }
