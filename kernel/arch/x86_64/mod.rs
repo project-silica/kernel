@@ -365,13 +365,7 @@ impl Hal for X86 {
     }
 
     fn set_timer(&self, deadline: u64) {
-        let tsc = if deadline == u64::MAX {
-            u64::MAX
-        } else {
-            let ticks = (deadline as u128 * self.ticks_per_ns.get() as u128) >> 32;
-            // 0 disarms the timer, so a deadline at tick 0 is moved to tick 1.
-            (self.tsc0.get() as u128 + ticks).clamp(1, u64::MAX as u128 - 1) as u64
-        };
+        let tsc = self.tsc_at(deadline);
         let per_ns = self.apic_per_ns.get();
         // Writing the timer leaves a virtual machine; writing what it holds
         // already (above all: disarming a timer that has fired, on every
@@ -422,6 +416,10 @@ impl Hal for X86 {
         }
     }
 
+    fn timer_armed(&self) -> bool {
+        percpu().deadline.get() != u64::MAX
+    }
+
     fn idle(&self, until: u64) {
         // The timer is armed ahead of `until` by how long this processor
         // has been taking to come out of the wait (on a virtual machine,
@@ -469,7 +467,12 @@ impl Hal for X86 {
         }
         let early = me.wake_ns.get();
         let armed = if until == u64::MAX { u64::MAX } else { until.saturating_sub(early).max(1) };
-        self.set_timer(armed);
+        // Only ever earlier (`Hal::idle`): a timer armed sooner fires early
+        // once and the scheduler comes back here.
+        if self.tsc_at(armed) < me.deadline.get() {
+            self.set_timer(armed);
+        }
+        let was_armed = me.deadline.get() != u64::MAX;
         let halted = self.now();
         // SAFETY: STI takes effect after the next instruction, so no
         // interrupt can arrive between the decision to wait and HLT (one
@@ -479,16 +482,18 @@ impl Hal for X86 {
         // Work, not the deadline, ended the halt: the watch learns how long
         // it would have had to be (`Watch`).
         let now = self.now();
-        if now < armed && kernel_core::sched::IDLE_WATCH_NS != 0 {
-            me.watch.woken_after(now - halted);
-        }
-        if until != u64::MAX {
-            if now >= armed {
-                let late = (now - armed).min(WAKE_ADVANCE_MAX_NS);
-                me.wake_ns.set((early * 7 + late) / 8);
-                while self.now() < until {
-                    core::hint::spin_loop();
-                }
+        let fired = was_armed && me.deadline.get() == u64::MAX;
+        if !fired {
+            if kernel_core::sched::IDLE_WATCH_NS != 0 {
+                me.watch.woken_after(now - halted);
+            }
+        } else if until != u64::MAX && now >= armed {
+            // The timer armed for `until` (not one left from before, which
+            // fires sooner and teaches nothing).
+            let late = (now - armed).min(WAKE_ADVANCE_MAX_NS);
+            me.wake_ns.set((early * 7 + late) / 8);
+            while self.now() < until {
+                core::hint::spin_loop();
             }
         }
         me.mode.enter_kernel();
@@ -708,6 +713,16 @@ unsafe impl Sync for InitState {}
 static INIT_STATE: InitState = InitState(core::cell::UnsafeCell::new([0; 4096 - FPU_OFFSET]));
 
 impl X86 {
+    /// The TSC value of monotonic time `deadline` (`u64::MAX`: none), as
+    /// the deadline timer takes it: 0 disarms, so tick 0 becomes tick 1.
+    fn tsc_at(&self, deadline: u64) -> u64 {
+        if deadline == u64::MAX {
+            return u64::MAX;
+        }
+        let ticks = (deadline as u128 * self.ticks_per_ns.get() as u128) >> 32;
+        (self.tsc0.get() as u128 + ticks).clamp(1, u64::MAX as u128 - 1) as u64
+    }
+
     /// Load extended state from a save area.
     ///
     /// # Safety

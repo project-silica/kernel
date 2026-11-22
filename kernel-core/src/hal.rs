@@ -144,15 +144,20 @@ pub trait Hal {
     /// lock: from now until `idle` returns it counts as idle, not as in the
     /// kernel, so a `kick` interrupts it.
     fn idle_begin(&self);
-    /// Arm this processor's timer for `until` (monotonic nanoseconds;
-    /// `u64::MAX`: no timer) and wait for an interrupt with interrupts
-    /// enabled; return after its handler has run. When it was the timer,
-    /// return no earlier than `until`: an architecture may arm the timer
-    /// ahead of `until` by the time this processor takes to come out of the
-    /// wait, and spin for the rest, so a deadline is met on time rather
-    /// than late by the wake-up latency. Called without this processor's
-    /// lock, so the handler must not touch kernel state.
+    /// Make sure this processor's timer fires no later than `until`
+    /// (monotonic nanoseconds; `u64::MAX`: no timer needed) and wait for an
+    /// interrupt with interrupts enabled; return after its handler has run.
+    /// A timer already armed sooner is left alone (programming it leaves a
+    /// virtual machine): it fires early, this returns, and the caller idles
+    /// again. When the timer armed for `until` fired, return no earlier
+    /// than `until`: an architecture may arm it ahead of `until` by the time
+    /// this processor takes to come out of the wait, and spin for the rest,
+    /// so a deadline is met on time rather than late by the wake-up latency.
+    /// Called without this processor's lock, so the handler must not touch
+    /// kernel state.
     fn idle(&self, until: u64);
+    /// Whether this processor's timer is still armed: set and not yet fired.
+    fn timer_armed(&self) -> bool;
     /// Route interrupt line `line` to processor `cpu`, with the given
     /// trigger and polarity, and let it interrupt. `false` when the machine
     /// has no such line.

@@ -94,6 +94,9 @@ impl Hal for ProofHal {
     }
     fn idle_begin(&self) {}
     fn idle(&self, _: u64) {}
+    fn timer_armed(&self) -> bool {
+        false
+    }
     fn irq_route(&self, _: usize, _: usize, _: bool, _: bool) -> bool {
         false
     }

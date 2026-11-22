@@ -179,14 +179,19 @@ impl Hal for TestHal {
     }
     fn idle_begin(&self) {}
     fn idle(&self, until: u64) {
-        self.set_timer(until);
-        // As hardware: each processor's timer fires once, at its deadline
-        // (at once if that has passed), and not again until it is set anew.
-        // Idling with none armed would sleep for ever (here: the kernel
-        // would spin).
+        // As hardware: a timer armed sooner is left; each processor's timer
+        // fires once, at its deadline (at once if that has passed), and not
+        // again until it is set anew. Idling with none armed would sleep
+        // for ever (here: the kernel would spin).
         let c = self.cpu.get();
+        if !self.armed[c].get() || until < self.timers[c].get() {
+            self.set_timer(until);
+        }
         assert!(self.armed[c].replace(false), "idle with no timer armed: the processor would sleep for ever");
         self.now.set(self.now.get().max(self.timers[c].get()));
+    }
+    fn timer_armed(&self) -> bool {
+        self.armed[self.cpu.get()].get()
     }
     fn irq_route(&self, line: usize, cpu: usize, level: bool, active_low: bool) -> bool {
         self.irq_log.borrow_mut().push(format!("route {line} cpu{cpu} level={level} low={active_low}"));

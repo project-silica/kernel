@@ -409,6 +409,12 @@ fn counter_frequency() -> u64 {
 }
 
 impl Arm {
+    /// The counter value of monotonic time `deadline`.
+    fn count_at(&self, deadline: u64) -> u64 {
+        let ticks = (deadline as u128 * self.ticks_per_ns.get() as u128) >> 32;
+        (self.count0.get() as u128 + ticks).min(u64::MAX as u128 - 1) as u64
+    }
+
     /// The table TTBR0 holds when no user address space is loaded.
     pub fn empty_root(&self) -> u64 {
         self.empty_root.get()
@@ -624,8 +630,7 @@ impl Hal for Arm {
             unsafe { asm!("msr cntv_ctl_el0, xzr", "isb", options(nostack, preserves_flags)) }
             return;
         }
-        let ticks = (deadline as u128 * self.ticks_per_ns.get() as u128) >> 32;
-        let at = (self.count0.get() as u128 + ticks).min(u64::MAX as u128 - 1) as u64;
+        let at = self.count_at(deadline);
         me.deadline.set(at);
         // SAFETY: an absolute compare value, then enabled and unmasked.
         unsafe {
@@ -646,6 +651,10 @@ impl Hal for Arm {
         } else {
             percpu().mode.idle();
         }
+    }
+
+    fn timer_armed(&self) -> bool {
+        percpu().deadline.get() != u64::MAX
     }
 
     fn idle(&self, until: u64) {
@@ -675,16 +684,22 @@ impl Hal for Arm {
                 return;
             }
         }
-        self.set_timer(until);
+        // Only ever earlier (`Hal::idle`): a timer armed sooner fires early
+        // once and the scheduler comes back here.
+        if until != u64::MAX && self.count_at(until) < percpu().deadline.get() {
+            self.set_timer(until);
+        }
+        let was_armed = percpu().deadline.get() != u64::MAX;
         let halted = self.now();
         // WFI wakes for a pending interrupt even while interrupts are
         // masked, so none is lost between the decision to wait and the
         // wait; it is then taken, briefly unmasked, by `kernel_irq`.
         // SAFETY: masking state is restored before returning.
         unsafe { asm!("dsb sy", "wfi", "msr daifclr, #2", "isb", "msr daifset, #2", options(nomem, nostack)) }
-        // Work, not the deadline, ended the halt: the watch learns from it.
+        // Work, not a timer, ended the halt: the watch learns from it.
         let now = self.now();
-        if now < until && kernel_core::sched::IDLE_WATCH_NS != 0 {
+        let fired = was_armed && percpu().deadline.get() == u64::MAX;
+        if !fired && kernel_core::sched::IDLE_WATCH_NS != 0 {
             percpu().watch.woken_after(now - halted);
         }
         percpu().mode.enter_kernel();

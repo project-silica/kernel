@@ -678,10 +678,13 @@ impl<H: Hal> Kernel<H> {
             me.lock.unlock();
             self.hal.idle(until);
             self.enter();
-            // The interrupt may have been the timer: look at deadlines, and
-            // program the timer afresh when one is next needed.
+            // The interrupt may have been the timer: look at deadlines. A
+            // timer that fired is armed afresh when one is next needed; one
+            // still armed fires no later than `until`, so it stays armed
+            // (moving it later would leave a virtual machine for nothing,
+            // on every wait for a device).
             me.tick.set(true);
-            me.timer_at.set(u64::MAX);
+            me.timer_at.set(if self.hal.timer_armed() { me.timer_at.get().min(until) } else { u64::MAX });
         }
         me.resched.set(false);
         self.arm_timer();
@@ -715,7 +718,7 @@ impl<H: Hal> Kernel<H> {
     /// deadline or the end of the slice. Programming the timer is expensive
     /// (on a virtual machine it leaves the guest), so it is only ever moved
     /// earlier; a timer left too early fires once and is then set right.
-    /// (An idle processor arms its timer exactly, through [`Hal::idle`].)
+    /// (An idle processor follows the same rule, through [`Hal::idle`].)
     fn arm_timer(&self) {
         let me = self.me();
         let t = me.timers.get();
