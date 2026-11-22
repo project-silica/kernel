@@ -27,7 +27,7 @@
 //!
 //! A processor waiting for its lock has interrupts off and has already saved
 //! its thread's registers, so the holder may change that thread. When it
-//! gets the lock it looks at what it was told in the meantime ([`Cpu::flush`]
+//! gets the lock it looks at what it was told in the meantime (`Cpu::flush`
 //! and the scheduler's `dirty`), and its current thread may no longer exist.
 //!
 //! The locks are taken and released by the architecture's entry and exit
@@ -74,7 +74,7 @@ const _: () = assert!(
 );
 
 /// Where processor `i`'s state is in the table: what an architecture
-/// keeps in its per-processor data for [`Hal::cpu_slot`](crate::hal::Hal::cpu_slot).
+/// keeps in its per-processor data for [`Hal::cpu_slot`].
 pub const fn cpu_slot(i: usize) -> usize {
     i / USED * PER_PAGE + SKIP + i % USED
 }

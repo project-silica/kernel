@@ -47,7 +47,7 @@ pub const FLAG_DMA: u8 = 128;
 ///
 /// Field use by type: `badge` is the endpoint or notification badge, the
 /// free offset of an Untyped, the end of a Hw range, or the mapped address
-/// (plus [`MAPPED`] and rights) of a Frame; `aux` is the cleared offset of an
+/// (plus `MAPPED` and rights) of a Frame; `aux` is the cleared offset of an
 /// Untyped or the address space a Frame is mapped in.
 #[repr(C, align(64))]
 pub struct Slot {

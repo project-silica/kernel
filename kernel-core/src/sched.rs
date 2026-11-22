@@ -7,11 +7,11 @@
 //!   first, earliest deadline first. A context's budget is spent by every
 //!   thread bound to it and refilled each period (a constant-bandwidth
 //!   server); once spent, its threads wait for the next period. Admission
-//!   control keeps the reservations on a processor below [`DEADLINE_CAP`].
+//!   control keeps the reservations on a processor below `DEADLINE_CAP`.
 //! - *Fair*: every other runnable thread, in order of virtual runtime, which
 //!   advances by the real time it ran scaled by the default weight over its
 //!   weight. The one that has run least (relative to its weight) runs; it is
-//!   preempted once it is [`GRANULE`] ahead of the next, and a waking thread
+//!   preempted once it is `GRANULE` ahead of the next, and a waking thread
 //!   that is well behind the running one preempts it.
 //!
 //! Time is charged to the processor's *account*: the thread last picked

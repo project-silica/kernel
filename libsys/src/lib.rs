@@ -74,7 +74,7 @@ pub enum Wait {
     Forever,
     /// Not at all: fail with `WouldBlock` when nothing is waiting.
     Poll,
-    /// Until this monotonic time in nanoseconds (see [`now`]), then fail with `Timeout`.
+    /// Until this monotonic time in nanoseconds (see [`Clock::now`]), then fail with `Timeout`.
     Until(u64),
 }
 
