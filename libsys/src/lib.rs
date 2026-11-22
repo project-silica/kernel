@@ -24,8 +24,8 @@ pub use silica_abi::Syscall;
 pub use silica_abi::root;
 pub use silica_abi::{
     ASPACE_IO, Error, FAULT_FETCH, FAULT_LABEL, FAULT_MAP, FAULT_PRESENT, FAULT_RESUME, FAULT_WRITE, Fault, IRQ_ACTIVE_LOW, IRQ_LEVEL,
-    IRQ_LINES, IRQ_MSI, KEEP, LARGE_BITS, MsgInfo, ObjectType, PAGE_BITS, Rights, SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_FAIR,
-    SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
+    IRQ_LINES, IRQ_MSI, KEEP, LARGE_BITS, LISTEN_SHIFT, MsgInfo, ObjectType, PAGE_BITS, Rights, SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT,
+    SCHED_FAIR, SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
 };
 
 /// Platform API level (`spec/CI_RELEASE.md` section 7).
@@ -56,6 +56,15 @@ pub struct Message {
     pub info: MsgInfo,
     /// Message words 0..3.
     pub words: [u64; 4],
+}
+
+impl Message {
+    /// For a receive that listened on a notification ([`recv_listening`],
+    /// [`reply_recv_listening`]): the notification's pending signals, when
+    /// that is what ended the wait; `None` for a message.
+    pub fn signals(&self) -> Option<u64> {
+        (self.info == MsgInfo::NOTIFIED).then_some(self.badge)
+    }
 }
 
 /// How long a receive may wait.
@@ -119,6 +128,21 @@ pub fn recv(from: Cap, wait: Wait) -> Result<Message> {
     sys(Syscall::Recv, [from.0, deadline, 0, 0, 0, 0]).map(message)
 }
 
+/// Receive from the endpoint `from` and listen on `notification` as well:
+/// whichever comes first, a message or the notification's signals
+/// ([`Message::signals`] tells which). The wait of a driver or server that
+/// serves callers and hears interrupts or wake-ups. One thread listens on a
+/// notification at a time (`InUse` otherwise); `Gone` when either
+/// capability is taken away while the thread waits.
+pub fn recv_listening(from: Cap, notification: Cap, wait: Wait) -> Result<Message> {
+    let deadline = match wait {
+        Wait::Forever => 0,
+        Wait::Poll => 1,
+        Wait::Until(t) => t.max(2),
+    };
+    sys(Syscall::Recv, [from.0 | notification.0 << LISTEN_SHIFT, deadline, 0, 0, 0, 0]).map(message)
+}
+
 /// Receive from an endpoint; if what arrives is a call, park it on the
 /// notification `park` instead of holding it on this thread. A parked call
 /// is answered, by any thread and at any later time, with [`answer`]; until
@@ -147,6 +171,12 @@ pub fn reply(info: MsgInfo, w: [u64; 4]) -> Result<()> {
 /// gone), then receive the next message from `from`. The server loop.
 pub fn reply_recv(from: Cap, info: MsgInfo, w: [u64; 4]) -> Result<Message> {
     sys(Syscall::ReplyRecv, [from.0, info.0, w[0], w[1], w[2], w[3]]).map(message)
+}
+
+/// [`reply_recv`] that listens on `notification` as well, as
+/// [`recv_listening`] does: the one call a server's loop makes.
+pub fn reply_recv_listening(from: Cap, notification: Cap, info: MsgInfo, w: [u64; 4]) -> Result<Message> {
+    sys(Syscall::ReplyRecv, [from.0 | notification.0 << LISTEN_SHIFT, info.0, w[0], w[1], w[2], w[3]]).map(message)
 }
 
 /// A pager's answer to a page fault: map `frame` at `vaddr` in `aspace`,

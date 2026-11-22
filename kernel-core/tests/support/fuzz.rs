@@ -43,7 +43,9 @@ impl Src<'_> {
             11 => [12, 13, 16, 21, 6, 3, 2, 1][b as usize & 7],
             12 => VADDRS[b as usize % VADDRS.len()],
             13 => [KEEP, 0, 1, 3, 5, 7, 15, 0x105, 0x401, 0x800, 0x9f4, 0x10e, 0x110, 64, 65][b as usize % 15],
-            14 => (WINDOW + (b & 15) as u64) | NONBLOCK,
+            14 if b & 8 == 0 => (WINDOW + (b & 7) as u64) | NONBLOCK,
+            // A receive that listens on a notification as well.
+            14 => (WINDOW + (b & 7) as u64) | (WINDOW + 8 + (b & 7) as u64) << silica_abi::LISTEN_SHIFT,
             _ => {
                 // A wild value, including the root task's own vital slots.
                 let mut v = 0u64;
@@ -200,7 +202,7 @@ pub fn run(data: &[u8]) {
         let s = m.k.slot_addr(&m.cs, i).unwrap();
         let Some(v) = m.k.view(s) else { continue };
         if matches!(v.cap.ty, T::Endpoint | T::Notification)
-            && let Err(what) = m.k.check_queue(v.cap.obj)
+            && let Err(what) = m.k.check_queue(v.cap.obj, v.cap.ty == T::Notification)
         {
             panic!("slot {i}, {:?}: {what}", v.cap);
         }

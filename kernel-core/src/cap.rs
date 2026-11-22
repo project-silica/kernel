@@ -123,7 +123,10 @@ impl<H: Hal> Kernel<H> {
         self.phys.obj(p)
     }
 
-    /// The address of slot `index` of the CapSpace `cs` refers to.
+    /// The address of slot `index` of the CapSpace `cs` refers to. Inlined:
+    /// a few instructions, on every capability operation (out of line it
+    /// cost the page fault 16).
+    #[inline(always)]
     pub(crate) fn slot_in(&self, cs: &Cap, index: u64) -> Result<Paddr, Error> {
         if cs.ty != ObjectType::CapSpace {
             return Err(Error::WrongType);
@@ -205,6 +208,11 @@ impl<H: Hal> Kernel<H> {
             self.slot(n).prev.set(p);
         }
         slot.wipe();
+        if cap.ty == ObjectType::Notification {
+            // Whoever listens through this capability (through any, when
+            // the notification itself goes) stops waiting.
+            self.unlisten(cap.obj, if last { 0 } else { s });
+        }
         if !last {
             if matches!(cap.ty, ObjectType::Endpoint | ObjectType::Notification) {
                 self.revoke_waiters(s, cap.obj);
@@ -319,6 +327,9 @@ impl<H: Hal> Kernel<H> {
         // Whoever waits through the capability waits through this slot,
         // which no longer holds it.
         if let Some(c) = s.cap().filter(|c| matches!(c.ty, ObjectType::Endpoint | ObjectType::Notification)) {
+            if c.ty == ObjectType::Notification {
+                self.unlisten(c.obj, src);
+            }
             self.revoke_waiters(src, c.obj);
         }
         s.wipe();

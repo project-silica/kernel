@@ -120,6 +120,9 @@ impl<H: Hal> Kernel<H> {
             return false;
         }
         let q = self.queue(cap.obj);
+        if cap.ty == ObjectType::Notification && !self.listener_is_local(h, cap.obj) {
+            return false;
+        }
         let head = q.head.get();
         // Answering a parked call unlinks the caller from the endpoint
         // its call came through.
@@ -132,6 +135,44 @@ impl<H: Hal> Kernel<H> {
             return false;
         }
         (head == 0 || (self.here(h, head) && MsgInfo(self.thread(head).regs[H::ARG[1]].get()).caps() == 0)) && self.here(h, t)
+    }
+
+    /// Whether what a signal to notification `n` (whose owner's lock is
+    /// held), or a wait on it, may touch of its listener is under the locks
+    /// this entry holds: the thread it names, and when that thread is
+    /// listening now, the endpoint it waits on.
+    fn listener_is_local(&self, h: Held, n: Paddr) -> bool {
+        let l = self.queue(n).listener().get();
+        if l == 0 {
+            return true;
+        }
+        if !h.has(self.thread(l).cpu.get()) {
+            return false;
+        }
+        self.listener(n) == 0 || self.owned(h, self.thread(l).blocked_on.get())
+    }
+
+    /// Whether the notification a receive of thread `t` listens on (named
+    /// in its first argument `a0`) can be made this thread's under the
+    /// locks this entry holds: nobody owns it, or a held lock's processor
+    /// does, and its last listener and the notification this thread
+    /// listened on before are under held locks too.
+    fn listen_is_local(&self, h: Held, t: Paddr, a0: u64) -> bool {
+        let index = crate::ipc::listen_slot(a0);
+        if index == 0 {
+            return true;
+        }
+        match self.cslot(t, index).ok().and_then(|s| self.slot(s).cap()) {
+            Some(n) if n.ty == ObjectType::Notification => {
+                let free = |o: u64| o == 0 || h.has(o - 1);
+                let q = self.queue(n.obj);
+                let (last, old) = (q.listener().get(), self.thread(t).listen.get());
+                free(q.owner.get())
+                    && (last == 0 || h.has(self.thread(last).cpu.get()))
+                    && (old == 0 || old == n.obj || free(self.queue(old).owner.get()))
+            }
+            _ => true, // an error, reported without touching anything
+        }
     }
 
     /// Whether the notification in slot `park` of thread `server`, on which
@@ -167,12 +208,13 @@ impl<H: Hal> Kernel<H> {
             Syscall::Yield | Syscall::PortIo | Syscall::Map | Syscall::Console | Syscall::PowerOff => true,
             // Passing capabilities changes capability slots.
             Syscall::Call | Syscall::Send => MsgInfo(a[1]).caps() == 0 && queue(a[0] & !NONBLOCK),
-            Syscall::Recv => queue(a[0]) && self.park_is_local(h, t, a[2]),
+            Syscall::Recv => queue(crate::ipc::recv_slot(a[0])) && self.park_is_local(h, t, a[2]) && self.listen_is_local(h, t, a[0]),
             Syscall::ReplyRecv => {
                 // The reply unlinks the caller from the endpoint its call came through.
                 let c = self.thread(t).caller.get();
                 let via = c == 0 || self.owned(h, self.thread(c).via.get());
-                MsgInfo(a[1]).caps() == 0 && via && self.here(h, t) && (a[0] == 0 || queue(a[0]))
+                let from = crate::ipc::recv_slot(a[0]);
+                MsgInfo(a[1]).caps() == 0 && via && self.here(h, t) && (from == 0 || (queue(from) && self.listen_is_local(h, t, a[0])))
             }
             _ => false,
         }
@@ -213,7 +255,7 @@ impl<H: Hal> Kernel<H> {
         };
         match s {
             Syscall::Call | Syscall::Send if MsgInfo(a[1]).caps() == 0 => of_queue(a[0] & !NONBLOCK),
-            Syscall::Recv => of_queue(a[0]),
+            Syscall::Recv => of_queue(crate::ipc::recv_slot(a[0])),
             Syscall::ReplyRecv if MsgInfo(a[1]).caps() == 0 => {
                 let c = self.thread(t).caller.get();
                 let of_caller = if c == 0 {
@@ -222,7 +264,7 @@ impl<H: Hal> Kernel<H> {
                     other(self.thread(c).cpu.get())
                         .or_else(|| self.queue(self.thread(c).via.get()).owner.get().checked_sub(1).and_then(other))
                 };
-                of_caller.or_else(|| if a[0] != 0 { of_queue(a[0]) } else { None })
+                of_caller.or_else(|| of_queue(crate::ipc::recv_slot(a[0])))
             }
             _ => None,
         }
@@ -350,10 +392,18 @@ impl<H: Hal> Kernel<H> {
             Syscall::ReplyRecv => {
                 let caller = self.thread(t).caller.get();
                 let replied = self.reply(t)?;
-                if a[0] == 0 {
+                if crate::ipc::recv_slot(a[0]) == 0 {
                     return if replied { Ok(Exit::Done) } else { Err(Error::NoCaller) };
                 }
                 let r = self.recv_any(t, a[0], 0, 0);
+                if r == Ok(Exit::Preempted) {
+                    // The reply is made; what runs again is the receive
+                    // alone (with no deadline and nothing to park on).
+                    let regs = &self.thread(t).regs;
+                    regs[H::SYS].set(Syscall::Recv as u64);
+                    regs[H::ARG[1]].set(0);
+                    regs[H::ARG[2]].set(0);
+                }
                 // The server now waits: the caller it answered runs next.
                 let me = self.me();
                 if replied
@@ -725,16 +775,30 @@ impl<H: Hal> Kernel<H> {
         Ok(id)
     }
 
-    fn recv_any(&self, t: Paddr, index: u64, deadline: u64, park: u64) -> Result<Exit, Error> {
-        let slot = self.cslot(t, index)?;
+    fn recv_any(&self, t: Paddr, a0: u64, deadline: u64, park: u64) -> Result<Exit, Error> {
+        let slot = self.cslot(t, crate::ipc::recv_slot(a0))?;
         let cap = self.slot(slot).cap().ok_or(Error::BadCap)?;
         if !cap.rights.has(Rights::READ) {
             return Err(Error::NoRights);
         }
-        self.thread(t).via_slot.set(slot);
+        let listen = crate::ipc::listen_slot(a0);
         match cap.ty {
-            ObjectType::Endpoint => self.recv(t, cap.obj, deadline, park),
-            ObjectType::Notification => self.wait(t, cap.obj, deadline),
+            ObjectType::Endpoint => {
+                let listen = if listen == 0 {
+                    (0, 0)
+                } else {
+                    let (s, n) = self.ccap(t, listen, ObjectType::Notification, Rights::READ)?;
+                    (s, n.obj)
+                };
+                self.thread(t).via_slot.set(slot);
+                self.recv(t, cap.obj, deadline, park, listen)
+            }
+            // A notification is waited on by itself.
+            ObjectType::Notification if listen != 0 => Err(Error::BadArg),
+            ObjectType::Notification => {
+                self.thread(t).via_slot.set(slot);
+                self.wait(t, cap.obj, deadline)
+            }
             _ => Err(Error::WrongType),
         }
     }
@@ -908,7 +972,7 @@ impl<H: Hal> Kernel<H> {
     /// there waits on it, every delivered call is linked to it, and each
     /// of them came through a slot that still holds a capability to it.
     /// For tests and fuzzing; says what is wrong.
-    pub fn check_queue(&self, q: Paddr) -> Result<(), &'static str> {
+    pub fn check_queue(&self, q: Paddr, notification: bool) -> Result<(), &'static str> {
         use crate::thread::{RECEIVING, REPLY, SENDING};
         let qu = self.queue(q);
         let through = |t: Paddr| {
@@ -947,7 +1011,14 @@ impl<H: Hal> Kernel<H> {
             }
             (prev, c) = (c, ct.qnext.get());
         }
-        if qu.pend_tail.get() != prev {
+        if notification {
+            // Where an endpoint keeps that list's tail, a notification
+            // names its last listener, which names it back.
+            let l = qu.listener().get();
+            if l != 0 && self.thread(l).listen.get() != q {
+                return Err("a notification names a listener that does not listen on it");
+            }
+        } else if qu.pend_tail.get() != prev {
             return Err("the list of calls in progress has the wrong tail");
         }
         Ok(())

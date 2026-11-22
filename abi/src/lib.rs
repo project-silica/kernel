@@ -31,11 +31,22 @@ pub enum Syscall {
     /// badge into the pending word (bit 0 for a capability without a badge),
     /// or answers the call parked there (see `Recv`).
     Send = 1,
-    /// `a0` endpoint or notification, `a1` deadline in monotonic nanoseconds
-    /// (0 or `u64::MAX`: wait for ever, 1: do not block), `a2` for an endpoint: a
-    /// notification to park the next call on (0: none). Returns `a0` badge,
-    /// `a1` [`MsgInfo`], `a2..a5` words. For a notification `a0` is the
-    /// pending word, cleared by the read.
+    /// `a0` endpoint or notification (its low 32 bits), `a1` deadline in
+    /// monotonic nanoseconds (0 or `u64::MAX`: wait for ever, 1: do not
+    /// block), `a2` for an endpoint: a notification to park the next call on
+    /// (0: none). Returns `a0` badge, `a1` [`MsgInfo`], `a2..a5` words. For
+    /// a notification `a0` is the pending word, cleared by the read.
+    ///
+    /// Receiving on an endpoint can listen on a notification as well: bits
+    /// 32 to 62 of `a0` name it (0: none; [`LISTEN_SHIFT`]). If it has been
+    /// signalled, or is signalled while the thread waits, the receive
+    /// returns its pending word in `a0` (cleared by the read) with `a1`
+    /// [`MsgInfo::NOTIFIED`], which no message carries. So one thread, in
+    /// one wait, serves callers and hears interrupts and wake-ups: the loop
+    /// of every driver and server. One thread listens on a notification at
+    /// a time, and none while another waits on it directly (`InUse`). When
+    /// the notification's capability leaves its slot, or the notification
+    /// is destroyed, while the thread waits, the receive fails with `Gone`.
     ///
     /// A call received with a parking notification waits there instead of
     /// on the receiving thread: any thread answers it by a `Send` to that
@@ -44,7 +55,9 @@ pub enum Syscall {
     /// the notification accumulate and waiting on it is refused (`InUse`).
     Recv = 2,
     /// Reply to the caller received last (`a1` [`MsgInfo`], `a2..a5` words),
-    /// then, when `a0` is not 0, `Recv` on `a0` with no deadline.
+    /// then, when the low 32 bits of `a0` are not 0, `Recv` on `a0` (an
+    /// endpoint, with a notification to listen on in its upper bits as for
+    /// `Recv`) with no deadline.
     ReplyRecv = 3,
     /// Give up the processor to another runnable thread.
     Yield = 4,
@@ -227,6 +240,9 @@ pub const THREAD_RECEIVING: u64 = 3;
 /// `Inspect` thread state: waiting for the answer to a call (or to a fault).
 pub const THREAD_REPLY: u64 = 4;
 
+/// `Recv`, `ReplyRecv`: the notification to listen on while receiving on an
+/// endpoint is named in `a0` from this bit up (31 bits).
+pub const LISTEN_SHIFT: u32 = 32;
 /// `ThreadConfigure`: leave this field as it is.
 pub const KEEP: u64 = u64::MAX;
 /// `Send`: flag in `a0` asking not to block.
@@ -440,6 +456,11 @@ impl Error {
 pub struct MsgInfo(pub u64);
 
 impl MsgInfo {
+    /// What a receive that listened on a notification returns instead of a
+    /// message's descriptor when the notification was signalled: bit 13,
+    /// which the kernel clears in every descriptor it delivers for a
+    /// sender, so no sender can make a message look like one.
+    pub const NOTIFIED: MsgInfo = MsgInfo(1 << 13);
     /// Most words in one message.
     pub const MAX_WORDS: usize = 500;
     /// Most capabilities in one message.

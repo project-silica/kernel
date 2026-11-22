@@ -82,6 +82,11 @@ pub struct Thread {
     pub(crate) sc_prev: Cell<Paddr>,
     /// Fair class: virtual runtime (`sched.rs`).
     pub(crate) vr: Cell<u64>,
+    /// The notification this thread last listened on while receiving on an
+    /// endpoint (it is that notification's listener, `ipc.rs`), and the
+    /// capability slot it named it through.
+    pub(crate) listen: Cell<Paddr>,
+    pub(crate) listen_slot: Cell<Paddr>,
 }
 impl KObj for Thread {}
 const _: () = assert!(core::mem::size_of::<Thread>() <= FPU_OFFSET);
@@ -118,6 +123,15 @@ pub struct Queue {
     pub(crate) pend_tail: Cell<Paddr>,
     /// Notification: how many interrupt lines signal it.
     pub(crate) bound: Cell<u64>,
+}
+
+impl Queue {
+    /// Notification: the thread that last listened on it while receiving
+    /// on an endpoint (0: none). Kept where an endpoint keeps the tail of
+    /// its calls in progress, which a notification has none of.
+    pub(crate) fn listener(&self) -> &Cell<Paddr> {
+        &self.pend_tail
+    }
 }
 impl KObj for Queue {}
 
@@ -440,6 +454,11 @@ impl<H: Hal> Kernel<H> {
     /// The last capability to thread `t` is gone.
     pub(crate) fn finalise_thread(&self, t: Paddr) {
         self.cancel(t, false);
+        // No notification goes on naming it as its listener.
+        let n = self.thread(t).listen.replace(0);
+        if n != 0 && self.queue(n).listener().get() == t {
+            self.queue(n).listener().set(0);
+        }
         self.drop_caller(t);
         self.sched_unlink(t);
         let cpu = self.home(t);

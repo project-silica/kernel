@@ -1348,3 +1348,173 @@ fn a_message_interrupt_line_is_bound_for_one_device_and_returns_its_message() {
     m.irq(70);
     assert_eq!(m.err(S::Recv, [FREE, 1, 0, 0, 0, 0]), Error::WouldBlock);
 }
+
+/// A receive on an endpoint that also listens on a notification: `a0` with
+/// the notification's slot above bit 32.
+fn listening(endpoint: u64, notification: u64) -> u64 {
+    endpoint | notification << silica_abi::LISTEN_SHIFT
+}
+
+/// One wait for messages and signals: a receive on an endpoint that names a
+/// notification hears a signal that came before it or comes while it waits,
+/// as a result no message can imitate, and still receives messages.
+#[test]
+fn a_receive_listens_on_a_notification_while_it_waits_for_messages() {
+    let (m, t) = pair();
+    let (ut, _) = m.big_untyped();
+    let (ep, send, n) = (FREE, FREE + 1, FREE + 5);
+    m.retype(ut, T::Notification, 0, n, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, n + 1, n, 15, 0b100, 0]);
+    let notified = MsgInfo::NOTIFIED.0;
+    // A signal already pending is returned at once, and cleared.
+    m.ok(S::Send, [n + 1, 0, 0, 0, 0, 0]);
+    let r = m.sys_as(t, S::Recv, [listening(ep, n), 0, 0, 0, 0, 0]);
+    assert!(!r.blocked && r.status == 0);
+    assert_eq!((m.arg(t, 0), m.arg(t, 1)), (0b100, notified));
+    // Nothing pending: it waits, on the endpoint.
+    assert!(m.sys_as(t, S::Recv, [listening(ep, n), 0, 0, 0, 0, 0]).blocked);
+    assert_eq!(m.k.thread_view(t).state, RECEIVING);
+    // A signal ends the wait, and the thread is off the endpoint's queue:
+    // a message sent now finds no receiver.
+    m.ok(S::Send, [n + 1, 0, 0, 0, 0, 0]);
+    assert_eq!((m.k.thread_view(t).state, m.status(t), m.arg(t, 0), m.arg(t, 1)), (RUNNABLE, 0, 0b100, notified));
+    assert_eq!(m.err(S::Send, [send | NONBLOCK, MsgInfo::new(1, 1).0, 5, 0, 0, 0]), Error::WouldBlock);
+    assert_eq!(m.k.check_queue(m.cap(ep).unwrap().obj, false), Ok(()));
+    // A message is received as ever, and no message can carry the mark of
+    // a notification: the kernel clears the bit in what it delivers.
+    assert!(m.sys_as(t, S::Recv, [listening(ep, n), 0, 0, 0, 0, 0]).blocked);
+    m.ok(S::Send, [send, MsgInfo(MsgInfo::new(9, 1).0 | notified).0, 5, 0, 0, 0]);
+    assert_eq!((m.arg(t, 0), m.arg(t, 1), m.arg(t, 2)), (77, MsgInfo::new(9, 1).0, 5));
+    // The thread has moved on (it is not receiving): a signal waits for
+    // whoever looks next, here a plain wait on the notification, which
+    // also ends the thread's standing as its listener.
+    m.ok(S::Send, [n + 1, 0, 0, 0, 0, 0]);
+    assert_eq!(m.k.thread_view(t).state, RUNNABLE);
+    m.ok(S::Recv, [n, 1, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 0b100);
+    // A plain receive after a listening one does not listen.
+    assert!(m.sys_as(t, S::Recv, [listening(ep, n), 0, 0, 0, 0, 0]).blocked);
+    m.ok(S::Send, [send, MsgInfo::new(1, 1).0, 6, 0, 0, 0]);
+    assert!(m.sys_as(t, S::Recv, [ep, 0, 0, 0, 0, 0]).blocked);
+    m.ok(S::Send, [n + 1, 0, 0, 0, 0, 0]);
+    assert_eq!(m.k.thread_view(t).state, RECEIVING, "a plain receive is not ended by a signal");
+    m.ok(S::Send, [send, MsgInfo::new(1, 1).0, 7, 0, 0, 0]);
+    assert_eq!(m.arg(t, 2), 7);
+    assert_eq!(m.k.check_queue(m.cap(n).unwrap().obj, true), Ok(()));
+    // Listening is for an endpoint's receive, on a notification that can be read.
+    assert_eq!(m.err(S::Recv, [listening(n, n), 1, 0, 0, 0, 0]), Error::BadArg);
+    assert_eq!(m.err(S::Recv, [listening(ep, ep), 1, 0, 0, 0, 0]), Error::WrongType);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, n + 2, n, 2, 0, 0]);
+    assert_eq!(m.err(S::Recv, [listening(ep, n + 2), 1, 0, 0, 0, 0]), Error::NoRights);
+    assert_eq!(m.err(S::Recv, [listening(ep, n + 3), 1, 0, 0, 0, 0]), Error::BadCap);
+}
+
+/// One thread listens on a notification at a time, and nobody waits on it
+/// directly meanwhile.
+#[test]
+fn a_notification_has_one_listener_and_no_waiter_beside_it() {
+    let (m, t) = pair();
+    let (ut, _) = m.big_untyped();
+    let (ep, n) = (FREE, FREE + 5);
+    m.retype(ut, T::Notification, 0, n, 1);
+    assert!(m.sys_as(t, S::Recv, [listening(ep, n), 0, 0, 0, 0, 0]).blocked);
+    assert_eq!(m.err(S::Recv, [n, 0, 0, 0, 0, 0]), Error::InUse, "a wait beside a listener");
+    assert_eq!(m.err(S::Recv, [listening(ep, n), 0, 0, 0, 0, 0]), Error::InUse, "a second listener");
+    // And the other way round: nobody listens where a thread waits.
+    m.retype(ut, T::Notification, 0, n + 1, 1);
+    let t2 = m.spawn(ut, n + 2);
+    assert!(m.sys_as(t2, S::Recv, [n + 1, 0, 0, 0, 0, 0]).blocked);
+    assert_eq!(m.err(S::Recv, [listening(ep, n + 1), 0, 0, 0, 0, 0]), Error::InUse);
+}
+
+/// Taking the notification away ends the listening receive with `Gone`,
+/// whether its capability leaves the slot or the notification is destroyed;
+/// a destroyed listener leaves the notification usable.
+#[test]
+fn revoking_or_destroying_the_notification_ends_a_listening_receive() {
+    let (m, t) = pair();
+    let (ut, _) = m.big_untyped();
+    let (ep, n) = (FREE, FREE + 5);
+    m.retype(ut, T::Notification, 0, n, 1);
+    // Through a derived capability, which is then revoked.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, n + 1, n, 15, 0, 0]);
+    assert!(m.sys_as(t, S::Recv, [listening(ep, n + 1), 0, 0, 0, 0, 0]).blocked);
+    m.ok(S::CapRevoke, [n, 0, 0, 0, 0, 0]);
+    assert_eq!((m.k.thread_view(t).state, m.status(t)), (RUNNABLE, Error::Gone as u64));
+    assert_eq!(m.k.check_queue(m.cap(ep).unwrap().obj, false), Ok(()));
+    // Moved to another slot: the receive was made through the old one.
+    assert!(m.sys_as(t, S::Recv, [listening(ep, n), 0, 0, 0, 0, 0]).blocked);
+    m.ok(S::CapMove, [SLOT_CAPSPACE, n + 2, n, 0, 0, 0]);
+    assert_eq!(m.status(t), Error::Gone as u64);
+    // Destroyed while listened on.
+    assert!(m.sys_as(t, S::Recv, [listening(ep, n + 2), 0, 0, 0, 0, 0]).blocked);
+    m.ok(S::CapDelete, [n + 2, 0, 0, 0, 0, 0]);
+    assert_eq!((m.k.thread_view(t).state, m.status(t)), (RUNNABLE, Error::Gone as u64));
+    // The listener destroyed while it listens: signals are kept, and
+    // another thread can listen or wait.
+    m.retype(ut, T::Notification, 0, n, 1);
+    assert!(m.sys_as(t, S::Recv, [listening(ep, n), 0, 0, 0, 0, 0]).blocked);
+    m.ok(S::CapDelete, [FREE + 2, 0, 0, 0, 0, 0]);
+    m.ok(S::Send, [n, 0, 0, 0, 0, 0]);
+    m.ok(S::Recv, [listening(ep, n), 1, 0, 0, 0, 0]);
+    assert_eq!((m.arg(m.root, 0), m.arg(m.root, 1)), (1, MsgInfo::NOTIFIED.0));
+    assert_eq!(m.k.check_queue(m.cap(n).unwrap().obj, true), Ok(()));
+}
+
+/// A server's loop: reply, receive and listen in one call. An interrupt
+/// ends the wait like any signal, also when it arrives on another
+/// processor, and a signal from another processor takes two locks, not all.
+#[test]
+fn a_server_loop_replies_receives_and_hears_interrupts_in_one_call() {
+    let (m, t) = two_processors();
+    let (ut, _) = m.big_untyped();
+    let (ep, send, n) = (FREE, FREE + 1, FREE + 5);
+    m.retype(ut, T::Notification, 0, n, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, n + 1, n, 15, 0b10, 0]);
+    // The server is the thread on processor 1; it binds an interrupt line there.
+    m.on(1);
+    assert_eq!(m.raw(S::IrqBind as u64, [SLOT_IRQS, 5, n + 1, 0, 0, 0]).status, 0);
+    assert!(m.raw(S::Recv as u64, [listening(ep, n), 0, 0, 0, 0, 0]).blocked);
+    // The interrupt arrives on the server's processor: local.
+    let globals = m.k.global_entries();
+    m.irq(5);
+    assert_eq!((m.status(t), m.arg(t, 0), m.arg(t, 1)), (0, 0b10, MsgInfo::NOTIFIED.0));
+    assert_eq!(m.k.global_entries(), globals, "an interrupt on the listener's processor takes no other lock");
+    // A call from processor 0 is served, and the reply goes back to
+    // listening: the loop's steady state, on the fast path.
+    assert!(m.raw(S::Recv as u64, [listening(ep, n), 0, 0, 0, 0, 0]).blocked);
+    m.on(0);
+    assert!(m.raw(S::Call as u64, [send, MsgInfo::new(3, 1).0, 10, 0, 0, 0]).blocked);
+    m.settle(1);
+    assert_eq!((m.k.current(), m.arg(t, 2)), (t, 10));
+    assert!(m.raw(S::ReplyRecv as u64, [listening(ep, n), MsgInfo::new(0, 1).0, 11, 0, 0, 0]).blocked);
+    m.settle(0);
+    assert_eq!((m.status(m.root), m.arg(m.root, 2)), (0, 11));
+    assert_eq!(m.k.thread_view(t).state, RECEIVING);
+    // A signal from processor 0 while the server listens on processor 1.
+    let (globals, pairs) = (m.k.global_entries(), m.k.pair_entries());
+    m.on(0);
+    m.ok(S::Send, [n + 1, 0, 0, 0, 0, 0]);
+    assert_eq!((m.k.thread_view(t).state, m.arg(t, 0), m.arg(t, 1)), (RUNNABLE, 0b10, MsgInfo::NOTIFIED.0));
+    assert_eq!((m.k.global_entries(), m.k.pair_entries()), (globals, pairs + 1), "a signal across processors takes two locks");
+    // An interrupt taken on the other processor reaches the listener too.
+    m.on(1);
+    m.settle(1);
+    assert!(m.raw(S::Recv as u64, [listening(ep, n), 0, 0, 0, 0, 0]).blocked);
+    m.on(0);
+    m.irq(5);
+    assert_eq!((m.k.thread_view(t).state, m.arg(t, 1)), (RUNNABLE, MsgInfo::NOTIFIED.0));
+    // Moved to processor 0 while it listens, the server makes its receive
+    // again there, and still hears the signal.
+    m.on(1);
+    m.settle(1);
+    assert!(m.raw(S::Recv as u64, [listening(ep, n), 0, 0, 0, 0, 0]).blocked);
+    m.on(0);
+    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.ok(S::Send, [n + 1, 0, 0, 0, 0, 0]);
+    let r = m.sys_as(t, S::Recv, [listening(ep, n), 0, 0, 0, 0, 0]);
+    assert!(!r.blocked);
+    assert_eq!((m.arg(t, 0), m.arg(t, 1)), (0b10, MsgInfo::NOTIFIED.0));
+    assert_eq!(m.k.check_runqueues(), Ok(()));
+    assert_eq!(m.k.check_queue(m.cap(n).unwrap().obj, true), Ok(()));
+}

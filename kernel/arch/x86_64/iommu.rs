@@ -25,9 +25,9 @@
 
 use super::cpu::percpu;
 use core::cell::UnsafeCell;
-use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, Ordering};
 use kernel_core::boot::{BootInfo, RegionTable};
+use kernel_core::klog;
 use kernel_core::lock::Lock;
 use kernel_core::mem::{Paddr, Phys};
 use silica_abi::Error;
@@ -225,7 +225,7 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
                 other_segments[others] = base;
                 others += 1;
             } else {
-                let _ = write!(super::Out, "kernel: an IOMMU at {base:#x} is out of reach; its devices are not confined\r\n");
+                klog!(super::kernel(), "kernel: an IOMMU at {base:#x} is out of reach; its devices are not confined");
             }
         }
         o += len as usize;
@@ -250,7 +250,7 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
     if widths == 0 {
         // Too old a unit (no queued invalidation, or neither 39 nor 48
         // bits): the machine runs as one without an IOMMU, and says so.
-        let _ = write!(super::Out, "kernel: this machine's IOMMU is of a kind Silica does not drive; devices are not confined\r\n");
+        klog!(super::kernel(), "kernel: this machine's IOMMU is of a kind Silica does not drive; devices are not confined");
         s.n = 0;
         return;
     }
@@ -259,7 +259,7 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
     // page, the context tables, and a queue page per unit.
     let pages = 3 + CONTEXT_TABLES + (s.n + others) as u64;
     let Some(mem) = table.carve(pages * PAGE, PAGE, 1 << 20, bi.phys_map_len) else {
-        let _ = write!(super::Out, "kernel: no memory for the IOMMU's tables; devices are not confined\r\n");
+        klog!(super::kernel(), "kernel: no memory for the IOMMU's tables; devices are not confined");
         s.n = 0;
         return;
     };
@@ -501,9 +501,9 @@ pub fn fault(phys: &Phys) {
             w64(phys, u.base, at + 8, 1 << 63);
             let n = REPORTED.fetch_add(1, Ordering::Relaxed);
             if n < FAULT_LINES {
-                let _ = write!(
-                    super::Out,
-                    "kernel: device {:02x}:{:02x}.{} was refused a {} at {:#x} (IOMMU fault reason {})\r\n",
+                klog!(
+                    super::kernel(),
+                    "kernel: device {:02x}:{:02x}.{} was refused a {} at {:#x} (IOMMU fault reason {})",
                     sid >> 8,
                     sid >> 3 & 31,
                     sid & 7,
@@ -513,7 +513,7 @@ pub fn fault(phys: &Phys) {
                 );
             } else {
                 if n == FAULT_LINES {
-                    let _ = write!(super::Out, "kernel: further refused device accesses are not reported\r\n");
+                    klog!(super::kernel(), "kernel: further refused device accesses are not reported");
                 }
                 w32(phys, u.base, FECTL, 1 << 31);
             }

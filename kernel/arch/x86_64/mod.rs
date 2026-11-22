@@ -584,7 +584,7 @@ impl Hal for X86 {
     }
 
     fn console(&self, bytes: &[u8]) {
-        serial::write(bytes);
+        serial::write_whole(bytes);
     }
 
     fn power_off(&self, status: u64) {

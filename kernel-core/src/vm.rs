@@ -50,7 +50,10 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// The level frames of `2^bits` bytes are mapped at in an address
-    /// space (`io`: one for devices), and the bytes one entry there maps.
+    /// space (`io`: one for devices), and the bytes one entry there maps (a
+    /// power of two). Inlined: out of line, the page fault paid for a
+    /// division by the step its caller could no longer see.
+    #[inline(always)]
     fn leaf(&self, bits: u8, io: bool) -> (u8, u64) {
         if bits >= LARGE_BITS && (!io || self.hal.io_large()) { (1, 1 << LARGE_BITS) } else { (0, PAGE) }
     }
@@ -87,7 +90,9 @@ impl<H: Hal> Kernel<H> {
 
     /// Check both overlap and table capacity without changing the address
     /// space. Each missing subtree is counted once, even for a frame that
-    /// crosses several table boundaries.
+    /// crosses several table boundaries. Inlined into `map`, its one
+    /// caller: the call measured 23 instructions on the page fault's path.
+    #[inline(always)]
     fn check_map(&self, a: Paddr, mut va: u64, end: u64, level: u8) -> Result<(), Error> {
         let h = self.aspace(a);
         let mut available = (1 << (h.bits.get() - PAGE_BITS as u64)) - 2 - h.used.get();
@@ -112,18 +117,37 @@ impl<H: Hal> Kernel<H> {
     /// Holds the structure lock unless the caller holds every lock or
     /// there is one processor (see `smp.rs`).
     pub(crate) fn map(&self, a: Paddr, fs: Paddr, vaddr: u64, rights: Rights) -> Result<(), Error> {
+        // Mapping for a device is a copy of its own, reached by a tail call
+        // before anything else is live: a page fault's cure pays one test
+        // for it (measured: dispatching after taking the lock kept values
+        // alive across the call, 20 instructions a fault).
+        if self.aspace(a).io.get() != 0 {
+            return self.map_io(a, fs, vaddr, rights);
+        }
+        self.map_with_lock::<false>(a, fs, vaddr, rights)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn map_io(&self, a: Paddr, fs: Paddr, vaddr: u64, rights: Rights) -> Result<(), Error> {
+        self.map_with_lock::<true>(a, fs, vaddr, rights)
+    }
+
+    #[inline(always)]
+    fn map_with_lock<const IO: bool>(&self, a: Paddr, fs: Paddr, vaddr: u64, rights: Rights) -> Result<(), Error> {
         let shared = self.ncpu.get() > 1 && !self.global.get();
         if shared {
             self.structure.lock();
         }
-        let r = self.map_locked(a, fs, vaddr, rights);
+        let r = self.map_locked::<IO>(a, fs, vaddr, rights);
         if shared {
             self.structure.unlock();
         }
         r
     }
 
-    fn map_locked(&self, a: Paddr, fs: Paddr, vaddr: u64, rights: Rights) -> Result<(), Error> {
+    #[inline(always)]
+    fn map_locked<const IO: bool>(&self, a: Paddr, fs: Paddr, vaddr: u64, rights: Rights) -> Result<(), Error> {
         let slot = self.slot(fs);
         let cap = slot.cap().ok_or(Error::BadCap)?;
         if slot.badge.get() & MAPPED != 0 {
@@ -133,17 +157,18 @@ impl<H: Hal> Kernel<H> {
             // W^X: no mapping is both writable and executable.
             return Err(if cap.rights.has(rights) { Error::BadArg } else { Error::NoRights });
         }
-        let h = self.aspace(a);
-        let io = h.io.get() != 0;
-        let (level, step) = self.leaf(cap.bits, io);
+        let (level, step) = self.leaf(cap.bits, IO);
         let size = 1u64 << cap.bits;
-        let top = if io { self.hal.io_top() } else { H::USER_TOP };
+        let top = if IO { self.hal.io_top() } else { H::USER_TOP };
         // Executing means nothing to a device.
-        if !vaddr.is_multiple_of(step) || vaddr >= top || size > top - vaddr || (io && rights.has(Rights::EXEC)) {
+        if vaddr & (step - 1) != 0 || vaddr >= top || size > top - vaddr || (IO && rights.has(Rights::EXEC)) {
             return Err(Error::BadArg);
         }
         self.check_map(a, vaddr, vaddr + size, level)?;
         let device = cap.flags & FLAG_DEVICE != 0;
+        // Taken only now: live across the check, it cost the page fault
+        // spills (measured).
+        let h = self.aspace(a);
         for i in 0..size / step {
             let va = vaddr + i * step;
             let (mut entry, at) = self.walk(a, va, level);
@@ -152,13 +177,13 @@ impl<H: Hal> Kernel<H> {
                 let page = a + (used + 2) * PAGE;
                 self.phys.zero(page, PAGE);
                 h.used.set(used + 1);
-                entry.set(if io { H::io_pte_table(page) } else { H::pte_table(page) });
+                entry.set(if IO { H::io_pte_table(page) } else { H::pte_table(page) });
                 entry = self.phys.word(page + ((va >> (PAGE_BITS + 9 * child)) & 511) * 8);
             }
             let frame = cap.obj + i * step;
-            entry.set(if io { H::io_pte_leaf(frame, rights, level) } else { H::pte_leaf(frame, rights, level, device) });
+            entry.set(if IO { H::io_pte_leaf(frame, rights, level) } else { H::pte_leaf(frame, rights, level, device) });
         }
-        if io && h.attached.get() != 0 {
+        if IO && h.attached.get() != 0 {
             self.hal.io_mapped(&self.phys, a + PAGE);
         }
         slot.badge.set(vaddr | MAPPED);

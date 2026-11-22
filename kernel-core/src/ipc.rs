@@ -4,7 +4,7 @@ use crate::hal::Hal;
 use crate::kernel::{Exit, Kernel};
 use crate::mem::Paddr;
 use crate::thread::{INACTIVE, IPC_CALL, IPC_FAULT, IPC_GRANT, IPC_PARKED, RECEIVING, REPLY, SENDING};
-use silica_abi::{Error, FAULT_LABEL, FAULT_MAP, FAULT_RESUME, Fault, MsgInfo, ObjectType, Rights};
+use silica_abi::{Error, FAULT_LABEL, FAULT_MAP, FAULT_RESUME, Fault, LISTEN_SHIFT, MsgInfo, ObjectType, Rights};
 
 const SENDERS: u64 = 1;
 pub(crate) const RECEIVERS: u64 = 2;
@@ -12,7 +12,71 @@ pub(crate) const RECEIVERS: u64 = 2;
 /// The queue holds one call waiting for its answer (a parked caller).
 pub(crate) const PARKED: u64 = 3;
 
+/// The notification slot a receive listens on, from its first argument.
+pub(crate) fn listen_slot(a0: u64) -> u64 {
+    a0 >> LISTEN_SHIFT & 0x7FFF_FFFF
+}
+
+/// The endpoint or notification slot of a receive, from its first argument.
+pub(crate) fn recv_slot(a0: u64) -> u64 {
+    a0 & 0xFFFF_FFFF
+}
+
 impl<H: Hal> Kernel<H> {
+    /// The thread that is listening on notification `n` right now: waiting
+    /// to receive on an endpoint, having named `n` to listen on as well
+    /// (0: none). A notification keeps naming its last listener after that
+    /// receive has ended, so that a server's loop registers once; what
+    /// makes the name count is the thread's own state, read here under its
+    /// home processor's lock (which the caller holds).
+    pub(crate) fn listener(&self, n: Paddr) -> Paddr {
+        let l = self.queue(n).listener().get();
+        if l != 0 {
+            let lt = self.thread(l);
+            if lt.listen.get() == n && lt.state.get() == RECEIVING && lt.blocked_on.get() != n && listen_slot(lt.regs[H::ARG[0]].get()) != 0
+            {
+                return l;
+            }
+        }
+        0
+    }
+
+    /// End the receive of `l`, which listens on a notification: off its
+    /// endpoint's queue, with the notification's `word` as what it received.
+    fn wake_listener(&self, l: Paddr, word: u64, status: Result<(), Error>) {
+        let lt = self.thread(l);
+        let eq = self.queue(lt.blocked_on.get());
+        self.q_remove(&eq.head, &eq.tail, l);
+        if eq.head.get() == 0 {
+            eq.kind.set(0);
+        }
+        lt.park.set(0);
+        lt.regs[H::ARG[0]].set(word);
+        lt.regs[H::ARG[1]].set(MsgInfo::NOTIFIED.0);
+        self.wake(l, status);
+    }
+
+    /// The capability in `slot` to notification `n` is leaving its slot
+    /// (`slot` 0: the notification itself is going): a thread listening
+    /// through it stops waiting, with `Gone`, and the notification names no
+    /// listener. The caller holds every lock.
+    pub(crate) fn unlisten(&self, n: Paddr, slot: Paddr) {
+        let q = self.queue(n);
+        let l = q.listener().get();
+        if l == 0 {
+            return;
+        }
+        let lt = self.thread(l);
+        if slot != 0 && lt.listen_slot.get() != slot {
+            return;
+        }
+        if self.listener(n) != 0 {
+            self.wake_listener(l, 0, Err(Error::Gone));
+        }
+        lt.listen.set(0);
+        q.listener().set(0);
+    }
+
     fn ipc_buffer(&self, t: Paddr) -> Option<Paddr> {
         self.thread(t).ipcbuf.cap().map(|c| c.obj)
     }
@@ -174,8 +238,52 @@ impl<H: Hal> Kernel<H> {
 
     /// Receive on endpoint `ep`. `deadline`: 0 or `u64::MAX` for ever, 1 do not block.
     /// `park`: a notification of the receiver's on which the next call is
-    /// parked (0: none).
-    pub(crate) fn recv(&self, t: Paddr, ep: Paddr, deadline: u64, park: u64) -> Result<Exit, Error> {
+    /// parked (0: none). `listen`: a notification to listen on as well, as
+    /// (capability slot, object), or (0, 0).
+    pub(crate) fn recv(&self, t: Paddr, ep: Paddr, deadline: u64, park: u64, listen: (Paddr, Paddr)) -> Result<Exit, Error> {
+        let th = self.thread(t);
+        if listen.1 != 0 {
+            // The notification becomes this processor's, like a queue a
+            // thread waits on. Whoever decided which locks this entry
+            // needs made sure of its owner's and its last listener's; if
+            // it was claimed by another processor since, look again.
+            let n = self.queue(listen.1);
+            let cpu = th.cpu.get() + 1;
+            if !(n.owner.claim(cpu) || self.holds(n.owner.get() - 1)) {
+                return Ok(Exit::Preempted);
+            }
+            if n.kind.get() == PARKED || n.head.get() != 0 {
+                // A call is parked there, or a thread waits on it directly.
+                return Err(Error::InUse);
+            }
+            let word = n.word.replace(0);
+            if word != 0 {
+                th.regs[H::ARG[0]].set(word);
+                th.regs[H::ARG[1]].set(MsgInfo::NOTIFIED.0);
+                return Ok(Exit::Done);
+            }
+            let last = n.listener().get();
+            if last != t {
+                if last != 0 {
+                    if !self.holds(self.thread(last).cpu.get()) {
+                        return Ok(Exit::Preempted);
+                    }
+                    if self.listener(listen.1) != 0 {
+                        return Err(Error::InUse);
+                    }
+                    self.thread(last).listen.set(0);
+                }
+                // This thread listens on one notification at a time.
+                let old = th.listen.get();
+                if old != 0 && old != listen.1 && self.queue(old).listener().get() == t {
+                    self.queue(old).listener().set(0);
+                }
+                n.listener().set(t);
+                th.listen.set(listen.1);
+            }
+            n.owner.set(cpu);
+            th.listen_slot.set(listen.0);
+        }
         let q = self.queue(ep);
         self.thread(t).park.set(park);
         if q.kind.get() == SENDERS {
@@ -245,7 +353,14 @@ impl<H: Hal> Kernel<H> {
         }
         let q = self.queue(n);
         let me = self.hal.cpu() as u64;
-        let local = self.ncpu.get() == 1 || (q.owner.get() == me + 1 && (q.head.get() == 0 || self.thread(q.head.get()).cpu.get() == me));
+        // Its waiter, or its listener and the endpoint that one waits on,
+        // must be this processor's.
+        let mine = |t: Paddr| t == 0 || self.thread(t).cpu.get() == me;
+        let local = self.ncpu.get() == 1
+            || (q.owner.get() == me + 1 && mine(q.head.get()) && mine(q.listener().get()) && {
+                let l = self.listener(n);
+                l == 0 || self.queue(self.thread(l).blocked_on.get()).owner.get() == me + 1
+            });
         if local {
             self.signal(n, irq.1.get());
             return;
@@ -270,6 +385,13 @@ impl<H: Hal> Kernel<H> {
         }
         let w = self.q_pop(&q.head, &q.tail);
         if w == 0 {
+            // A thread listening while it receives on an endpoint hears it
+            // now; otherwise it is kept for whoever looks next.
+            let l = self.listener(n);
+            if l != 0 {
+                self.wake_listener(l, q.word.replace(0) | badge, Ok(()));
+                return;
+            }
             q.word.set(q.word.get() | badge);
             return;
         }
@@ -288,6 +410,16 @@ impl<H: Hal> Kernel<H> {
         if q.kind.get() == PARKED {
             // A call is parked here; it cannot also be waited on.
             return Err(Error::InUse);
+        }
+        // Nor while a thread listens on it; a listener that has moved on
+        // is forgotten.
+        let last = q.listener().get();
+        if last != 0 {
+            if self.listener(n) != 0 {
+                return Err(Error::InUse);
+            }
+            self.thread(last).listen.set(0);
+            q.listener().set(0);
         }
         let word = q.word.replace(0);
         if word != 0 {
@@ -548,10 +680,35 @@ impl<H: Hal> Kernel<H> {
         true
     }
 
+    /// Whether a fast `ReplyRecv` of thread `t` may go back to listening on
+    /// the notification in slot `listen` without doing anything about it:
+    /// only in a server loop's steady state, where the thread is already
+    /// the notification's listener through the same capability and nothing
+    /// is pending there. Out of line: a receive that does not listen pays
+    /// one test for it.
+    #[cold]
+    #[inline(never)]
+    fn fast_listen(&self, t: Paddr, listen: u64) -> bool {
+        let th = self.thread(t);
+        let n = th.listen.get();
+        let Ok(ls) = self.cslot(t, listen) else { return false };
+        if n == 0
+            || th.listen_slot.get() != ls
+            || !self.slot(ls).cap().is_some_and(|c| c.ty == ObjectType::Notification && c.obj == n && c.rights.has(Rights::READ))
+        {
+            return false;
+        }
+        let nq = self.queue(n);
+        nq.owner.get() == self.hal.cpu() as u64 + 1 && nq.word.get() == 0 && nq.kind.get() == 0 && nq.listener().get() == t
+    }
+
     /// `ReplyRecv` of thread `t` (current on this processor) with arguments `a`.
     pub(crate) fn fast_reply_recv(&self, t: Paddr, a: &[u64; 6]) -> bool {
         let info = MsgInfo(a[1]);
-        if info.caps() != 0 || a[0] == 0 {
+        // The endpoint's slot is the low half of `a0` (a notification to
+        // listen on is in the upper half, looked at last: keeping both
+        // halves apart from the start cost the round trip spills).
+        if info.caps() != 0 || a[0] as u32 == 0 {
             return false;
         }
         let th = self.thread(t);
@@ -578,9 +735,12 @@ impl<H: Hal> Kernel<H> {
         {
             return false;
         }
-        let Some((slot, ep)) = self.fast_cap(t, a[0], ObjectType::Endpoint, Rights::READ) else { return false };
+        let Some((slot, ep)) = self.fast_cap(t, recv_slot(a[0]), ObjectType::Endpoint, Rights::READ) else { return false };
         let q = self.queue(ep.obj);
         if q.owner.get() != me + 1 || q.kind.get() == SENDERS {
+            return false;
+        }
+        if a[0] >> LISTEN_SHIFT != 0 && !self.fast_listen(t, listen_slot(a[0])) {
             return false;
         }
         // The mapping is the last thing that can fail: if it does, nothing

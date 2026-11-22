@@ -30,6 +30,18 @@ pub fn init() {
     outb(COM1 + 4, 0x03);
 }
 
+/// One writer at a time for whole calls of [`write_whole`].
+static WRITER: kernel_core::lock::Lock = kernel_core::lock::Lock::new();
+
+/// Send `bytes` with no other processor's bytes among them: a kernel line,
+/// or one piece a program writes through its console capability. Not for
+/// the panic path, which must not wait for a lock its own processor may hold.
+pub fn write_whole(bytes: &[u8]) {
+    WRITER.lock();
+    write(bytes);
+    WRITER.unlock();
+}
+
 /// Send bytes, waiting for the transmitter. Gives up on a port that never
 /// becomes ready (no serial port present) so a missing console cannot hang
 /// the kernel.
