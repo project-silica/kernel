@@ -734,7 +734,9 @@ impl<H: Hal> Kernel<H> {
                 for (i, w) in a[2..6].iter().enumerate() {
                     bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
                 }
-                self.hal.console(&bytes[..n]);
+                // A thread object is aligned: its address with the low bit set is
+                // never 0 nor the kernel.
+                crate::log::write(&self.hal, t | 1, &bytes[..n]);
                 Ok(Exit::Done)
             }
             Syscall::PowerOff => {

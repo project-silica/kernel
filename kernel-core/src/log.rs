@@ -1,7 +1,35 @@
 //! The kernel's console output.
 
 use crate::hal::Hal;
+use crate::lock::Lock;
 use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// The writer whose line the console is in the middle of (0: none; a line
+/// ends with a newline). Kept with [`LINE`] held.
+static OPEN: AtomicU64 = AtomicU64::new(0);
+static LINE: Lock = Lock::new();
+
+/// The kernel's own lines, as a writer.
+pub const KERNEL: u64 = u64::MAX;
+
+/// Write `bytes` for `writer` (the kernel, or a thread through its console
+/// capability), whole. A writer that finds the line left unfinished by
+/// another starts a fresh one, so a program's prompt and a kernel line never
+/// share a line, and every line a reader anchors on starts where it should.
+pub fn write<H: Hal>(hal: &H, writer: u64, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    LINE.lock();
+    let open = OPEN.load(Ordering::Relaxed);
+    if open != 0 && open != writer {
+        hal.console(b"\r\n");
+    }
+    hal.console(bytes);
+    OPEN.store(if bytes.last() == Some(&b'\n') { 0 } else { writer }, Ordering::Relaxed);
+    LINE.unlock();
+}
 
 /// One line for the architecture's console, gathered and written with one
 /// call, so that lines from different processors (and the pieces programs
@@ -22,7 +50,7 @@ impl<'a, H: Hal> Console<'a, H> {
     /// Write out what has been gathered.
     pub fn flush(&mut self) {
         if self.len != 0 {
-            self.hal.console(&self.buf[..self.len]);
+            write(self.hal, KERNEL, &self.buf[..self.len]);
             self.len = 0;
         }
     }

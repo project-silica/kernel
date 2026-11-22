@@ -143,6 +143,19 @@ pub fn recv_listening(from: Cap, notification: Cap, wait: Wait) -> Result<Messag
     sys(Syscall::Recv, [from.0 | notification.0 << LISTEN_SHIFT, deadline, 0, 0, 0, 0]).map(message)
 }
 
+/// The receive with every option: from the endpoint `from`, listening on
+/// `notification` as well when it is not [`Cap::NONE`], and parking a call
+/// that arrives on `park` when that is not [`Cap::NONE`] (see
+/// [`recv_parking`], [`recv_listening`]).
+pub fn recv_with(from: Cap, notification: Cap, wait: Wait, park: Cap) -> Result<Message> {
+    let deadline = match wait {
+        Wait::Forever => 0,
+        Wait::Poll => 1,
+        Wait::Until(t) => t.max(2),
+    };
+    sys(Syscall::Recv, [from.0 | notification.0 << LISTEN_SHIFT, deadline, park.0, 0, 0, 0]).map(message)
+}
+
 /// Receive from an endpoint; if what arrives is a call, park it on the
 /// notification `park` instead of holding it on this thread. A parked call
 /// is answered, by any thread and at any later time, with [`answer`]; until
