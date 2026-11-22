@@ -1,6 +1,8 @@
 # In-OS tests of the aarch64 kernel (roottest/src/main.rs), as for x86_64.
 # Not yet on aarch64 (B08): irq (no device here whose interrupt the test can
 # raise on demand).
+# "quiet" marks a test that judges a time (a scheduling latency): the
+# harness runs it with nothing beside it, where the others run at once.
 syscall
 fault_page
 fault_instruction
@@ -27,5 +29,5 @@ smp_stress smp=8
 smp_revoke smp=8
 smp_timeouts smp=8
 entropy
-sched
+sched quiet
 console

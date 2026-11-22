@@ -1,6 +1,8 @@
 # In-OS tests of the x86_64 kernel (roottest/src/main.rs): one name per line,
 # then optionally the machine the test needs (smp=<processors> mem=<MiB>).
 # A test that names none runs twice: on one processor and on four.
+# "quiet" marks a test that judges a time (a scheduling latency): the
+# harness runs it with nothing beside it, where the others run at once.
 syscall
 fault_page
 fault_instruction
@@ -28,4 +30,4 @@ smp_revoke smp=8
 smp_timeouts smp=8
 entropy
 console
-sched
+sched quiet
