@@ -180,14 +180,37 @@ fn check(k: &Kernel<Hal0>, n: usize, caps: &[Option<Cap>], depth: &[u16], s: usi
     }
 }
 
+/// The cases are split in [`PARTS`] tests, each taking every `PARTS`th case
+/// by number, so they run at once (Miri runs one test at a time per process).
+const PARTS: u64 = 4;
+
 #[test]
-fn revoke_is_complete_on_every_list_of_up_to_five_slots() {
+fn revoke_is_complete_on_every_list_of_up_to_five_slots_part_0() {
+    revoke_is_complete(0);
+}
+
+#[test]
+fn revoke_is_complete_on_every_list_of_up_to_five_slots_part_1() {
+    revoke_is_complete(1);
+}
+
+#[test]
+fn revoke_is_complete_on_every_list_of_up_to_five_slots_part_2() {
+    revoke_is_complete(2);
+}
+
+#[test]
+fn revoke_is_complete_on_every_list_of_up_to_five_slots_part_3() {
+    revoke_is_complete(3);
+}
+
+fn revoke_is_complete(part: u64) {
     let mut mem = Mem([0; 64 * (SLOTS + 3)]);
     // SAFETY: every address the kernel is given here is inside `mem` (the
     // slots and the two queues) or is a frame address that is only compared;
     // `mem` outlives the kernel.
     let k = Kernel::new(Hal0, unsafe { Phys::new(mem.0.as_mut_ptr()) });
-    let mut cases = 0u64;
+    let (mut cases, mut number) = (0u64, 0u64);
     // Under Miri (which checks this test's use of memory, not the kernel's
     // logic, and runs it a thousand times slower) lists of up to three.
     let longest = if cfg!(miri) { 3 } else { SLOTS };
@@ -199,6 +222,10 @@ fn revoke_is_complete_on_every_list_of_up_to_five_slots() {
                     // Each poll can see an interrupt or not; revoke polls once
                     // per descendant removed, so `end - s - 1` bits cover them all.
                     for schedule in 0..1u32 << (end - s - 1) {
+                        number += 1;
+                        if number % PARTS != part {
+                            continue;
+                        }
                         // A fresh list in memory: the slots and the queues
                         // (through the kernel's own view of it, the only one
                         // in use while it lives).
@@ -235,5 +262,5 @@ fn revoke_is_complete_on_every_list_of_up_to_five_slots() {
     }
     // Every case above ran; the count is here so a change to the bounds is seen.
     std::println!("{cases} cases");
-    assert!(cases > if cfg!(miri) { 100 } else { 100_000 }, "only {cases} cases");
+    assert!(cases > if cfg!(miri) { 100 / PARTS } else { 100_000 / PARTS }, "only {cases} cases");
 }

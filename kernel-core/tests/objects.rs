@@ -522,8 +522,24 @@ fn destroying_a_capspace_deletes_capabilities_derived_from_its_contents() {
 /// (and Miri) exercises it; `tools/fuzz.sh` runs it coverage-guided.
 #[test]
 fn random_syscall_sequences_keep_the_kernel_invariants() {
-    let mut r = Rng(0x5EED);
-    for _ in 0..if cfg!(miri) { 3 } else { 300 } {
+    random_syscall_sequences(0x5EED);
+}
+
+// The same in three tests of their own, so they run at once (Miri runs one
+// test at a time per process).
+#[test]
+fn random_syscall_sequences_keep_the_kernel_invariants_2() {
+    random_syscall_sequences(0x5EED_0002);
+}
+
+#[test]
+fn random_syscall_sequences_keep_the_kernel_invariants_3() {
+    random_syscall_sequences(0x5EED_0003);
+}
+
+fn random_syscall_sequences(seed: u64) {
+    let mut r = Rng(seed);
+    for _ in 0..if cfg!(miri) { 1 } else { 100 } {
         let len = 16 + r.below(if cfg!(miri) { 200 } else { 3000 }) as usize;
         let data: Vec<u8> = (0..len).map(|_| r.next() as u8).collect();
         support::fuzz::run(&data);
