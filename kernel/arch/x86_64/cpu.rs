@@ -328,6 +328,9 @@ unsafe extern "C" {
     /// Leave the kernel for the thread the scheduler picks. The caller has
     /// entered the kernel (`Kernel::enter`).
     pub fn exit_to_user() -> !;
+    /// The second half of `exit_to_user`: return to the thread already
+    /// scheduled (its frame at gs:[8]); the caller has let go of the lock.
+    static restore_user: u8;
 }
 
 // Each way in marks the processor as in the kernel and takes its lock; the
@@ -338,7 +341,15 @@ unsafe extern "C" {
 
 /// `contended`: the entry found this processor's lock held by another
 /// processor and did not take it.
-extern "C" fn syscall_rust(contended: u64) {
+///
+/// It does not return: it schedules and goes straight to `restore_user`.
+/// Everything the thread had is in its frame, so nothing this function is
+/// called with needs keeping, and a function that never returns saves no
+/// registers for its caller: returning to the stub and calling the
+/// scheduler from there cost each system call a second call and twelve
+/// saves and restores (`profile.sh --lines`: 16 instructions at each of
+/// the two functions' entry and exit per round trip).
+extern "C" fn syscall_rust(contended: u64) -> ! {
     let k = super::kernel();
     percpu().mode.enter_kernel();
     if contended == 0 {
@@ -347,6 +358,13 @@ extern "C" fn syscall_rust(contended: u64) {
         k.enter();
     }
     k.syscall();
+    k.schedule();
+    percpu().mode.leave_to_user();
+    k.leave();
+    // SAFETY: `restore_user` loads the scheduled thread's frame (gs:[8])
+    // and returns to user mode; it takes nothing from this stack, which
+    // the next entry starts afresh (gs:[0]).
+    unsafe { asm!("jmp {r}", r = sym restore_user, options(noreturn)) }
 }
 
 extern "C" fn schedule_rust() {
@@ -458,11 +476,14 @@ syscall_entry:
     mov rsp, gs:[0]
     xor ebp, ebp
     call {syscall}
+    ud2
 
 .global exit_to_user
 exit_to_user:
     mov rsp, gs:[0]
     call {schedule}
+.global restore_user
+restore_user:
     mov rax, gs:[8]
     cmp byte ptr gs:[24], 0
     je 5f

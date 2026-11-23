@@ -595,7 +595,9 @@ impl<H: Hal> Kernel<H> {
     /// Choose the thread this processor returns to. Called by the
     /// architecture on every way out of the kernel, holding this
     /// processor's lock; when it returns, [`Kernel::current`] is runnable
-    /// and loaded.
+    /// and loaded. In line in each way out (two on x86_64: the system call's,
+    /// which never returns and so saves no registers, and the rest's).
+    #[inline(always)]
     pub fn schedule(&self) {
         let me = self.me();
         // Most kernel entries change nothing the scheduler cares about.

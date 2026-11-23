@@ -338,7 +338,10 @@ impl<H: Hal> Kernel<H> {
         Some(global)
     }
 
-    /// Handle the syscall the current thread just made.
+    /// Handle the syscall the current thread just made. In line in the
+    /// architecture's system-call entry, which never returns: then nothing
+    /// saves registers for a caller on the way.
+    #[inline(always)]
     pub fn syscall(&self) {
         let me = self.me();
         let t = me.cur.get();
