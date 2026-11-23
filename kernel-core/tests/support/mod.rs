@@ -61,7 +61,7 @@ pub struct TestHal {
     /// A word of the machine's memory (its host address; 0: none) read in
     /// each watch over words: what a device would see while the processor
     /// watches.
-    pub spy: Cell<usize>,
+    pub spy: Cell<*const u32>,
     pub spied: Cell<u32>,
     /// The machine's IOMMU: how far device addresses reach (0: no IOMMU),
     /// whether it maps 2 MiB with one entry, which device identity is
@@ -233,9 +233,9 @@ impl Hal for TestHal {
                 return true;
             }
             let spy = self.spy.get();
-            if spy != 0 {
-                // SAFETY: an address in this machine's memory the test named.
-                self.spied.set(unsafe { (spy as *const u32).read_volatile() });
+            if !spy.is_null() {
+                // SAFETY: a word in this machine's memory the test named.
+                self.spied.set(unsafe { spy.read_volatile() });
             }
             self.watch_ends.set(self.watch_ends.get() + 1);
             return false;
@@ -421,7 +421,7 @@ impl Machine {
             irq_log: RefCell::new(Vec::new()),
             watch_wakes: Cell::new(0),
             watch_ends: Cell::new(0),
-            spy: Cell::new(0),
+            spy: Cell::new(core::ptr::null()),
             spied: Cell::new(0),
             io_top: Cell::new(1 << 48),
             io_large: Cell::new(true),

@@ -1531,7 +1531,7 @@ fn a_watched_line_delivers_its_word_once_whichever_sees_it_first() {
     assert_eq!(read(word2), 0x0005_0000, "quiet with nobody watching, or the program's bits lost");
     // A wait the watch does not end: quiet while watched, told to interrupt
     // before the processor halts (until the receive's deadline).
-    m.k.hal.spy.set(m.k.phys.ptr(word2) as usize);
+    m.k.hal.spy.set(m.k.phys.ptr(word2).cast::<u32>().cast_const());
     let ends = m.k.hal.watch_ends.get();
     let deadline = m.k.hal.now() + 1_000_000;
     assert!(m.sys(S::Recv, [n, deadline, 0, 0, 0, 0]).blocked);
@@ -1539,7 +1539,7 @@ fn a_watched_line_delivers_its_word_once_whichever_sees_it_first() {
     assert_eq!(Error::result(m.status(m.root)), Err(Error::Timeout));
     assert_eq!((m.k.hal.spied.get(), read(word2), m.k.hal.watch_ends.get()), (0x0005_0001, 0x0005_0000, ends + 1));
     // Its watch ends: loud for good.
-    m.k.hal.spy.set(0);
+    m.k.hal.spy.set(core::ptr::null());
     m.ok(S::CapDelete, [frame + 3, 0, 0, 0, 0, 0]);
     m.ok(S::IrqWatch, [SLOT_IRQS, 70, 0, 0, 0, 0]);
     assert_eq!(read(word2), 0x0005_0000);
