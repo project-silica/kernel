@@ -33,8 +33,21 @@ pub fn outw(port: u16, v: u16) {
     unsafe { asm!("out dx, ax", in("dx") port, in("ax") v, options(nomem, nostack, preserves_flags)) }
 }
 
+/// Whether the machine has COM1 (its scratch register keeps what is
+/// written; on a machine without one the port reads as all ones).
+static PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Whether COM1 is there to write to.
+pub fn present() -> bool {
+    PRESENT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// 115200 baud, 8 data bits, no parity, one stop bit, FIFOs on, no interrupts.
 pub fn init() {
+    outb(COM1 + 7, 0x5A);
+    let kept = inb(COM1 + 7) == 0x5A;
+    outb(COM1 + 7, 0xA5);
+    PRESENT.store(kept && inb(COM1 + 7) == 0xA5, core::sync::atomic::Ordering::Relaxed);
     outb(COM1 + 1, 0x00);
     outb(COM1 + 3, 0x80);
     outb(COM1, 0x01);
@@ -60,6 +73,9 @@ pub fn write_whole(bytes: &[u8]) {
 /// becomes ready (no serial port present) so a missing console cannot hang
 /// the kernel.
 pub fn write(bytes: &[u8]) {
+    if !present() {
+        return;
+    }
     for &b in bytes {
         let mut spins = 0u32;
         while inb(COM1 + 5) & 0x20 == 0 && spins < 1_000_000 {

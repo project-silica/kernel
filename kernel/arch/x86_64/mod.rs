@@ -8,6 +8,7 @@
 //! APIC emulation) the local APIC's one-shot counter is used instead.
 
 mod cpu;
+mod fbcon;
 mod ioapic;
 mod iommu;
 mod serial;
@@ -608,6 +609,7 @@ impl Hal for X86 {
 
     fn console(&self, bytes: &[u8]) {
         serial::write_whole(bytes);
+        fbcon::write(bytes);
     }
 
     fn power_off(&self, status: u64) {
@@ -866,6 +868,7 @@ struct Out;
 impl Write for Out {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         serial::write(s.as_bytes());
+        fbcon::write(s.as_bytes());
         Ok(())
     }
 }
@@ -902,6 +905,7 @@ fn backtrace(first: u64, mut rbp: u64) {
 
 /// The kernel panicked: say why, show where, stop.
 pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    fbcon::panic();
     let _ = write!(Out, "\r\nPANIC: {}\r\n", info.message());
     if let Some(l) = info.location() {
         let _ = write!(Out, "  at {}:{}\r\n", l.file(), l.line());
@@ -919,6 +923,7 @@ pub fn kernel_fault(f: &cpu::KernelFrame) -> ! {
     let cr2: u64;
     // SAFETY: reading CR2 in ring 0 has no side effect.
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) }
+    fbcon::panic();
     let _ = write!(
         Out,
         "\r\nPANIC: kernel exception {} (error {:#x}) at {:#x}, address {:#x}, rsp {:#x}\r\n  kernel slide {:#x}; backtrace (link addresses):\r\n",
@@ -1270,6 +1275,14 @@ pub extern "C" fn kmain(info: u64) -> ! {
     }
     flush_all();
 
+    fbcon::init(&bi, &k.phys);
+    if !serial::present() {
+        klog!(
+            k,
+            "kernel: no serial port: the kernel's lines are on the screen{}",
+            if fbcon::present() { " until the system starts, and a panic always" } else { ", and there is no screen either" }
+        );
+    }
     ioapic::init(&bi, &k.phys);
     init_power(&bi, &k.phys);
     let hz = tsc_frequency(&bi, &k.phys);
@@ -1385,6 +1398,8 @@ pub extern "C" fn kmain(info: u64) -> ! {
         die();
     }
     smp::start(hz);
+    // The screen is the display driver's from here.
+    fbcon::release();
     // SAFETY: the tables, the processor and the root thread are set up and
     // the kernel is entered; this is the first exit to user mode.
     unsafe { cpu::exit_to_user() }
