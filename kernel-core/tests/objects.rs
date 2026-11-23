@@ -1453,6 +1453,104 @@ fn a_message_interrupt_line_is_bound_for_one_device_and_returns_its_message() {
     assert_eq!(m.err(S::Recv, [FREE, 1, 0, 0, 0, 0]), Error::WouldBlock);
 }
 
+/// A watched message line (`IrqWatch`): its news is a word the device
+/// writes. An idle processor sees the word change and delivers it as the
+/// interrupt, the interrupt that follows wakes nobody again, a change the
+/// watch has not delivered is delivered by the interrupt, and the watch ends
+/// with its line's binding and with its frame.
+#[test]
+fn a_watched_line_delivers_its_word_once_whichever_sees_it_first() {
+    use silica_abi::IRQ_MSI;
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.retype(ut, T::Frame, 12, FREE + 2, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, SLOT_DEVICES, 15, 0x18 | 0x19 << 32, 0]);
+    let (n, frame) = (FREE, FREE + 2);
+    let word = m.cap(frame).unwrap().obj + 8;
+    let set = |v: u32| m.k.phys.write_val(word, &v);
+    let poll = || match m.sys(S::Recv, [n, 1, 0, 0, 0, 0]) {
+        r if r.status == 0 => Some(m.arg(m.root, 0)),
+        _ => None,
+    };
+    assert_eq!(m.err(S::IrqWatch, [SLOT_IRQS, 70, frame, 8, 0xFFFF_0000, 0]), Error::BadArg, "a line not bound");
+    m.ok(S::IrqBind, [SLOT_IRQS, 70, n, IRQ_MSI, FREE + 1, 0x18]);
+    m.ok(S::IrqBind, [SLOT_IRQS, 5, n, 0, 0, 0]);
+    assert_eq!(m.err(S::IrqWatch, [SLOT_IRQS, 5, frame, 8, 0xFFFF_0000, 0]), Error::BadArg, "a wire");
+    assert_eq!(m.err(S::IrqWatch, [SLOT_IRQS, 70, frame, 6, 0xFFFF_0000, 0]), Error::BadArg, "a word not aligned");
+    assert_eq!(m.err(S::IrqWatch, [SLOT_IRQS, 70, frame, 4096, 0xFFFF_0000, 0]), Error::BadArg, "a word past the frame");
+    assert_eq!(m.err(S::IrqWatch, [SLOT_IRQS, 70, frame, 8, 0, 0]), Error::BadArg, "no bits to watch");
+    assert_eq!(m.err(S::IrqWatch, [SLOT_IRQS, 70, n, 8, 0xFFFF_0000, 0]), Error::WrongType, "not a frame");
+    set(0x0001_0007);
+    m.ok(S::IrqWatch, [SLOT_IRQS, 70, frame, 8, 0xFFFF_0000, 0]);
+    // What the word held when the watch began is not news; nor is a change
+    // outside the mask (virtio's flags beside its index).
+    m.irq(70);
+    set(0x0001_0000);
+    m.irq(70);
+    assert_eq!(poll(), None, "an interrupt with no news woke the driver");
+    // News the interrupt brings first: delivered once.
+    set(0x0002_0000);
+    m.irq(70);
+    m.irq(70);
+    assert_eq!(poll(), Some(1));
+    assert_eq!(poll(), None, "one news, two signals");
+    // News an idle processor sees: the waiting receive is woken without an
+    // interrupt, and the interrupt after it wakes nobody.
+    set(0x0003_0000);
+    assert!(m.sys(S::Recv, [n, 0, 0, 0, 0, 0]).blocked);
+    m.idle();
+    assert_eq!(m.status(m.root), 0, "the watch did not wake the waiter");
+    assert_eq!((m.arg(m.root, 0), m.k.hal.watch_wakes.get()), (1, 1));
+    m.irq(70);
+    assert_eq!(poll(), None, "the interrupt after the watch woke the driver again");
+    // Rebinding the line ends the watch: every interrupt is news again.
+    m.ok(S::IrqBind, [SLOT_IRQS, 70, n, IRQ_MSI, FREE + 1, 0x18]);
+    m.irq(70);
+    assert_eq!(poll(), Some(1));
+    // As does destroying the frame.
+    m.ok(S::IrqWatch, [SLOT_IRQS, 70, frame, 8, 0xFFFF_0000, 0]);
+    m.irq(70);
+    assert_eq!(poll(), None);
+    m.ok(S::CapDelete, [frame, 0, 0, 0, 0, 0]);
+    m.irq(70);
+    assert_eq!(poll(), Some(1), "a watch outlived its frame");
+    // The device told not to interrupt (`IrqQuiet`): only while watched.
+    m.retype(ut, T::Frame, 12, frame + 1, 1);
+    m.ok(S::IrqWatch, [SLOT_IRQS, 70, frame + 1, 8, 0xFFFF_0000, 0]);
+    m.ok(S::IrqBind, [SLOT_IRQS, 71, n, IRQ_MSI, FREE + 1, 0x18]);
+    assert_eq!(m.err(S::IrqQuiet, [SLOT_IRQS, 71, frame + 1, 16, 1, 0]), Error::BadArg, "a line not watched");
+    assert_eq!(m.err(S::IrqQuiet, [SLOT_IRQS, 70, frame + 1, 18, 1, 0]), Error::BadArg, "a word not aligned");
+    assert_eq!(m.err(S::IrqQuiet, [SLOT_IRQS, 70, frame + 1, 16, 0, 0]), Error::BadArg, "no bits");
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, frame + 3, frame + 1, Rights::READ.0 as u64, 0, 0]);
+    assert_eq!(m.err(S::IrqQuiet, [SLOT_IRQS, 70, frame + 3, 16, 1, 0]), Error::NoRights, "a frame it may not write");
+    let word2 = m.cap(frame + 1).unwrap().obj + 16;
+    m.k.phys.write_val(word2, &0x0005_0000u32);
+    m.ok(S::IrqQuiet, [SLOT_IRQS, 70, frame + 1, 16, 1, 0]);
+    let read = |p: u64| u32::from_le_bytes(m.mem(p, 4).try_into().unwrap());
+    assert_eq!(read(word2), 0x0005_0000, "quiet with nobody watching, or the program's bits lost");
+    // A wait the watch does not end: quiet while watched, told to interrupt
+    // before the processor halts (until the receive's deadline).
+    m.k.hal.spy.set(m.k.phys.ptr(word2) as usize);
+    let ends = m.k.hal.watch_ends.get();
+    let deadline = m.k.hal.now() + 1_000_000;
+    assert!(m.sys(S::Recv, [n, deadline, 0, 0, 0, 0]).blocked);
+    m.idle();
+    assert_eq!(Error::result(m.status(m.root)), Err(Error::Timeout));
+    assert_eq!((m.k.hal.spied.get(), read(word2), m.k.hal.watch_ends.get()), (0x0005_0001, 0x0005_0000, ends + 1));
+    // Its watch ends: loud for good.
+    m.k.hal.spy.set(0);
+    m.ok(S::CapDelete, [frame + 3, 0, 0, 0, 0, 0]);
+    m.ok(S::IrqWatch, [SLOT_IRQS, 70, 0, 0, 0, 0]);
+    assert_eq!(read(word2), 0x0005_0000);
+    // A watch with nothing behind it: stopped by its owner.
+    m.retype(ut, T::Frame, 12, frame, 1);
+    m.ok(S::IrqWatch, [SLOT_IRQS, 70, frame, 8, 0xFFFF_0000, 0]);
+    m.ok(S::IrqWatch, [SLOT_IRQS, 70, 0, 0, 0, 0]);
+    m.irq(70);
+    assert_eq!(poll(), Some(1));
+}
+
 /// A receive on an endpoint that also listens on a notification: `a0` with
 /// the notification's slot above bit 32.
 fn listening(endpoint: u64, notification: u64) -> u64 {

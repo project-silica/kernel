@@ -439,7 +439,7 @@ impl Hal for X86 {
         percpu().deadline.get() != u64::MAX
     }
 
-    fn idle(&self, until: u64) {
+    fn idle(&self, until: u64, words: Option<&[kernel_core::hal::Watched]>) -> bool {
         // The timer is armed ahead of `until` by how long this processor
         // has been taking to come out of the wait (on a virtual machine,
         // mostly the host waking the virtual processor's thread), and the
@@ -459,7 +459,10 @@ impl Hal for X86 {
         // interrupt (its handler leaves the word at "idle"). Any other
         // interrupt taken here carries no news: nobody sends this processor
         // one for work while it says "watching" (`idle_begin`).
-        if kernel_core::sched::IDLE_WATCH_NS != 0 {
+        // Without `words` the watch already ran (`Hal::idle`): halt now.
+        if let Some(words) = words
+            && kernel_core::sched::IDLE_WATCH_NS != 0
+        {
             let end = self.now().saturating_add(me.watch.length());
             loop {
                 // SAFETY: STI takes effect after the next instruction, so
@@ -468,21 +471,37 @@ impl Hal for X86 {
                 if !me.mode.watching() {
                     break;
                 }
+                // A device wrote a watched line's news (`IrqWatch`): the
+                // kernel delivers it as the interrupt, which has not come yet.
+                if changed(words) {
+                    me.mode.enter_kernel();
+                    return true;
+                }
                 let now = self.now();
                 if now >= until {
                     // The deadline came while watching: no timer was needed.
                     me.mode.enter_kernel();
-                    return;
+                    return true;
                 }
                 if now >= end {
+                    if !words.is_empty() {
+                        // The kernel tells the devices to interrupt before
+                        // this processor halts (`IrqQuiet`).
+                        me.mode.enter_kernel();
+                        return false;
+                    }
                     break;
                 }
                 core::hint::spin_loop();
             }
             if !me.mode.stop_watching() {
                 me.mode.enter_kernel();
-                return;
+                return true;
             }
+        } else if kernel_core::sched::IDLE_WATCH_NS != 0 && !me.mode.stop_watching() {
+            // Poked since `idle_begin`: there is work to look for.
+            me.mode.enter_kernel();
+            return true;
         }
         let early = me.wake_ns.get();
         let armed = if until == u64::MAX { u64::MAX } else { until.saturating_sub(early).max(1) };
@@ -516,6 +535,7 @@ impl Hal for X86 {
             }
         }
         me.mode.enter_kernel();
+        true
     }
 
     fn cpu_slot(&self) -> usize {
@@ -1435,4 +1455,20 @@ pub extern "C" fn kmain(info: u64) -> ! {
     // SAFETY: the tables, the processor and the root thread are set up and
     // the kernel is entered; this is the first exit to user mode.
     unsafe { cpu::exit_to_user() }
+}
+
+/// Whether a watched word (`Hal::idle`) no longer holds what it held at the
+/// line's last delivery.
+#[inline(always)]
+fn changed(words: &[kernel_core::hal::Watched]) -> bool {
+    words.iter().any(|w| {
+        // SAFETY: `at` is in the kernel's window on physical memory, in a
+        // frame of RAM (not device memory: `IrqWatch` refuses those) that was
+        // live when the scheduler gathered it under this processor's lock.
+        // If it is destroyed meanwhile the processor is kicked out of this
+        // wait; a read before that sees reused memory, which is only a reason
+        // for the kernel to look again under the lock (`poll_watches`).
+        let v = unsafe { w.at.read_volatile() };
+        v & w.mask != w.seen
+    })
 }

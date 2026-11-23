@@ -8,6 +8,21 @@ use silica_abi::{Error, Rights};
 /// Number of words in a thread's saved register frame.
 pub const NREGS: usize = 40;
 
+/// A word an idle processor watches (`IrqWatch`, `watch.rs`): its address
+/// in the kernel's window on physical memory, and what it held, under
+/// `mask`, when the line was last delivered.
+#[derive(Clone, Copy, Debug)]
+pub struct Watched {
+    pub at: *const u32,
+    pub mask: u32,
+    pub seen: u32,
+}
+
+impl Watched {
+    /// Nothing: a placeholder in an array.
+    pub const NONE: Watched = Watched { at: core::ptr::null(), mask: 0, seen: 0 };
+}
+
 /// Architecture operations and constants.
 pub trait Hal {
     /// Frame index of the instruction pointer.
@@ -171,7 +186,14 @@ pub trait Hal {
     /// so a deadline is met on time rather than late by the wake-up latency.
     /// Called without this processor's lock, so the handler must not touch
     /// kernel state.
-    fn idle(&self, until: u64);
+    /// With `Some(words)`, watch for work first ([`crate::sched::Watch`]),
+    /// and watch `words` as well (`IrqWatch`): one that no longer holds
+    /// `seen` under its mask ends the wait as work would, and the caller
+    /// delivers it. When the watch ends with nothing and `words` is not
+    /// empty, return `false` without halting: the caller tells the devices
+    /// to interrupt again (`IrqQuiet`), looks once more, and calls again
+    /// with `None`, which halts without watching. Otherwise `true`.
+    fn idle(&self, until: u64, words: Option<&[Watched]>) -> bool;
     /// Whether this processor's timer is still armed: set and not yet fired.
     fn timer_armed(&self) -> bool;
     /// Route interrupt line `line` to processor `cpu`, with the given

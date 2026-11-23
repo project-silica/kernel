@@ -54,6 +54,15 @@ pub struct TestHal {
     pub forgets: Cell<u64>,
     /// What the kernel asked of the interrupt controller, in order.
     pub irq_log: RefCell<Vec<String>>,
+    /// Idle waits a watched word ended (`IrqWatch`), and watches over words
+    /// that ended with nothing.
+    pub watch_wakes: Cell<u64>,
+    pub watch_ends: Cell<u64>,
+    /// A word of the machine's memory (its host address; 0: none) read in
+    /// each watch over words: what a device would see while the processor
+    /// watches.
+    pub spy: Cell<usize>,
+    pub spied: Cell<u32>,
     /// The machine's IOMMU: how far device addresses reach (0: no IOMMU),
     /// whether it maps 2 MiB with one entry, which device identity is
     /// attached to which root table, and how often its cache was flushed.
@@ -205,7 +214,32 @@ impl Hal for TestHal {
         n > 0
     }
     fn idle_begin(&self) {}
-    fn idle(&self, until: u64) {
+    fn idle(&self, until: u64, words: Option<&[kernel_core::hal::Watched]>) -> bool {
+        // A watched word already changed: the watch sees it before any
+        // timer (as the architecture's watch loop does). Otherwise a watch
+        // over words ends with nothing (`watch_ends` of them, then halts as
+        // the caller asks next).
+        if let Some(words) = words.filter(|w| !w.is_empty()) {
+            let changed = || {
+                words.iter().any(|w| {
+                    // SAFETY: the words are this machine's own memory, in the
+                    // window the kernel was given.
+                    let v = unsafe { w.at.read_volatile() };
+                    v & w.mask != w.seen
+                })
+            };
+            if changed() {
+                self.watch_wakes.set(self.watch_wakes.get() + 1);
+                return true;
+            }
+            let spy = self.spy.get();
+            if spy != 0 {
+                // SAFETY: an address in this machine's memory the test named.
+                self.spied.set(unsafe { (spy as *const u32).read_volatile() });
+            }
+            self.watch_ends.set(self.watch_ends.get() + 1);
+            return false;
+        }
         // As hardware: a timer armed sooner is left; each processor's timer
         // fires once, at its deadline (at once if that has passed), and not
         // again until it is set anew. Idling with none armed would sleep
@@ -216,6 +250,7 @@ impl Hal for TestHal {
         }
         assert!(self.armed[c].replace(false), "idle with no timer armed: the processor would sleep for ever");
         self.now.set(self.now.get().max(self.timers[c].get()));
+        true
     }
     fn timer_armed(&self) -> bool {
         self.armed[self.cpu.get()].get()
@@ -322,6 +357,15 @@ impl Machine {
         self.k.leave();
     }
 
+    /// The current processor, with nothing to run, waits for work in the
+    /// scheduler's idle loop until something wakes a thread (it must: a
+    /// timer armed, or a watched word changed).
+    pub fn idle(&self) {
+        self.k.enter();
+        self.k.schedule();
+        self.k.leave();
+    }
+
     /// A timer interrupt on the current processor.
     pub fn tick(&self) {
         self.k.enter();
@@ -375,6 +419,10 @@ impl Machine {
             resets: Cell::new(0),
             forgets: Cell::new(0),
             irq_log: RefCell::new(Vec::new()),
+            watch_wakes: Cell::new(0),
+            watch_ends: Cell::new(0),
+            spy: Cell::new(0),
+            spied: Cell::new(0),
             io_top: Cell::new(1 << 48),
             io_large: Cell::new(true),
             attached: RefCell::new(std::collections::BTreeMap::new()),

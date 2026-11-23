@@ -105,7 +105,9 @@ impl Hal for Hal0 {
         })
     }
     fn idle_begin(&self) {}
-    fn idle(&self, _: u64) {}
+    fn idle(&self, _: u64, _: Option<&[crate::hal::Watched]>) -> bool {
+        true
+    }
     fn timer_armed(&self) -> bool {
         false
     }

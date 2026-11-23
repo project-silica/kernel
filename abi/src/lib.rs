@@ -197,11 +197,51 @@ pub enum Syscall {
     /// plain `Recv`. A call of its own rather than an argument of `Recv`, so
     /// that every other receive pays nothing for it.
     SignalRecv = 23,
+    /// `a0` interrupt-line capability, `a1` a message-signalled line bound
+    /// with `IrqBind`, `a2` a Frame (readable; 0: stop watching), `a3` the
+    /// offset of a 32-bit word in it (a multiple of 4), `a4` a mask (its low
+    /// 32 bits; not 0). Says that the line's news is that word: the device
+    /// changes `word & mask` whenever it raises the line, and the driver
+    /// takes all of it each time it is signalled (virtio's used index, which
+    /// the device advances before it interrupts). From then on a processor
+    /// with nothing to run, watching for work before it halts, watches the
+    /// word as well, and a change is delivered at once as the interrupt
+    /// would be: the line's notification signalled with its badge. The
+    /// interrupt that follows is delivered only if the word changed again
+    /// since: one news, one signal. A processor that halts (its watch ended
+    /// with nothing) is woken by the interrupt as before, so nothing waits
+    /// longer than without the watch. The watch lasts while the frame's
+    /// capability stays in slot `a2`: once that slot holds anything else it
+    /// is inert (every interrupt delivered, nothing read). Rebinding the
+    /// line, or destroying the notification or the CapSpace, ends it. The word is watched by
+    /// the processor of the calling thread: call it from the thread that
+    /// bound the line, which is where the line is delivered. `BadArg` for a line that
+    /// is a wire or not bound, a word outside the frame, or a mask of 0;
+    /// `NoMemory` when the kernel's watches ([`IRQ_WATCHES`]) are all in use.
+    IrqWatch = 24,
+    /// `a0` interrupt-line capability, `a1` a line watched with `IrqWatch`,
+    /// `a2` a Frame (writable), `a3` the offset of a 32-bit word in it (a
+    /// multiple of 4), `a4` bits of that word (not 0) that tell the device
+    /// not to interrupt (virtio's `VRING_AVAIL_F_NO_INTERRUPT`). From then
+    /// on those bits are the kernel's to write, and the program must not
+    /// store to them (it may store to the word's other bits): they are set
+    /// while a processor watches the line's word and clear at every other
+    /// time, so the device interrupts exactly when nobody is watching for
+    /// it, and is told before the watch ends. Only for a device that writes
+    /// its news before it reads these bits and interrupts whenever they are
+    /// clear (virtio without event indices). Lasts while the frame's
+    /// capability stays in slot `a2` (keep it there: a device left quiet
+    /// interrupts nobody), and ends with the watch, its bits left clear. `BadArg` for a line not watched, a word outside the
+    /// frame, or no bits.
+    IrqQuiet = 25,
 }
+
+/// Interrupt lines that can be watched (`IrqWatch`) at once.
+pub const IRQ_WATCHES: usize = 16;
 
 impl Syscall {
     /// One past the highest syscall number.
-    pub const COUNT: u64 = 24;
+    pub const COUNT: u64 = 26;
 
     /// Decode a syscall number.
     pub const fn from_u64(n: u64) -> Option<Syscall> {
@@ -230,6 +270,8 @@ impl Syscall {
             21 => Syscall::SchedConfigure,
             22 => Syscall::DeviceAttach,
             23 => Syscall::SignalRecv,
+            24 => Syscall::IrqWatch,
+            25 => Syscall::IrqQuiet,
             _ => return None,
         })
     }

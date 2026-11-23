@@ -33,6 +33,7 @@ pub mod smp;
 pub mod thread;
 pub mod untyped;
 pub mod vm;
+pub mod watch;
 
 pub use kernel::Kernel;
 

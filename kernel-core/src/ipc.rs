@@ -351,6 +351,11 @@ impl<H: Hal> Kernel<H> {
             self.hal.irq_mask(line, true);
             return;
         }
+        // A watched line whose word has not changed since it was last
+        // delivered: the idle watch delivered this news already.
+        if !self.line_news(line) {
+            return;
+        }
         let q = self.queue(n);
         let me = self.hal.cpu() as u64;
         // Its waiter, or its listener and the endpoint that one waits on,

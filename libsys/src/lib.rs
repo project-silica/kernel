@@ -402,6 +402,24 @@ pub fn irq_bind_msi(lines: Cap, line: u32, notification: Cap, devices: Cap, devi
     sys(Syscall::IrqBind, [lines.0, line as u64, notification.0, IRQ_MSI, devices.0, device as u64]).map(|r| (r[0], r[1]))
 }
 
+/// The news of the message-signalled `line` is the 32-bit word at `offset`
+/// in `frame`, masked by `mask` (see `Syscall::IrqWatch`): a processor
+/// idling where the line is delivered sees the device change it, and signals
+/// as the interrupt would, sooner; the interrupt then wakes nobody again.
+/// The driver must take everything new each time it is signalled. `frame`
+/// [`Cap::NONE`] stops watching.
+pub fn irq_watch(lines: Cap, line: u32, frame: Cap, offset: u64, mask: u32) -> Result<()> {
+    sys(Syscall::IrqWatch, [lines.0, line as u64, frame.0, offset, mask as u64, 0]).map(|_| ())
+}
+
+/// While the watched `line` is watched, the bits `bits` of the 32-bit word
+/// at `offset` in `frame` say "no interrupt" to the device, and at every
+/// other time they are clear (see `Syscall::IrqQuiet`). The program does not
+/// store to those bits from then on.
+pub fn irq_quiet(lines: Cap, line: u32, frame: Cap, offset: u64, bits: u32) -> Result<()> {
+    sys(Syscall::IrqQuiet, [lines.0, line as u64, frame.0, offset, bits as u64, 0]).map(|_| ())
+}
+
 /// A new address space for devices, with `2^bits` bytes for its tables (at
 /// least 14), in slot `slot` of `space`. Frames mapped in it ([`map`]; the
 /// address is the device's) are what the devices attached to it

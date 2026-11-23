@@ -37,6 +37,9 @@ pub struct Kernel<H: Hal> {
     /// The notification and badge each interrupt line signals (changed
     /// only by a holder of every lock).
     pub(crate) irqs: [(Cell<Paddr>, Cell<u64>); silica_abi::IRQ_LINES as usize],
+    /// Watched lines (`watch.rs`), and how many entries are in use.
+    pub(crate) watches: [crate::watch::LineWatch; silica_abi::IRQ_WATCHES],
+    pub(crate) nwatches: Cell<usize>,
 }
 
 impl<H: Hal> Kernel<H> {
@@ -53,6 +56,8 @@ impl<H: Hal> Kernel<H> {
             globals: Cell::new(0),
             reap: Cell::new(0),
             irqs: [const { (Cell::new(0), Cell::new(0)) }; silica_abi::IRQ_LINES as usize],
+            watches: [const { crate::watch::LineWatch::new() }; silica_abi::IRQ_WATCHES],
+            nwatches: Cell::new(0),
         }
     }
 
@@ -665,7 +670,9 @@ impl<H: Hal> Kernel<H> {
                     let (_, n) = self.ccap(t, a[2], ObjectType::Notification, Rights::WRITE)?;
                     (n.obj, n.badge.max(1))
                 };
-                // Whatever the line signalled before no longer hears from it.
+                // Whatever the line signalled before no longer hears from it,
+                // and its news is no longer known.
+                self.unwatch_line(line);
                 let old = self.irqs[line].0.replace(0);
                 self.hal.irq_mask(line, true);
                 if old != 0 {
@@ -697,6 +704,58 @@ impl<H: Hal> Kernel<H> {
                     self.irqs[line].1.set(badge);
                     let q = self.queue(to);
                     q.bound.set(q.bound.get() + 1);
+                }
+                Ok(Exit::Done)
+            }
+            Syscall::IrqQuiet => {
+                let (_, hw) = self.ccap(t, a[0], ObjectType::Hw, Rights::WRITE)?;
+                if hw.flags & crate::cap::FLAG_IRQS == 0 {
+                    return Err(Error::WrongType);
+                }
+                if a[1] < hw.obj || a[1] >= hw.badge || a[1] >= silica_abi::IRQ_LINES {
+                    return Err(Error::BadArg);
+                }
+                let (slot, frame) = self.ccap(t, a[2], ObjectType::Frame, Rights(Rights::READ.0 | Rights::WRITE.0))?;
+                let size = 1u64 << frame.bits;
+                let bits = a[4] as u32;
+                if frame.flags & crate::cap::FLAG_DEVICE != 0 || !a[3].is_multiple_of(4) || a[3] >= size || bits == 0 || a[4] >> 32 != 0 {
+                    return Err(Error::BadArg);
+                }
+                if !self.quiet_line(a[1] as usize, slot, frame.obj, a[3], bits) {
+                    return Err(Error::BadArg);
+                }
+                Ok(Exit::Done)
+            }
+            Syscall::IrqWatch => {
+                let (_, hw) = self.ccap(t, a[0], ObjectType::Hw, Rights::WRITE)?;
+                if hw.flags & crate::cap::FLAG_IRQS == 0 {
+                    return Err(Error::WrongType);
+                }
+                if a[1] < hw.obj || a[1] >= hw.badge || a[1] >= silica_abi::IRQ_LINES {
+                    return Err(Error::BadArg);
+                }
+                let line = a[1] as usize;
+                if a[2] == 0 {
+                    self.unwatch_line(line);
+                    return Ok(Exit::Done);
+                }
+                let (slot, frame) = self.ccap(t, a[2], ObjectType::Frame, Rights::READ)?;
+                let size = 1u64 << frame.bits;
+                // A message line, bound: a wire may be shared, and its
+                // interrupt held off until acknowledged.
+                let mask = a[4] as u32;
+                if line < self.hal.msi_first()
+                    || self.irqs[line].0.get() == 0
+                    || frame.flags & crate::cap::FLAG_DEVICE != 0
+                    || !a[3].is_multiple_of(4)
+                    || a[3] >= size
+                    || mask == 0
+                    || a[4] >> 32 != 0
+                {
+                    return Err(Error::BadArg);
+                }
+                if !self.watch_line(line, self.hal.cpu(), slot, frame.obj, a[3], mask) {
+                    return Err(Error::NoMemory);
                 }
                 Ok(Exit::Done)
             }

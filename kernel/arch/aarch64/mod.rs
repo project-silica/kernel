@@ -659,9 +659,12 @@ impl Hal for Arm {
         percpu().deadline.get() != u64::MAX
     }
 
-    fn idle(&self, until: u64) {
-        // Watch for work first, as on x86 (`IDLE_WATCH_NS`).
-        if kernel_core::sched::IDLE_WATCH_NS != 0 {
+    fn idle(&self, until: u64, words: Option<&[kernel_core::hal::Watched]>) -> bool {
+        // Watch for work first, as on x86 (`IDLE_WATCH_NS`); without `words`
+        // the watch already ran (`Hal::idle`).
+        if let Some(words) = words
+            && kernel_core::sched::IDLE_WATCH_NS != 0
+        {
             let me = percpu();
             let end = self.now().saturating_add(me.watch.length());
             loop {
@@ -671,20 +674,33 @@ impl Hal for Arm {
                 if !me.mode.watching() {
                     break;
                 }
+                // A watched line's news (`IrqWatch`), before its interrupt.
+                if changed(words) {
+                    me.mode.enter_kernel();
+                    return true;
+                }
                 let now = self.now();
                 if now >= until {
                     me.mode.enter_kernel();
-                    return;
+                    return true;
                 }
                 if now >= end {
+                    if !words.is_empty() {
+                        // Devices told to be quiet are told to interrupt first.
+                        me.mode.enter_kernel();
+                        return false;
+                    }
                     break;
                 }
                 core::hint::spin_loop();
             }
             if !me.mode.stop_watching() {
                 me.mode.enter_kernel();
-                return;
+                return true;
             }
+        } else if kernel_core::sched::IDLE_WATCH_NS != 0 && !percpu().mode.stop_watching() {
+            percpu().mode.enter_kernel();
+            return true;
         }
         // Only ever earlier (`Hal::idle`): a timer armed sooner fires early
         // once and the scheduler comes back here.
@@ -704,6 +720,7 @@ impl Hal for Arm {
             percpu().watch.woken_after(now - halted);
         }
         percpu().mode.enter_kernel();
+        true
     }
 
     fn cpu(&self) -> usize {
@@ -1041,3 +1058,17 @@ static BOOT_CPU: PerCpu = PerCpu::new(0, 0, 0);
 
 /// The first-level table TTBR0 holds while no user address space is loaded.
 static EMPTY_ROOT: Table = Table(UnsafeCell::new([0; 512]));
+
+/// Whether a watched word (`Hal::idle`) no longer holds what it held at the
+/// line's last delivery.
+#[inline(always)]
+fn changed(words: &[kernel_core::hal::Watched]) -> bool {
+    words.iter().any(|w| {
+        // SAFETY: as on x86_64: `at` is in the kernel's window on physical
+        // memory, in a frame of RAM live when the scheduler gathered it; a
+        // read of reused memory only makes the kernel look again under the
+        // lock. The device's write is seen through coherent DMA.
+        let v = unsafe { w.at.read_volatile() };
+        v & w.mask != w.seen
+    })
+}

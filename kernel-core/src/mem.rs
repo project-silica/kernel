@@ -52,6 +52,36 @@ impl Phys {
         unsafe { &*self.ptr(p).cast::<Cell<u64>>() }
     }
 
+    /// The 32-bit word at `p` of a frame a device writes (`IrqWatch`),
+    /// read once as the device left it.
+    pub(crate) fn device_word(&self, p: Paddr) -> u32 {
+        debug_assert!(p != 0 && p.is_multiple_of(4));
+        // SAFETY: `p` is in a live frame (module invariant: a watch ends when
+        // its frame is destroyed), aligned; a device may write it at any
+        // time, so it is read with one volatile load and the value is
+        // only a fact about that moment.
+        unsafe { self.ptr(p).cast::<u32>().read_volatile() }
+    }
+
+    /// Set the bits `set` and clear the bits `clear` of the 32-bit word at
+    /// `p` of a frame a device reads (`IrqQuiet`), in one atomic step each:
+    /// the program sharing the word with the device may store to its other
+    /// bits at the same time, and keeps what it stored.
+    pub(crate) fn device_word_update(&self, p: Paddr, set: u32, clear: u32) {
+        debug_assert!(p != 0 && p.is_multiple_of(4));
+        // SAFETY: `p` is in a live frame of RAM (module invariant: a watch
+        // ends when its frames are destroyed), aligned for a u32; others
+        // write it only with atomic or plain stores the hardware keeps
+        // apart from this read-modify-write, which is what an atomic is.
+        let w = unsafe { &*self.ptr(p).cast::<core::sync::atomic::AtomicU32>() };
+        if set != 0 {
+            w.fetch_or(set, core::sync::atomic::Ordering::SeqCst);
+        }
+        if clear != 0 {
+            w.fetch_and(!clear, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// Fill `[p, p + len)` with zeros.
     pub fn zero(&self, p: Paddr, len: u64) {
         // SAFETY: the range is owned by the kernel (module invariant) and no

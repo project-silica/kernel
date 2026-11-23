@@ -513,6 +513,7 @@ impl<H: Hal> Kernel<H> {
         if qu.bound.replace(0) != 0 {
             for (line, irq) in self.irqs.iter().enumerate() {
                 if irq.0.get() == q {
+                    self.unwatch_line(line);
                     irq.0.set(0);
                     self.hal.irq_mask(line, true);
                 }
@@ -691,10 +692,7 @@ impl<H: Hal> Kernel<H> {
             // The program's root stays loaded (no switch on the way to idle
             // and back): an address space destroyed meanwhile is left first
             // (`Kernel::evict`, answered while this waits for its lock).
-            self.hal.idle_begin();
-            me.lock.unlock();
-            self.hal.idle(until);
-            self.enter_from_idle();
+            self.wait_idle(until);
             // The interrupt may have been the timer: look at deadlines. A
             // timer that fired is armed afresh when one is next needed; one
             // still armed fires no later than `until`, so it stays armed
@@ -713,6 +711,34 @@ impl<H: Hal> Kernel<H> {
             me.loaded_root.set(root);
         }
         me.dirty.set(false);
+    }
+
+    /// Nothing to run: wait for work, or until `until`, with this
+    /// processor's lock let go meanwhile. Returns holding it again.
+    #[cold]
+    #[inline(never)]
+    fn wait_idle(&self, until: u64) {
+        let me = self.me();
+        let mut words = [crate::hal::Watched::NONE; crate::watch::WATCHED_PER_CPU];
+        let watched = self.begin_watches(&mut words);
+        self.hal.idle_begin();
+        me.lock.unlock();
+        let halted = self.hal.idle(until, Some(&words[..watched]));
+        self.enter_from_idle();
+        if watched == 0 {
+            return;
+        }
+        // The devices interrupt again, and what they wrote meanwhile is
+        // delivered (`watch.rs`).
+        self.end_watches();
+        if halted || me.rq_head.get() != 0 || me.dl_head.get() != 0 || me.direct.get() != 0 || self.hal.now() >= until {
+            return;
+        }
+        // The watch ran its length with nothing: halt, without watching again.
+        self.hal.idle_begin();
+        me.lock.unlock();
+        self.hal.idle(until, None);
+        self.enter_from_idle();
     }
 
     /// Whether the scheduler would decide what it decided last time: the
