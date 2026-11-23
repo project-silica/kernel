@@ -255,6 +255,10 @@ impl Hal for X86 {
         }
     }
 
+    // In line in each way out of the kernel (`syscall_rust`, which never
+    // returns, saves no registers; a call here saved six again: profile.sh
+    // --kvm --bench ctx put 47% of the switch in this function's own frame).
+    #[inline(always)]
     fn switch_thread(&self, phys: &Phys, from: Paddr, to: Paddr, root: Paddr) {
         let kind = self.xsave_kind.get();
         let to_regs = kernel().regs(to);
