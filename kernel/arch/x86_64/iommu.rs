@@ -22,6 +22,16 @@
 //!
 //! A refused access is recorded by the unit and raises its fault interrupt,
 //! which logs who was refused what (the first [`FAULT_LINES`] times).
+//!
+//! Interrupts are remapped too, where every unit can (ECAP.IR, with
+//! extended interrupt mode for x2APIC destinations): a device's message is
+//! only an index into the kernel's table of [`IRT_ENTRIES`] entries, one per
+//! interrupt line, and the unit delivers it only if the entry names that
+//! device as its source ([`remap`]). Messages in the old format, which name
+//! a processor and vector directly, are blocked. So a device can raise no
+//! interrupt but the ones its driver bound, and none of another device's. The
+//! I/O APICs' lines are entries as well, their source the I/O APIC the DMAR
+//! table places. Units of other segments get a table of their own, empty.
 
 use super::cpu::percpu;
 use core::cell::UnsafeCell;
@@ -55,6 +65,18 @@ const FEADDR: u64 = 0x40;
 const FEUADDR: u64 = 0x44;
 const IQT: u64 = 0x88;
 const IQA: u64 = 0x90;
+const IRTA: u64 = 0xB8;
+const ECAP_IR: u64 = 1 << 3;
+const ECAP_EIM: u64 = 1 << 4;
+const GCMD_IRE: u32 = 1 << 25;
+const GCMD_SIRTP: u32 = 1 << 24;
+const GCMD_CFI: u32 = 1 << 23;
+/// Entries of the interrupt remapping table: one per line, one page.
+pub const IRT_ENTRIES: usize = 256;
+/// The table's size as IRTA says it: 2^(S + 1) entries.
+const IRT_SIZE: u64 = 7;
+/// I/O APICs whose source identifier the DMAR gives.
+const MAX_IOAPICS: usize = 8;
 const GCMD_TE: u32 = 1 << 31;
 const GCMD_SRTP: u32 = 1 << 30;
 const GCMD_QIE: u32 = 1 << 26;
@@ -93,6 +115,13 @@ struct State {
     /// Devices attached per bus, so releasing an address space looks only
     /// at buses that have any.
     per_bus: [u16; 256],
+    /// The interrupt remapping table (0: interrupts are not remapped), and
+    /// whether its destinations are 32-bit x2APIC identifiers.
+    irt: u64,
+    eime: bool,
+    /// Each I/O APIC's identifier and source identifier, from the DMAR.
+    ioapics: [(u8, u16); MAX_IOAPICS],
+    ioapic_count: usize,
 }
 
 struct Racy(UnsafeCell<State>);
@@ -113,12 +142,18 @@ static STATE: Racy = Racy(UnsafeCell::new(State {
     domains: [1, 0, 0, 0],
     domain_limit: DOMAINS,
     per_bus: [0; 256],
+    irt: 0,
+    eime: false,
+    ioapics: [(0, 0); MAX_IOAPICS],
+    ioapic_count: 0,
 }));
 static LOCK: Lock = Lock::new();
 static REPORTED: AtomicU32 = AtomicU32::new(0);
 /// `top` again, readable without the lock: 0 until the units translate.
 static TOP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static LARGE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Interrupts are remapped: readable without the lock.
+static REMAPPING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn r32(phys: &Phys, base: u64, reg: u64) -> u32 {
     // SAFETY: a register of a remapping unit at the address the firmware
@@ -221,6 +256,23 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
             if fits && segment == 0 && s.n < MAX_UNITS {
                 s.units[s.n].base = base;
                 s.n += 1;
+                // Its device scopes: an I/O APIC's (type 3) gives the source
+                // identifier its interrupts carry.
+                let mut at = 16;
+                while let (Some(kind), Some(n)) = (field(at, 1), field(at + 1, 1)) {
+                    if n < 6 || at + n as usize > len as usize {
+                        break;
+                    }
+                    if let (3, Some(id), Some(bus), Some(dev), Some(func)) =
+                        (kind, field(at + 4, 1), field(at + 5, 1), field(at + 6, 1), field(at + 7, 1))
+                        && n >= 8
+                        && s.ioapic_count < MAX_IOAPICS
+                    {
+                        s.ioapics[s.ioapic_count] = (id as u8, (bus << 8 | dev << 3 | func) as u16);
+                        s.ioapic_count += 1;
+                    }
+                    at += n as usize;
+                }
             } else if fits && others < MAX_UNITS {
                 other_segments[others] = base;
                 others += 1;
@@ -234,7 +286,7 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
         return;
     }
     // What every unit of segment 0 can do.
-    let (mut widths, mut mgaw) = (0b110u64, 64);
+    let (mut widths, mut mgaw, mut remap) = (0b110u64, 64, true);
     for u in &mut s.units[..s.n] {
         let (cap, ecap) = (r64(phys, u.base, CAP), r64(phys, u.base, ECAP));
         widths &= cap >> 8 & 0x1F;
@@ -246,6 +298,7 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
         if ecap & 2 == 0 || u.fault_regs + u.fault_count * 16 > PAGE {
             widths = 0;
         }
+        remap &= ecap & ECAP_IR != 0 && ecap & ECAP_EIM != 0;
     }
     if widths == 0 {
         // Too old a unit (no queued invalidation, or neither 39 nor 48
@@ -256,25 +309,29 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
     }
     s.four_levels = widths & 0b100 != 0;
     // Root table, an empty root for other segments, the wait status word's
-    // page, the context tables, and a queue page per unit.
-    let pages = 3 + CONTEXT_TABLES + (s.n + others) as u64;
+    // page, the interrupt remapping table and an empty one for other
+    // segments, the context tables, and a queue page per unit.
+    let pages = 5 + CONTEXT_TABLES + (s.n + others) as u64;
     let Some(mem) = table.carve(pages * PAGE, PAGE, 1 << 20, bi.phys_map_len) else {
         klog!(super::kernel(), "kernel: no memory for the IOMMU's tables; devices are not confined");
         s.n = 0;
         return;
     };
     phys.zero(mem, pages * PAGE);
-    (s.root, s.status, s.pool) = (mem, mem + 2 * PAGE, mem + 3 * PAGE);
+    (s.root, s.status, s.pool) = (mem, mem + 2 * PAGE, mem + 5 * PAGE);
     let queues = s.pool + CONTEXT_TABLES * PAGE;
+    // A unit of another segment remaps nothing: its devices' identifiers
+    // could be those of segment 0's.
+    let (irt, empty_irt) = if remap { (Some(mem + 3 * PAGE), Some(mem + 4 * PAGE)) } else { (None, None) };
     for (i, base) in other_segments[..others].iter().enumerate() {
         let mut u = Unit { base: *base, queue: queues + (s.n + i) as u64 * PAGE, fault_regs: 0, fault_count: 0, gcmd: 0 };
-        start(phys, &mut u, mem + PAGE, s.status);
+        start(phys, &mut u, mem + PAGE, s.status, empty_irt);
     }
     let boot_apic = percpu().apic_id as u64;
     for i in 0..s.n {
         let mut u = s.units[i];
         u.queue = queues + i as u64 * PAGE;
-        start(phys, &mut u, s.root, s.status);
+        start(phys, &mut u, s.root, s.status, irt);
         // Its fault interrupt, to the boot processor.
         if boot_apic < 0xFF {
             w32(phys, u.base, FEDATA, FAULT_VECTOR as u32);
@@ -292,20 +349,43 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
     s.top = 1 << mgaw.min(if s.four_levels { 48 } else { 39 });
     TOP.store(s.top, Ordering::Release);
     LARGE.store(s.large, Ordering::Release);
+    if let Some(table) = irt {
+        (s.irt, s.eime) = (table, true);
+        REMAPPING.store(true, Ordering::Release);
+        klog!(super::kernel(), "kernel: interrupts are remapped: a device raises only the interrupts its driver bound");
+        if s.ioapic_count == 0 {
+            klog!(super::kernel(), "kernel: the DMAR names no I/O APIC: its lines are remapped without checking who raised them");
+        }
+    } else {
+        klog!(super::kernel(), "kernel: this machine's IOMMU does not remap interrupts: a device can raise any interrupt, as anyone");
+    }
 }
 
 /// Point unit `u` at root table `root`, switch its queue on, drop whatever
-/// the firmware left cached, and make it translate.
-fn start(phys: &Phys, u: &mut Unit, root: u64, status: u64) {
+/// the firmware left cached, and make it translate; with `irt`, remap
+/// interrupts through that table and block the old format.
+fn start(phys: &Phys, u: &mut Unit, root: u64, status: u64, irt: Option<u64>) {
     // Whatever the firmware left on: translation off first, so the root
-    // table can change without a window of stale entries.
-    u.gcmd = r32(phys, u.base, GSTS) & (1 << 25 | 1 << 23); // interrupt remapping, if the firmware uses it, stays
+    // table can change without a window of stale entries. Interrupt
+    // remapping, if the firmware uses it and this kernel does not, stays.
+    u.gcmd = if irt.is_some() { 0 } else { r32(phys, u.base, GSTS) & (GCMD_IRE | GCMD_CFI) };
     w32(phys, u.base, GCMD, u.gcmd);
-    wait("switching translation off", || r32(phys, u.base, GSTS) & (GCMD_TE | GCMD_QIE) == 0);
+    let off = GCMD_TE | GCMD_QIE | if irt.is_some() { GCMD_IRE } else { 0 };
+    wait("switching translation off", || r32(phys, u.base, GSTS) & off == 0);
     w64(phys, u.base, IQT, 0);
     w64(phys, u.base, IQA, u.queue);
     u.gcmd |= GCMD_QIE;
     command(phys, u, GCMD_QIE, "switching its queue on");
+    if let Some(table) = irt {
+        // Extended interrupt mode: destinations are x2APIC identifiers.
+        w64(phys, u.base, IRTA, table | 1 << 11 | IRT_SIZE);
+        command(phys, u, GCMD_SIRTP, "taking the interrupt remapping table");
+        let one = State { units: [*u; MAX_UNITS], n: 1, status, ..empty() };
+        invalidate(phys, &one, &[[4, 0]]);
+        // On, with the old format blocked (CFI stays clear).
+        u.gcmd |= GCMD_IRE;
+        command(phys, u, GCMD_IRE, "switching interrupt remapping on");
+    }
     w64(phys, u.base, RTADDR, root);
     command(phys, u, GCMD_SRTP, "taking the root table");
     // Global invalidation of the context cache and the IOTLB.
@@ -330,6 +410,10 @@ const fn empty() -> State {
         domains: [1, 0, 0, 0],
         domain_limit: DOMAINS,
         per_bus: [0; 256],
+        irt: 0,
+        eime: false,
+        ioapics: [(0, 0); MAX_IOAPICS],
+        ioapic_count: 0,
     }
 }
 
@@ -341,6 +425,54 @@ pub fn top() -> u64 {
 /// Whether 2 MiB is mapped with one entry.
 pub fn large() -> bool {
     LARGE.load(Ordering::Acquire)
+}
+
+/// Whether interrupts are remapped: a message line is then raised through
+/// [`remap`], and an I/O APIC line too.
+pub fn remapping() -> bool {
+    REMAPPING.load(Ordering::Acquire)
+}
+
+/// The source identifier of the I/O APIC with identifier `id`, as the
+/// DMAR gives it.
+pub fn ioapic_source(id: u8) -> Option<u16> {
+    LOCK.lock();
+    // SAFETY: under `LOCK`.
+    let s = unsafe { &*STATE.0.get() };
+    let found = s.ioapics[..s.ioapic_count].iter().find(|(i, _)| *i == id).map(|(_, sid)| *sid);
+    LOCK.unlock();
+    found
+}
+
+/// Make remapping entry `line` deliver `vector` to the processor with x2APIC
+/// identifier `apic_id`, level- or edge-triggered, and only when the
+/// device with source identifier `source` raises it (`None`: whoever does;
+/// for an I/O APIC the DMAR does not place). Returns the entry's handle
+/// for the message or the I/O APIC's entry, once no unit holds the old
+/// entry; `None` when interrupts are not remapped.
+pub fn remap(phys: &Phys, line: usize, apic_id: u32, vector: u8, level: bool, source: Option<u16>) -> Option<u16> {
+    if !remapping() || line >= IRT_ENTRIES {
+        return None;
+    }
+    LOCK.lock();
+    // SAFETY: under `LOCK`.
+    let s = unsafe { &*STATE.0.get() };
+    let at = s.irt + line as u64 * 16;
+    // Present, physical destination, fixed delivery; the source checked
+    // in full (SVT 1, SQ 0).
+    let low = 1 | (level as u64) << 4 | (vector as u64) << 16 | (apic_id as u64) << 32;
+    let high = source.map_or(0, |sid| sid as u64 | 1 << 18);
+    // SAFETY: entry `line` of the kernel's table. Not present while it
+    // changes, so no unit reads half of the old and half of the new.
+    unsafe {
+        word(phys, at).write_volatile(0);
+        word(phys, at + 8).write_volatile(high);
+        word(phys, at).write_volatile(low);
+    }
+    // The entry, by index, out of every unit's cache.
+    invalidate(phys, s, &[[4 | 1 << 4 | (line as u64) << 32, 0]]);
+    LOCK.unlock();
+    Some(line as u16)
 }
 
 /// `Hal::io_attach`.
@@ -504,10 +636,34 @@ pub fn fault(phys: &Phys) {
                     continue;
                 }
                 found = true;
-                let (address, sid, reason, read) = (r64(phys, u.base, at) & !0xFFF, hi & 0xFFFF, hi >> 32 & 0xFF, hi >> 62 & 1 != 0);
+                let lo = r64(phys, u.base, at);
+                let (address, sid, reason, read) = (lo & !0xFFF, hi & 0xFFFF, hi >> 32 & 0xFF, hi >> 62 & 1 != 0);
                 w64(phys, u.base, at + 8, 1 << 63);
                 let n = REPORTED.fetch_add(1, Ordering::Relaxed);
-                if n < FAULT_LINES {
+                if n < FAULT_LINES && reason >= 0x20 {
+                    // An interrupt request: the entry it named is in the
+                    // top bits of the record (VT-d 7.2.2).
+                    if reason == 0x25 {
+                        klog!(
+                            super::kernel(),
+                            "kernel: device {:02x}:{:02x}.{} was refused an interrupt in the old format (IOMMU fault reason {:#x})",
+                            sid >> 8,
+                            sid >> 3 & 31,
+                            sid & 7,
+                            reason
+                        );
+                    } else {
+                        klog!(
+                            super::kernel(),
+                            "kernel: device {:02x}:{:02x}.{} was refused interrupt entry {} (IOMMU fault reason {:#x})",
+                            sid >> 8,
+                            sid >> 3 & 31,
+                            sid & 7,
+                            lo >> 48,
+                            reason
+                        );
+                    }
+                } else if n < FAULT_LINES {
                     klog!(
                         super::kernel(),
                         "kernel: device {:02x}:{:02x}.{} was refused a {} at {:#x} (IOMMU fault reason {})",

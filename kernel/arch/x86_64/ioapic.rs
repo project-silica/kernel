@@ -21,12 +21,14 @@ struct IoApic {
     base: u64,
     first: u32,
     count: u32,
+    /// Its identifier, as the MADT and the DMAR name it.
+    id: u8,
 }
 
 struct Racy(UnsafeCell<[IoApic; 8]>);
 // SAFETY: filled by the boot processor before any interrupt is routed, then only read.
 unsafe impl Sync for Racy {}
-static IOAPICS: Racy = Racy(UnsafeCell::new([IoApic { base: 0, first: 0, count: 0 }; 8]));
+static IOAPICS: Racy = Racy(UnsafeCell::new([IoApic { base: 0, first: 0, count: 0, id: 0 }; 8]));
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 /// The index and data registers of an I/O APIC are used as a pair.
 static REGS: Lock = Lock::new();
@@ -68,7 +70,7 @@ pub fn init(bi: &BootInfo, phys: &Phys) {
                 for pin in 0..count {
                     write(phys, base, 0x10 + 2 * pin, 1 << 16);
                 }
-                list[n] = IoApic { base, first, count };
+                list[n] = IoApic { base, first, count, id: madt[o + 2] };
                 n += 1;
             }
         }
@@ -77,13 +79,13 @@ pub fn init(bi: &BootInfo, phys: &Phys) {
     COUNT.store(n, Ordering::Release);
 }
 
-fn find(line: usize) -> Option<(u64, u32)> {
+fn find(line: usize) -> Option<(u64, u32, u8)> {
     // SAFETY: read-only after `init`.
     let list = unsafe { &*IOAPICS.0.get() };
     list[..COUNT.load(Ordering::Acquire)]
         .iter()
         .find(|a| line as u32 >= a.first && (line as u32) < a.first + a.count)
-        .map(|a| (a.base, line as u32 - a.first))
+        .map(|a| (a.base, line as u32 - a.first, a.id))
 }
 
 /// One past the highest line that is a wire into an I/O APIC: the lines
@@ -95,16 +97,30 @@ pub fn lines() -> usize {
 }
 
 /// Deliver `line` to the processor with APIC identifier `apic_id` and unmask it.
+/// Where interrupts are remapped (`iommu::remapping`) the entry names the
+/// line's remapping entry, which says where it goes.
 pub fn route(phys: &Phys, line: usize, apic_id: u32, level: bool, active_low: bool) -> bool {
-    let Some((base, pin)) = find(line) else { return false };
-    if line >= IRQ_LINES as usize || apic_id > 0xFE {
+    let Some((base, pin, id)) = find(line) else { return false };
+    if line >= IRQ_LINES as usize {
         return false;
     }
+    let vector = FIRST_VECTOR as u32 + line as u32;
+    let (high, low) = if super::iommu::remapping() {
+        let Some(h) = super::iommu::remap(phys, line, apic_id, vector as u8, level, super::iommu::ioapic_source(id)) else { return false };
+        // Remappable format: handle bits 14..0 at 63..49, bit 15 at 11,
+        // the format bit at 48; the vector stays the entry's (EOI matching).
+        let h = h as u32;
+        ((h & 0x7FFF) << 17 | 1 << 16, vector | (h >> 15 & 1) << 11)
+    } else if apic_id > 0xFE {
+        return false;
+    } else {
+        (apic_id << 24, vector)
+    };
     LEVEL[line].store(level, Ordering::Release);
-    let low = (FIRST_VECTOR as u32 + line as u32) | (active_low as u32) << 13 | (level as u32) << 15;
+    let low = low | (active_low as u32) << 13 | (level as u32) << 15;
     REGS.lock();
     write(phys, base, 0x10 + 2 * pin, 1 << 16);
-    write(phys, base, 0x11 + 2 * pin, apic_id << 24);
+    write(phys, base, 0x11 + 2 * pin, high);
     write(phys, base, 0x10 + 2 * pin, low);
     REGS.unlock();
     true
@@ -112,7 +128,7 @@ pub fn route(phys: &Phys, line: usize, apic_id: u32, level: bool, active_low: bo
 
 /// Hold `line` off, or let it interrupt again.
 pub fn mask(phys: &Phys, line: usize, masked: bool) {
-    let Some((base, pin)) = find(line) else { return };
+    let Some((base, pin, _)) = find(line) else { return };
     REGS.lock();
     let low = read(phys, base, 0x10 + 2 * pin);
     write(phys, base, 0x10 + 2 * pin, if masked { low | 1 << 16 } else { low & !(1 << 16) });

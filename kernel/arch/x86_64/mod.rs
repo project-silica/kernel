@@ -213,12 +213,24 @@ impl Hal for X86 {
     fn msi_first(&self) -> usize {
         ioapic::lines()
     }
-    fn msi_route(&self, line: usize, cpu: usize, _source: u64) -> Option<(u64, u64)> {
+    fn msi_route(&self, line: usize, cpu: usize, source: u64) -> Option<(u64, u64)> {
+        let apic = cpu::percpu_of(cpu)?.apic_id;
+        if line >= silica_abi::IRQ_LINES as usize {
+            return None;
+        }
+        let vector = ioapic::FIRST_VECTOR + line as u64;
+        if iommu::remapping() {
+            // The message names the line's remapping entry, which delivers
+            // it only from `source` (segment 0: the units remap no other).
+            let sid = u16::try_from(source).ok()?;
+            let handle = iommu::remap(&kernel().phys, line, apic, vector as u8, false, Some(sid))? as u64;
+            // Remappable format: handle bits 14..0 at 19..5, bit 15 at 2.
+            return Some((0xFEE0_0000 | (handle & 0x7FFF) << 5 | 1 << 4 | (handle >> 15 & 1) << 2, 0));
+        }
         // The message a device writes to raise the line: to one processor,
         // edge-triggered, at the line's vector. Without interrupt remapping
         // the processor is named by eight bits, and nothing checks who sent it.
-        let apic = cpu::percpu_of(cpu)?.apic_id as u64;
-        (apic < 0xFF && line < silica_abi::IRQ_LINES as usize).then_some((0xFEE0_0000 | apic << 12, ioapic::FIRST_VECTOR + line as u64))
+        (apic < 0xFF).then_some((0xFEE0_0000 | (apic as u64) << 12, vector))
     }
 
     fn init_root(&self, phys: &Phys, root: Paddr) {
