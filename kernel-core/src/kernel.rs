@@ -487,7 +487,15 @@ impl<H: Hal> Kernel<H> {
             Syscall::CapMove => {
                 let (_, dst) = self.ccap(t, a[0], ObjectType::CapSpace, Rights::WRITE)?;
                 let d = self.slot_in(&dst, a[1])?;
-                let s = self.cslot(t, a[2])?;
+                // From the caller's own CapSpace, or (a[3]) from slot a[2]
+                // of another it may write: how a parent takes back what it
+                // gave a child before the child goes.
+                let s = if a[3] == 0 {
+                    self.cslot(t, a[2])?
+                } else {
+                    let (_, src) = self.ccap(t, a[3], ObjectType::CapSpace, Rights::WRITE)?;
+                    self.slot_in(&src, a[2])?
+                };
                 if self.slot(s).is_empty() {
                     return Err(Error::BadCap);
                 }

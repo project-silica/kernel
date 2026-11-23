@@ -259,6 +259,13 @@ pub fn cap_move(space: Cap, dst: u64, src: Cap) -> Result<()> {
     sys(Syscall::CapMove, [space.0, dst, src.0, 0, 0, 0]).map(|_| ())
 }
 
+/// Move what slot `index` of the CapSpace `from` holds into slot `dst` of
+/// `space`, keeping its place in the derivation tree: how a parent takes
+/// back a capability it gave a child (`from`: the child's CapSpace).
+pub fn cap_move_from(space: Cap, dst: u64, from: Cap, index: u64) -> Result<()> {
+    sys(Syscall::CapMove, [space.0, dst, index, from.0, 0, 0]).map(|_| ())
+}
+
 /// Delete a capability and everything derived from it. An object is
 /// destroyed with its last capability.
 ///

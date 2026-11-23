@@ -137,6 +137,15 @@ fn copy_narrows_rights_and_revoke_deletes_descendants() {
     assert!(m.cap(FREE + 2).is_none());
     assert_eq!(m.err(S::CapMove, [cs, FREE + 7, FREE + 1, 0, 0, 0]), Error::SlotFull);
     assert_eq!(m.err(S::CapMove, [cs, FREE + 8, FREE + 2, 0, 0, 0]), Error::BadCap);
+    // A move can take from another CapSpace the caller may write (a
+    // parent taking back what it gave a child): here its own, named.
+    m.ok(S::CapMove, [cs, FREE + 8, FREE + 7, cs, 0, 0]);
+    assert!(m.cap(FREE + 7).is_none() && m.cap(FREE + 8).is_some());
+    m.ok(S::CapCopy, [cs, FREE + 9, cs, 1, 0, 0]);
+    assert_eq!(m.err(S::CapMove, [cs, FREE + 7, FREE + 8, FREE + 9, 0, 0]), Error::NoRights, "a CapSpace it may only read");
+    assert_eq!(m.err(S::CapMove, [cs, FREE + 7, FREE + 8, FREE, 0, 0]), Error::WrongType);
+    m.ok(S::CapDelete, [FREE + 9, 0, 0, 0, 0, 0]);
+    m.ok(S::CapMove, [cs, FREE + 7, FREE + 8, 0, 0, 0]);
     m.ok(S::CapRevoke, [FREE, 0, 0, 0, 0, 0]);
     assert!(m.cap(FREE).is_some());
     assert!(m.cap(FREE + 1).is_none() && m.cap(FREE + 7).is_none());

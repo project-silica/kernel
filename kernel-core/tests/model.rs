@@ -237,7 +237,12 @@ impl Model {
             S::CapMove => {
                 let (_, dst) = self.typed(a[0], T::CapSpace, 2)?;
                 let d = self.slot_in(&dst, a[1])?;
-                let s = self.root(a[2])?;
+                let s = if a[3] == 0 {
+                    self.root(a[2])?
+                } else {
+                    let (_, src) = self.typed(a[3], T::CapSpace, 2)?;
+                    self.slot_in(&src, a[2])?
+                };
                 if !self.slots.contains_key(&s) {
                     return Err(Error::BadCap);
                 }
@@ -482,7 +487,14 @@ fn run(seed: u64, ops: u32) {
             55..63 => {
                 let c = cs(&mut r, &model);
                 let i = idx(&mut r, &model, c);
-                (S::CapMove, [c, i, w(&mut r, &model, true), 0, 0, 0])
+                if r.below(3) == 0 {
+                    // Out of a CapSpace named, at one of its indexes.
+                    let from = cs(&mut r, &model);
+                    let at = idx(&mut r, &model, from);
+                    (S::CapMove, [c, i, at, from, 0, 0])
+                } else {
+                    (S::CapMove, [c, i, w(&mut r, &model, true), 0, 0, 0])
+                }
             }
             63..70 => (S::CapDelete, [w(&mut r, &model, true), 0, 0, 0, 0, 0]),
             70..73 => (S::CapRevoke, [if r.below(10) == 0 { ut } else { w(&mut r, &model, true) }, 0, 0, 0, 0, 0]),
