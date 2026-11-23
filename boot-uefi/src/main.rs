@@ -38,6 +38,21 @@ fn print(s: &str) {
     arch::print(s);
 }
 
+/// Print `v` in decimal (no allocation).
+fn print_u64(mut v: u64) {
+    let mut b = [0u8; 20];
+    let mut i = b.len();
+    loop {
+        i -= 1;
+        b[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    print(core::str::from_utf8(&b[i..]).unwrap_or("?"));
+}
+
 /// Report a fatal error and stop: status through the emulator's exit device
 /// when there is one, then halt.
 fn fail(what: &str) -> ! {
@@ -266,15 +281,18 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     if unsafe { ((*fs).open_volume)(fs, &mut root) } != efi::SUCCESS {
         fail("cannot open the boot volume");
     }
+    let t_open = arch::counter();
     let (kfile, klen) = boot.read(root, "SILICA\\KERNEL.ELF", efi::MEM_LOADER_DATA).unwrap_or_else(|| fail("SILICA\\KERNEL.ELF not found"));
     let ramdisk = boot.read(root, "SILICA\\RAMDISK.IMG", efi::MEM_SILICA_RAMDISK).unwrap_or((0, 0));
     let cmdline = boot.read(root, "SILICA\\CMDLINE.TXT", efi::MEM_LOADER_DATA).unwrap_or((0, 0));
+    let t_files = arch::counter();
     // SAFETY: the command line was read into `cmdline.1` bytes at `cmdline.0`.
     let words = unsafe { core::slice::from_raw_parts(cmdline.0 as *const u8, cmdline.1 as usize) };
     HARNESS.store(words.split(|b| b.is_ascii_whitespace()).any(|w| w == b"exit=semihosting"), Ordering::Relaxed);
 
     // Entropy and time, while the firmware can still be asked.
     let (seed, entropy_sources) = gather_entropy(&boot);
+    let t_entropy = arch::counter();
     let mut time = efi::Time::default();
     // SAFETY: runtime services are valid; `time` outlives the call.
     let wall_secs = if unsafe { ((*rt).get_time)(&mut time, ptr::null_mut()) } == efi::SUCCESS { unix_seconds(&time) } else { 0 };
@@ -382,6 +400,9 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         }
     }
 
+    // Where the loader's time went is said once the firmware is left.
+    let t_end = arch::counter();
+
     // The final memory map and the point of no return. Nothing may allocate
     // between GetMemoryMap and ExitBootServices; if the map changed anyway
     // (the firmware allows one retry), read it again.
@@ -402,6 +423,25 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
             fail("the firmware refused ExitBootServices");
         }
     }
+    // Where the loader's time went, in counter ticks (the kernel says the
+    // counter's rate): finding the volume, reading the files, entropy, the
+    // wall clock, laying out the kernel, and the firmware's own exit (on a
+    // virtual machine of eight processors most of the boot: it parks the
+    // other processors).
+    let t_exit = arch::counter();
+    print("loader: ticks: volume ");
+    print_u64(t_open.wrapping_sub(loader_tsc));
+    print(", files ");
+    print_u64(t_files.wrapping_sub(t_open));
+    print(", entropy ");
+    print_u64(t_entropy.wrapping_sub(t_files));
+    print(", wall clock ");
+    print_u64(wall_tsc.wrapping_sub(t_entropy));
+    print(", layout ");
+    print_u64(t_end.wrapping_sub(wall_tsc));
+    print(", the firmware's exit ");
+    print_u64(t_exit.wrapping_sub(t_end));
+    print("\r\n");
 
     // Convert the firmware map: sort by address, merge neighbours of one kind.
     let count = size / dsize;

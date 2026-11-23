@@ -1243,6 +1243,7 @@ fn deliberate_panic() {
 
 /// Kernel entry from the boot stub, on the kernel stack, interrupts off.
 pub extern "C" fn kmain(info: u64) -> ! {
+    let entered = rdtsc();
     serial::init();
     let k = kernel();
     // SAFETY: the loader passes the physical address of a BootInfo in
@@ -1352,9 +1353,11 @@ pub extern "C" fn kmain(info: u64) -> ! {
     // maps for it.
     let mut reserved = [(0u64, 0u64); 17];
     reserved[0] = (0xFEC0_0000, 0xFEF0_0000);
+    let t_iommu = rdtsc();
     if Cmdline(cmdline).get("iommu") != Some(b"off") {
         iommu::init(&bi, &k.phys, table, &mut reserved);
     }
+    let t_iommu_done = rdtsc();
     let regions = table.as_slice();
     let usable: u64 = regions.iter().filter(|r| r.kind == 1).map(|r| r.len).sum();
     klog!(k, "silica: {} MiB free, {} processors, clock {} Hz, kernel slide {:#x}", usable >> 20, cpus, hz, bi.kernel_slide);
@@ -1410,7 +1413,23 @@ pub extern "C" fn kmain(info: u64) -> ! {
         klog!(k, "ERROR: kernel: cannot start the root task: {e:?}");
         die();
     }
+    let smp_from = rdtsc();
     smp::start(hz);
+    // Where the boot's time went, by this processor's counter: the loader
+    // (from its start to the kernel's: mostly the firmware's own exit, which
+    // the loader's line breaks down), the kernel up to starting the other
+    // processors (of which the IOMMU's set-up), and starting them.
+    let us = |a: u64, b: u64| b.wrapping_sub(a) / (hz / 1_000_000).max(1);
+    let now = rdtsc();
+    klog!(
+        k,
+        "kernel: boot: loader {} us, kernel {} us (the IOMMU {} us), {} processors started in {} us",
+        us(bi.loader_tsc, entered),
+        us(entered, smp_from),
+        us(t_iommu, t_iommu_done),
+        cpus,
+        us(smp_from, now)
+    );
     // The screen is the display driver's from here.
     fbcon::release();
     // SAFETY: the tables, the processor and the root thread are set up and
