@@ -67,8 +67,17 @@ pub fn init(bi: &BootInfo, phys: &Phys) {
             let (base, first) = (u32_at(4) as u64, u32_at(8));
             if base != 0 && base + 0x20 <= bi.phys_map_len {
                 let count = (read(phys, base, 1) >> 16 & 0xFF) + 1;
+                // Every pin masked; written only where it is not already
+                // (the reset state, which firmware mostly leaves). Under a
+                // hypervisor that keeps the I/O APIC outside the kernel
+                // (QEMU's split irqchip, which interrupt remapping needs)
+                // each write of an entry changes the machine's interrupt
+                // routes, which can wait milliseconds to take effect:
+                // writing all 24 took 0.28 ms, or 3.1 ms in one boot of three.
                 for pin in 0..count {
-                    write(phys, base, 0x10 + 2 * pin, 1 << 16);
+                    if read(phys, base, 0x10 + 2 * pin) & 1 << 16 == 0 {
+                        write(phys, base, 0x10 + 2 * pin, 1 << 16);
+                    }
                 }
                 list[n] = IoApic { base, first, count, id: madt[o + 2] };
                 n += 1;
