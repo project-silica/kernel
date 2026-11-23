@@ -449,6 +449,13 @@ pub struct SlotInfo {
     pub depth: u16,
 }
 
+/// Whether a call is parked on `notification` (`recv_parking`), its caller
+/// still waiting for the answer: a parked caller that ended is no longer
+/// there.
+pub fn parked(notification: Cap) -> Result<bool> {
+    sys(Syscall::Inspect, [notification.0, 0, 0, 0, 0, 0]).map(|r| r[0] != 0)
+}
+
 /// What slot `index` of the CapSpace `space` holds (`None`: nothing).
 pub fn inspect_slot(space: Cap, index: u64) -> Result<Option<SlotInfo>> {
     let r = sys(Syscall::Inspect, [space.0, index, 0, 0, 0, 0])?;

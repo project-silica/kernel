@@ -723,6 +723,10 @@ impl<H: Hal> Kernel<H> {
                         [sc.class.get(), size, sc.period.get(), sc.remaining.get(), sc.consumed.get(), cpu]
                     }
                     ObjectType::CapSpace | ObjectType::Thread => return Err(Error::BadArg),
+                    // Whether a call is parked on the notification, its
+                    // caller still waiting for the answer: how a server
+                    // tells a parked caller from one that has gone.
+                    ObjectType::Notification => [(self.queue(cap.obj).kind.get() == crate::ipc::PARKED) as u64, 0, 0, 0, 0, 0],
                     // Where a device reaches a frame on a machine that
                     // cannot confine DMA: its physical address.
                     ObjectType::Hw if cap.flags & FLAG_DMA != 0 => {

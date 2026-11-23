@@ -1105,10 +1105,17 @@ fn a_parked_call_is_answered_later_through_its_notification() {
     let r = m.sys_as(t, S::CapDelete, [FREE + 10, 0, 0, 0, 0, 0]);
     assert_eq!(r.status, 0);
     assert_eq!(Error::result(m.status(m.root)), Err(Error::Gone));
-    // And a parked caller that is destroyed leaves the notification free.
+    // And a parked caller that is destroyed leaves the notification free,
+    // which the server can see (Inspect) before it answers.
+    m.ok(S::Inspect, [FREE + 11, 0, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 0, "nothing parked yet");
     assert!(m.sys_as(t, S::Recv, [FREE, 0, FREE + 11, 0, 0, 0]).blocked);
     assert!(m.sys_as(t2, S::Call, [FREE + 1, 0, 1, 0, 0, 0]).blocked);
+    m.ok(S::Inspect, [FREE + 11, 0, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 1, "the caller waits");
     m.ok(S::CapDelete, [FREE + 5, 0, 0, 0, 0, 0]);
+    m.ok(S::Inspect, [FREE + 11, 0, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 0, "the caller has gone");
     m.ok(S::Send, [FREE + 11, 0, 0, 0, 0, 0]);
     m.ok(S::Recv, [FREE + 11, 1, 0, 0, 0, 0]);
 }
