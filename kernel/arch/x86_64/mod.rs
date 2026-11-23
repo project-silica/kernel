@@ -153,6 +153,8 @@ impl Hal for X86 {
     /// `syscall` instruction can sit where its return address would be
     /// non-canonical.
     const USER_TOP: u64 = 0x0000_7FFF_FFFF_F000;
+    /// CR3 is the only root: every program's carries the kernel's upper half.
+    const KERNEL_IN_ROOT: bool = true;
 
     fn pte_table(table: Paddr) -> u64 {
         table | PTE_P | PTE_W | PTE_U | PTE_A
@@ -542,6 +544,13 @@ impl Hal for X86 {
         // to one processor by its identifier.
         unsafe { wrmsr(0x830, (them.apic_id as u64) << 32 | KICK_VECTOR) };
         while wait && them.mode.is_user() {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn wait_left(&self, _cpu: usize, request: &kernel_core::lock::Leave) {
+        // It answers while it waits for its lock, which the caller holds.
+        while !request.answered() {
             core::hint::spin_loop();
         }
     }

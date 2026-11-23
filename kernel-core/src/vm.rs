@@ -265,7 +265,39 @@ impl<H: Hal> Kernel<H> {
             me.loaded_root.set(0);
             me.dirty.set(true);
         }
-        self.shoot_down(a + PAGE);
+        self.evict(a + PAGE);
+    }
+
+    /// Address space `root` is destroyed and its memory may be reused as
+    /// soon as this returns: no other processor may still run on it. Where a
+    /// root maps the kernel too ([`Hal::KERNEL_IN_ROOT`]), one that has it
+    /// loaded runs the kernel through it out of user mode as well (idle, or
+    /// waiting for its lock, which this entry holds), so each such processor
+    /// is asked to leave it, kicked (out of user mode, out of a halt, out of
+    /// its watch: into waiting for its lock), and answers there; this waits
+    /// for every answer. Elsewhere the shoot-down is enough.
+    fn evict(&self, root: Paddr) {
+        if !H::KERNEL_IN_ROOT || self.ncpu.get() == 1 {
+            self.shoot_down(root);
+            return;
+        }
+        for (i, cpu) in self.others() {
+            if cpu.loaded_root.get() == root {
+                cpu.flush.set(true);
+                cpu.dirty.set(true);
+                cpu.leave.ask(root);
+                self.hal.kick(i, false);
+            } else {
+                self.hal.tlb_forget(root, i);
+            }
+        }
+        // All asked before any is waited for: they leave at once.
+        for (i, cpu) in self.others() {
+            if cpu.loaded_root.get() == root {
+                self.hal.wait_left(i, &cpu.leave);
+                cpu.loaded_root.set(0);
+            }
+        }
     }
 
     /// Mappings of address space `root` were removed: no other processor

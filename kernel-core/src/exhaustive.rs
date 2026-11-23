@@ -62,6 +62,7 @@ impl Hal for Hal0 {
     const FLAGS_INIT: u64 = 0;
     const SYSCALL_LEN: u64 = 2;
     const USER_TOP: u64 = 1 << 47;
+    const KERNEL_IN_ROOT: bool = true;
     fn pte_table(table: Paddr) -> u64 {
         table | 1
     }
@@ -86,6 +87,10 @@ impl Hal for Hal0 {
         0
     }
     fn kick(&self, _: usize, _: bool) {}
+    fn wait_left(&self, _: usize, request: &crate::lock::Leave) {
+        // Processors here take turns: the asked one answers as it would.
+        request.answer();
+    }
     fn tlb_reset(&self) {}
     fn tlb_forget(&self, _: Paddr, _: usize) {}
     fn now(&self) -> u64 {

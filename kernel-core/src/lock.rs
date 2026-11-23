@@ -24,8 +24,15 @@ impl Lock {
     }
     /// Take the lock, waiting for it if need be.
     pub fn lock(&self) {
+        self.lock_while(|| {});
+    }
+    /// Take the lock, calling `waiting` on every turn of the wait: what a
+    /// processor that does not hold its own lock must go on answering
+    /// ([`Leave`]).
+    pub fn lock_while(&self, mut waiting: impl FnMut()) {
         while self.0.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             while self.0.load(Ordering::Relaxed) {
+                waiting();
                 spin();
             }
         }
@@ -44,24 +51,71 @@ impl Lock {
 
 /// From holding `mine` to holding every lock in `all` (which includes
 /// `mine`), taken in order so two processors doing this cannot deadlock.
-pub fn go_global<'a>(mine: &Lock, all: impl Iterator<Item = &'a Lock>) {
+/// `waiting` is called on every turn of a wait, as in [`Lock::lock_while`]:
+/// `mine` is let go first.
+pub fn go_global<'a>(mine: &Lock, all: impl Iterator<Item = &'a Lock>, mut waiting: impl FnMut()) {
     mine.unlock();
     for l in all {
-        l.lock();
+        l.lock_while(&mut waiting);
     }
 }
 
 /// From holding `mine` to holding `mine` and `other`, taken in index order
 /// (the order [`go_global`] uses), so no two of these transitions deadlock.
 /// When `other` comes first `mine` is let go on the way: the caller then
-/// re-examines everything it looked at before.
-pub fn go_pair(mine: &Lock, other: &Lock, other_first: bool) {
+/// re-examines everything it looked at before, and `waiting` is called on
+/// every turn of the waits that follow ([`Lock::lock_while`]).
+pub fn go_pair(mine: &Lock, other: &Lock, other_first: bool, mut waiting: impl FnMut()) {
     if other_first {
         mine.unlock();
-        other.lock();
-        mine.lock();
+        other.lock_while(&mut waiting);
+        mine.lock_while(&mut waiting);
     } else {
         other.lock();
+    }
+}
+
+/// A request to one processor to stop running on an address-space root:
+/// the root, or 0 for none. A global entry about to reuse a root's memory
+/// asks each processor that has the root loaded ([`Leave::ask`]) and waits
+/// until each has answered. The asked processor does not hold its lock
+/// (the global entry does), so it is in user mode, idle or waiting for that
+/// lock; once kicked it is waiting for it, and it answers there, on every
+/// turn of the wait ([`Lock::lock_while`]): it loads the kernel's own root,
+/// then [`Leave::answer`]s. The asker needs nothing from it but that, so
+/// neither waits for the other's lock and they cannot deadlock.
+pub struct Leave(AtomicU64);
+
+impl Leave {
+    ctor! {
+        /// No request.
+        pub fn new() -> Leave {
+            Leave(AtomicU64::new(0))
+        }
+    }
+    /// Ask the processor to leave `root` (not 0). The caller holds its lock.
+    pub fn ask(&self, root: u64) {
+        self.0.store(root, Ordering::Release);
+    }
+    /// The root the processor is asked to leave, or 0. Read by the asked
+    /// processor while it waits for its lock.
+    pub fn asked(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+    /// The asked processor no longer runs on the root: whatever the asker
+    /// does after seeing [`Leave::answered`] comes after its switch.
+    pub fn answer(&self) {
+        self.0.store(0, Ordering::Release);
+    }
+    /// Whether the request was answered (or none was made).
+    pub fn answered(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 0
+    }
+}
+
+impl Default for Leave {
+    fn default() -> Leave {
+        Leave::new()
     }
 }
 

@@ -39,6 +39,13 @@ pub struct TestHal {
     pub flushes: Cell<u64>,
     pub switches: Cell<u64>,
     pub left: Cell<u64>,
+    /// The address-space root each simulated processor has loaded (0: the
+    /// kernel's own), as CR3 would hold it. This HAL keeps the kernel in
+    /// every root, as x86_64 does, so no root may be built in memory a
+    /// processor still has loaded (`init_root` checks).
+    pub roots: [Cell<Paddr>; TEST_CPUS],
+    /// How many times a processor answered a request to leave a root.
+    pub answers: Cell<u64>,
     /// The simulated processor the test is currently acting as.
     pub cpu: Cell<usize>,
     /// (processor, waited) for every kick, in order.
@@ -68,6 +75,7 @@ impl Hal for TestHal {
     const FLAGS_INIT: u64 = 0x202;
     const SYSCALL_LEN: u64 = 2;
     const USER_TOP: u64 = 0x7FFF_FFFF_F000;
+    const KERNEL_IN_ROOT: bool = true;
 
     fn pte_table(table: Paddr) -> u64 {
         table | 7
@@ -134,16 +142,24 @@ impl Hal for TestHal {
         Some((0xFEE0_0000 | (cpu as u64) << 12, 0x30 + line as u64))
     }
     fn init_root(&self, phys: &Phys, root: Paddr) {
+        for (c, loaded) in self.roots.iter().enumerate() {
+            assert_ne!(loaded.get(), root, "a root is built in memory processor {c} still runs on");
+        }
         phys.write_val(root + 511 * 8, &0xDEAD_0000_0000_0003u64);
     }
     fn init_thread(&self, phys: &Phys, thread: Paddr) {
         phys.write_val(thread + kernel_core::thread::FPU_OFFSET as u64, &0x1F80u64);
     }
-    fn switch_thread(&self, _phys: &Phys, _from: Paddr, _to: Paddr, _root: Paddr) {
+    fn switch_thread(&self, _phys: &Phys, _from: Paddr, _to: Paddr, root: Paddr) {
         self.switches.set(self.switches.get() + 1);
+        self.roots[self.cpu.get()].set(root);
     }
     fn leave_aspace(&self, root: Paddr) {
         self.left.set(root);
+        let loaded = &self.roots[self.cpu.get()];
+        if loaded.get() == root {
+            loaded.set(0);
+        }
     }
     fn tlb_flush(&self, _root: Paddr, _vaddr: u64, _len: u64) {
         self.flushes.set(self.flushes.get() + 1);
@@ -156,8 +172,19 @@ impl Hal for TestHal {
         // another is in the kernel, so there is nothing to wait for.
         self.kicks.borrow_mut().push((cpu, wait));
     }
+    fn wait_left(&self, cpu: usize, request: &kernel_core::lock::Leave) {
+        // The simulated processor is not running: it answers as it would
+        // while waiting for its lock (`Kernel::enter`).
+        let loaded = &self.roots[cpu];
+        if loaded.get() == request.asked() {
+            loaded.set(0);
+        }
+        request.answer();
+        self.answers.set(self.answers.get() + 1);
+    }
     fn tlb_reset(&self) {
         self.resets.set(self.resets.get() + 1);
+        self.roots[self.cpu.get()].set(0);
     }
     fn tlb_forget(&self, _root: Paddr, _cpu: usize) {
         self.forgets.set(self.forgets.get() + 1);
@@ -341,6 +368,8 @@ impl Machine {
             flushes: Cell::new(0),
             switches: Cell::new(0),
             left: Cell::new(0),
+            roots: [const { Cell::new(0) }; TEST_CPUS],
+            answers: Cell::new(0),
             cpu: Cell::new(0),
             kicks: RefCell::new(Vec::new()),
             resets: Cell::new(0),

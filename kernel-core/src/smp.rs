@@ -23,7 +23,12 @@
 //!   them all it is the only code in the kernel, so nothing it changes can
 //!   be in use; before it reuses memory it brings every processor that
 //!   might still be running on that memory in user mode into the kernel
-//!   ([`Hal::kick`] with `wait`).
+//!   ([`Hal::kick`] with `wait`). An address-space root is the exception
+//!   where a root maps the kernel too ([`Hal::KERNEL_IN_ROOT`], x86_64): a
+//!   processor runs the kernel through the root it has loaded, also while
+//!   idle or waiting for its lock, so each one on a root being destroyed is
+//!   asked to leave it and answers while it waits ([`crate::lock::Leave`],
+//!   `Kernel::evict`).
 //!
 //! A processor waiting for its lock has interrupts off and has already saved
 //! its thread's registers, so the holder may change that thread. When it
@@ -151,6 +156,12 @@ pub struct Cpu {
     pub(crate) pair: Cell<u64>,
     /// How many of this processor's kernel entries took a second lock.
     pub(crate) pairs: Cell<u64>,
+    /// A global entry's request that this processor stop running on a root
+    /// it is about to reuse ([`Kernel::evict`]), answered while this
+    /// processor waits for a lock without holding its own.
+    /// Last: read only when a lock is contended, so it moves nothing the
+    /// entry paths use.
+    pub(crate) leave: crate::lock::Leave,
 }
 
 /// The processors whose locks a kernel entry holds.
@@ -196,6 +207,7 @@ impl Cpu {
             flush: Cell::new(false),
             pair: Cell::new(0),
             pairs: Cell::new(0),
+            leave: crate::lock::Leave::new(),
         }
     }
 }
@@ -229,8 +241,23 @@ impl<H: Hal> Kernel<H> {
     /// Enter the kernel on this processor: take its lock and act on what
     /// other processors asked of it while it was away.
     pub fn enter(&self) {
-        self.me().lock.lock();
+        self.me().lock.lock_while(|| self.answer_leave());
         self.caught_up();
+    }
+
+    /// Answer a global entry's request to stop running on a root
+    /// ([`Kernel::evict`]): called on every turn of a wait for a lock while
+    /// this processor does not hold its own. Only where a root maps the
+    /// kernel ([`Hal::KERNEL_IN_ROOT`]) is one ever made.
+    fn answer_leave(&self) {
+        if H::KERNEL_IN_ROOT {
+            let leave = &self.me().leave;
+            let root = leave.asked();
+            if root != 0 {
+                self.hal.leave_aspace(root);
+                leave.answer();
+            }
+        }
     }
 
     /// Enter the kernel on this processor, whose lock the architecture's
@@ -264,7 +291,7 @@ impl<H: Hal> Kernel<H> {
     /// Other global operations may run in between: the caller re-examines
     /// everything it looked at before.
     pub(crate) fn go_global(&self) {
-        crate::lock::go_global(&self.me().lock, self.cpus.iter(self.ncpu.get()).map(|c| &c.lock));
+        crate::lock::go_global(&self.me().lock, self.cpus.iter(self.ncpu.get()).map(|c| &c.lock), || self.answer_leave());
         self.global.set(true);
         self.globals.set(self.globals.get() + 1);
         self.caught_up();
@@ -281,7 +308,7 @@ impl<H: Hal> Kernel<H> {
     /// re-examines everything it looked at before.
     pub(crate) fn go_pair(&self, other: usize) {
         let me = self.hal.cpu();
-        crate::lock::go_pair(&self.cpus.get(me).lock, &self.cpus.get(other).lock, other < me);
+        crate::lock::go_pair(&self.cpus.get(me).lock, &self.cpus.get(other).lock, other < me, || self.answer_leave());
         let cpu = self.me();
         cpu.pair.set(other as u64 + 1);
         cpu.pairs.set(cpu.pairs.get() + 1);

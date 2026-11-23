@@ -686,6 +686,9 @@ impl<H: Hal> Kernel<H> {
             let until = if t != 0 { self.thread(t).deadline.get() } else { u64::MAX };
             let until = until.min(self.preempt_at(me, now));
             me.preempt_at.set(u64::MAX);
+            // The program's root stays loaded (no switch on the way to idle
+            // and back): an address space destroyed meanwhile is left first
+            // (`Kernel::evict`, answered while this waits for its lock).
             self.hal.idle_begin();
             me.lock.unlock();
             self.hal.idle(until);

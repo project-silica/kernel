@@ -26,7 +26,7 @@ mod sync {
 #[path = "../src/lock.rs"]
 mod lock;
 
-use lock::{Lock, Presence, go_global, go_local, go_pair};
+use lock::{Leave, Lock, Presence, go_global, go_local, go_pair};
 use loom::cell::UnsafeCell;
 use loom::sync::Arc;
 use loom::sync::atomic::{AtomicBool, Ordering};
@@ -54,7 +54,7 @@ impl Machine {
     /// A kernel entry that goes global: everybody's state.
     fn global(&self, me: usize) {
         self.locks[me].lock();
-        go_global(&self.locks[me], self.locks.iter());
+        go_global(&self.locks[me], self.locks.iter(), || {});
         self.shared.with_mut(|p| unsafe { *p += 1 });
         for c in &self.cpu {
             c.with_mut(|p| unsafe { *p += 10 });
@@ -115,7 +115,7 @@ impl Three {
     }
     fn pair(&self, me: usize, other: usize) {
         self.locks[me].lock();
-        go_pair(&self.locks[me], &self.locks[other], other < me);
+        go_pair(&self.locks[me], &self.locks[other], other < me, || {});
         for c in [me, other] {
             self.cpu[c].with_mut(|p| unsafe { *p += 1 });
         }
@@ -124,7 +124,7 @@ impl Three {
     }
     fn global(&self, me: usize) {
         self.locks[me].lock();
-        go_global(&self.locks[me], self.locks.iter());
+        go_global(&self.locks[me], self.locks.iter(), || {});
         for c in &self.cpu {
             c.with_mut(|p| unsafe { *p += 10 });
         }
@@ -191,7 +191,7 @@ fn a_queue_changing_owner_is_never_used_under_the_old_owners_lock_alone() {
         // Processor 0: a receive on a queue processor 1 owns.
         s.locks[0].lock();
         if s.owner.load(Ordering::Relaxed) == 2 {
-            go_pair(&s.locks[0], &s.locks[1], false);
+            go_pair(&s.locks[0], &s.locks[1], false, || {});
             // Looked at again with both locks held.
             if s.owner.load(Ordering::Relaxed) == 2 {
                 s.queue.with_mut(|p| unsafe { *p += 10 });
@@ -473,5 +473,69 @@ fn work_queued_for_a_watching_processor_is_never_missed() {
         // A wake that was lost would leave the idler halted for ever: the
         // model would report a deadlock.
         assert_eq!(idler.join().unwrap(), 1);
+    });
+}
+
+/// Processor 0 has address-space root R loaded and runs through it (where
+/// a root maps the kernel, in user mode and in the kernel alike: each walk
+/// of its tables reads R's memory). Processor 1, a global entry holding
+/// processor 0's lock, destroys R and reuses its memory. It asks processor
+/// 0 to leave R, kicks it, and waits for the answer, which processor 0 gives
+/// while it waits for that lock: the memory is written only after the last
+/// walk, whichever of the two takes the lock first, and neither waits for
+/// the other for ever.
+#[test]
+fn a_root_is_reused_only_after_the_processor_on_it_has_left_it() {
+    loom::model(|| {
+        struct S {
+            lock: Lock,
+            leave: Leave,
+            /// R's memory: read by every walk, written by its reuse.
+            root: UnsafeCell<u32>,
+            kicked: AtomicBool,
+        }
+        let s = Arc::new(S { lock: Lock::new(), leave: Leave::new(), root: UnsafeCell::new(0), kicked: AtomicBool::new(false) });
+        let on_root = {
+            let s = s.clone();
+            thread::spawn(move || {
+                let mut on = true;
+                let walk = |on: bool| {
+                    if on {
+                        s.root.with(|p| unsafe { *p });
+                    }
+                };
+                // As `Kernel::enter`: wait for the lock, answering meanwhile.
+                let answer = |on: &mut bool| {
+                    if s.leave.asked() != 0 {
+                        *on = false; // the kernel's root loaded
+                        s.leave.answer();
+                    }
+                    walk(*on);
+                };
+                s.lock.lock_while(|| answer(&mut on));
+                walk(on);
+                s.lock.unlock();
+                walk(on); // back in user mode
+                if on {
+                    // Not asked yet: the kick brings it into the kernel.
+                    while !s.kicked.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    s.lock.lock_while(|| answer(&mut on));
+                    assert!(!on, "the request is answered before the lock is had");
+                    s.lock.unlock();
+                }
+            })
+        };
+        // Processor 1: the global entry.
+        s.lock.lock();
+        s.leave.ask(1);
+        s.kicked.store(true, Ordering::Release);
+        while !s.leave.answered() {
+            thread::yield_now();
+        }
+        s.root.with_mut(|p| unsafe { *p = 1 }); // the memory reused
+        s.lock.unlock();
+        on_root.join().unwrap();
     });
 }

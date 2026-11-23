@@ -521,6 +521,8 @@ impl Hal for Arm {
     const FLAGS_INIT: u64 = 0;
     const SYSCALL_LEN: u64 = 4;
     const USER_TOP: u64 = 0x0000_7FFF_FFFF_F000;
+    /// The kernel runs on TTBR1; TTBR0 holds only the program's half.
+    const KERNEL_IN_ROOT: bool = false;
 
     fn pte_table(table: Paddr) -> u64 {
         table | 0b11
@@ -715,6 +717,14 @@ impl Hal for Arm {
         }
         gic::kick(them.mpidr.load(Ordering::Relaxed));
         while wait && them.mode.is_user() {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn wait_left(&self, _cpu: usize, request: &kernel_core::lock::Leave) {
+        // Never asked here (`KERNEL_IN_ROOT` is false), but as on x86: it
+        // answers while it waits for its lock.
+        while !request.answered() {
             core::hint::spin_loop();
         }
     }

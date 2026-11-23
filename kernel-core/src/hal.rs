@@ -32,6 +32,16 @@ pub trait Hal {
     const SYSCALL_LEN: u64;
     /// One past the highest user virtual address.
     const USER_TOP: u64;
+    /// Whether a program's address-space root also maps the kernel, so that
+    /// a processor runs the kernel through whichever root it has loaded
+    /// (x86_64: the upper half of every root is a copy of the kernel's,
+    /// [`Hal::init_root`]), in user mode or not: idle, or waiting for its
+    /// lock. Then a root's memory is reused only after every processor that
+    /// has it loaded has left it (`Kernel::evict`). Where the kernel has a
+    /// root of its own (aarch64: TTBR1), a program's root is used only for
+    /// the program's addresses, and bringing processors out of user mode is
+    /// enough.
+    const KERNEL_IN_ROOT: bool;
 
     /// Make a user-supplied instruction pointer safe to return to.
     fn user_ip_ok(ip: u64) -> bool {
@@ -108,7 +118,8 @@ pub trait Hal {
     /// state (when not 0), load `to`'s, and switch to address-space root
     /// `root` (0: kernel mappings only).
     fn switch_thread(&self, phys: &Phys, from: Paddr, to: Paddr, root: Paddr);
-    /// Leave address-space root `root` if this processor has it loaded.
+    /// Leave address-space root `root` if this processor has it loaded,
+    /// for the kernel's mappings only (what `switch_thread` loads for root 0).
     fn leave_aspace(&self, root: Paddr);
     /// Drop cached translations for `[vaddr, vaddr + len)` in `root`.
     fn tlb_flush(&self, root: Paddr, vaddr: u64, len: u64);
@@ -125,6 +136,11 @@ pub trait Hal {
     /// kernel, has saved its thread's registers, and will take its lock
     /// (which the caller holds) before doing anything else.
     fn kick(&self, cpu: usize, wait: bool);
+    /// Return once processor `cpu`, kicked after being asked to leave a root
+    /// (`request`, [`crate::lock::Leave`]), has answered: it runs on the
+    /// kernel's root and will not load that one again. The caller holds
+    /// `cpu`'s lock; the processor answers while it waits for it.
+    fn wait_left(&self, cpu: usize, request: &crate::lock::Leave);
     /// On this processor, drop every cached user translation and load the
     /// kernel-only address space. Another processor changed or destroyed
     /// mappings this one may have cached.

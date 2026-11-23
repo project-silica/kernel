@@ -252,6 +252,40 @@ fn address_space_table_pool_runs_out_cleanly_and_destroying_it_unmaps_frames() {
     m.ok(S::Map, [SLOT_ASPACE, FREE + 1, 0x2000_0000, 3, 0, 0]);
 }
 
+/// The memory of an address space another processor has loaded is reused
+/// only once that processor has stopped running on it. On x86_64 every root
+/// maps the kernel too, so a processor runs the kernel through the root it
+/// has loaded even when it is not in user mode: idle, or waiting for its
+/// lock while a global entry holds it. Before this was asked of it, an idle
+/// processor took its next interrupt through a root whose memory had become
+/// a new object (`systest` under load: a double fault in the halt, or a
+/// triple fault and the machine gone, 7 runs in 240).
+#[test]
+fn an_address_space_is_reused_only_after_every_processor_has_left_it() {
+    let m = Machine::with_cpus(16, 2);
+    let (ut, _) = m.big_untyped();
+    // An address space alone in an Untyped of its own, so that revoking
+    // the Untyped destroys it and the next retype reuses its memory.
+    m.retype(ut, T::Untyped, 14, FREE, 1);
+    m.retype(FREE, T::AddressSpace, 14, FREE + 1, 1);
+    let root = m.cap(FREE + 1).unwrap().obj + 4096;
+    // A thread in it, moved to processor 1 and running there.
+    m.retype(ut, T::Thread, 0, FREE + 2, 1);
+    m.ok(S::ThreadConfigure, [FREE + 2, SLOT_CAPSPACE, FREE + 1, 0, 0, 0]);
+    m.ok(S::ThreadStart, [FREE + 2, 0x40_0000, 0, 0, 1, 0]);
+    m.ok(S::ThreadControl, [FREE + 2, 2, 1, 0, 0, 0]);
+    m.settle(1);
+    assert_eq!(m.k.hal.roots[1].get(), root, "processor 1 runs on the new address space");
+    // Processor 0 destroys it, then builds a new one in the same memory.
+    m.on(0);
+    let answers = m.k.hal.answers.get();
+    m.ok(S::CapRevoke, [FREE, 0, 0, 0, 0, 0]);
+    assert_eq!(m.k.hal.answers.get(), answers + 1, "processor 1 was asked to leave it, and answered");
+    assert_eq!(m.k.hal.roots[1].get(), 0, "processor 1 is on the kernel's root");
+    m.retype(FREE, T::AddressSpace, 14, FREE + 1, 1);
+    assert_eq!(m.cap(FREE + 1).unwrap().obj + 4096, root, "the memory was reused");
+}
+
 /// Root plus one thread sharing its CapSpace; an endpoint at FREE.
 fn pair() -> (Machine, u64) {
     let m = Machine::new(16);
