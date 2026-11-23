@@ -241,17 +241,30 @@ impl<H: Hal> Kernel<H> {
     /// Enter the kernel on this processor: take its lock and act on what
     /// other processors asked of it while it was away.
     pub fn enter(&self) {
-        self.me().lock.lock_while(|| self.answer_leave());
-        self.caught_up();
+        // `me` found once: the answer may load a root (a write the compiler
+        // cannot see past), and finding it again after the wait cost every
+        // entry an instruction.
+        let me = self.me();
+        me.lock.lock_while(|| self.answer_leave(me));
+        self.catch_up(me);
+    }
+
+    /// [`Kernel::enter`] for the scheduler coming back from idle: out of
+    /// line, so that the way out of the kernel, which does not idle, is not
+    /// laid out around it (`bench.sh --only insns`).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn enter_from_idle(&self) {
+        self.enter();
     }
 
     /// Answer a global entry's request to stop running on a root
     /// ([`Kernel::evict`]): called on every turn of a wait for a lock while
     /// this processor does not hold its own. Only where a root maps the
     /// kernel ([`Hal::KERNEL_IN_ROOT`]) is one ever made.
-    fn answer_leave(&self) {
+    fn answer_leave(&self, me: &Cpu) {
         if H::KERNEL_IN_ROOT {
-            let leave = &self.me().leave;
+            let leave = &me.leave;
             let root = leave.asked();
             if root != 0 {
                 self.hal.leave_aspace(root);
@@ -274,7 +287,10 @@ impl<H: Hal> Kernel<H> {
     }
 
     fn caught_up(&self) {
-        let me = self.me();
+        self.catch_up(self.me());
+    }
+
+    fn catch_up(&self, me: &Cpu) {
         if me.flush.replace(false) {
             self.hal.tlb_reset();
             me.loaded_root.set(0);
@@ -291,10 +307,11 @@ impl<H: Hal> Kernel<H> {
     /// Other global operations may run in between: the caller re-examines
     /// everything it looked at before.
     pub(crate) fn go_global(&self) {
-        crate::lock::go_global(&self.me().lock, self.cpus.iter(self.ncpu.get()).map(|c| &c.lock), || self.answer_leave());
+        let me = self.me();
+        crate::lock::go_global(&me.lock, self.cpus.iter(self.ncpu.get()).map(|c| &c.lock), || self.answer_leave(me));
         self.global.set(true);
         self.globals.set(self.globals.get() + 1);
-        self.caught_up();
+        self.catch_up(me);
     }
 
     /// How many times a kernel entry has taken every lock (a statistic
@@ -307,12 +324,11 @@ impl<H: Hal> Kernel<H> {
     /// well. This one's may have been let go on the way: the caller
     /// re-examines everything it looked at before.
     pub(crate) fn go_pair(&self, other: usize) {
-        let me = self.hal.cpu();
-        crate::lock::go_pair(&self.cpus.get(me).lock, &self.cpus.get(other).lock, other < me, || self.answer_leave());
         let cpu = self.me();
+        crate::lock::go_pair(&cpu.lock, &self.cpus.get(other).lock, other < self.hal.cpu(), || self.answer_leave(cpu));
         cpu.pair.set(other as u64 + 1);
         cpu.pairs.set(cpu.pairs.get() + 1);
-        self.caught_up();
+        self.catch_up(cpu);
     }
 
     /// Let go of the second lock taken by [`Kernel::go_pair`].

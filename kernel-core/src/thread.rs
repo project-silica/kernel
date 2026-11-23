@@ -692,7 +692,7 @@ impl<H: Hal> Kernel<H> {
             self.hal.idle_begin();
             me.lock.unlock();
             self.hal.idle(until);
-            self.enter();
+            self.enter_from_idle();
             // The interrupt may have been the timer: look at deadlines. A
             // timer that fired is armed afresh when one is next needed; one
             // still armed fires no later than `until`, so it stays armed
