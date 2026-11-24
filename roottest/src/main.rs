@@ -954,6 +954,51 @@ fn need_cpus(n: u64) -> T {
     if CPUS.load(SeqCst) < n { Err("this test needs more processors than the machine has") } else { Ok(()) }
 }
 
+/// Whether a long test is still getting somewhere. A hang is no progress,
+/// on a fast machine or a slow one (emulated aarch64 on a hosted runner is
+/// 3 to 30 times slower than on the reference host, 2026-11-24), so a test
+/// that can count its progress judges that rather than a total time. It
+/// says how far it got every ten seconds: the harness ends a guest that
+/// says nothing for a minute (`tools/qemu.sh --quiet`), which finds a hung
+/// kernel as soon on a slow machine as on a fast one.
+struct Progress {
+    what: &'static str,
+    last: u64,
+    changed: u64,
+    said: u64,
+}
+
+impl Progress {
+    /// Longest without progress before the test fails.
+    const STALL_NS: u64 = 30_000_000_000;
+    /// How often it says how far it got.
+    const SAY_NS: u64 = 10_000_000_000;
+
+    fn new(what: &'static str) -> Progress {
+        let now = CLOCK.now();
+        Progress { what, last: 0, changed: now, said: now }
+    }
+
+    /// `done` is how far the test has got: an error once it has not moved
+    /// for [`Self::STALL_NS`].
+    fn check(&mut self, done: u64) -> T {
+        let now = CLOCK.now();
+        if done != self.last {
+            self.last = done;
+            self.changed = now;
+        }
+        if now - self.said >= Self::SAY_NS {
+            println!("{}: {done} so far", self.what);
+            self.said = now;
+        }
+        if now - self.changed > Self::STALL_NS {
+            println!("{}: {done}, and none for 30 s", self.what);
+            return Err("no progress for 30 seconds");
+        }
+        Ok(())
+    }
+}
+
 fn sleep_ms(ms: u64) {
     static NAP: AtomicU64 = AtomicU64::new(0);
     if NAP.load(SeqCst) == 0 {
@@ -1065,14 +1110,22 @@ fn t_smp_shootdown() -> T {
 }
 
 static ROUNDS: AtomicU64 = AtomicU64::new(0);
+/// Round trips done so far by the stress clients, in steps of 1024: the
+/// test's progress (ROUNDS is each client's count, added once it is done).
+static UNDERWAY: AtomicU64 = AtomicU64::new(0);
 static LOST: AtomicU64 = AtomicU64::new(0);
 static RETRIES: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn stress_client(arg: u64) -> ! {
     let ep = Cap(SHARED[3].load(SeqCst));
     let want = arg & 0xFFFF_FFFF;
-    let mut done = 0u64;
+    let (mut done, mut told) = (0u64, 0u64);
     while done < want {
+        // Round trips done, told every 1024 (a retry is not one).
+        if done % 1024 == 0 && done > 0 && done != told {
+            UNDERWAY.fetch_add(1024, SeqCst);
+            told = done;
+        }
         match call(ep, MsgInfo::new(7, 3), [done, 5, 6, 0]) {
             Ok(r) if r.words[0] == done * 2 => done += 1,
             Ok(_) => {
@@ -1128,21 +1181,34 @@ fn smp_stress(rounds: u64, revoke: bool) -> T {
     cap_derive(SPACE, lent, master, Rights::ALL, 0).map_err(|_| "derive")?;
     SHARED[3].store(lent, SeqCst);
     ROUNDS.store(0, SeqCst);
+    UNDERWAY.store(0, SeqCst);
     LOST.store(0, SeqCst);
     RETRIES.store(0, SeqCst);
     // Server and client share processor 1 (the fast, local path); a second
     // client calls from processor 2 (the cross-processor path).
-    let _ = spawn_on(1, stress_server, master.0, Cap::NONE);
-    let _ = spawn_on(1, stress_client, rounds, Cap::NONE);
-    let _ = spawn_on(2, stress_client, rounds / 10, Cap::NONE);
-    let _ = spawn_on(3, count_for_ever, 3, Cap::NONE);
+    let threads = [
+        ("server", spawn_on(1, stress_server, master.0, Cap::NONE).0),
+        ("client on processor 1", spawn_on(1, stress_client, rounds, Cap::NONE).0),
+        ("client on processor 2", spawn_on(2, stress_client, rounds / 10, Cap::NONE).0),
+        ("spinner", spawn_on(3, count_for_ever, 3, Cap::NONE).0),
+    ];
     let total = rounds + rounds / 10;
-    let end = CLOCK.now() + 120_000_000_000;
+    let mut progress = Progress::new(if revoke { "smp_revoke: round trips" } else { "smp_stress: round trips" });
     let mut revokes = 0u64;
     while ROUNDS.load(SeqCst) < total {
-        if CLOCK.now() > end {
+        if let Err(e) = progress.check(UNDERWAY.load(SeqCst)) {
             println!("smp_stress: {} of {total} round trips, {revokes} revokes, {} retries", ROUNDS.load(SeqCst), RETRIES.load(SeqCst));
-            return Err("the round trips did not finish in two minutes");
+            // Where each thread is: the first question about a stall.
+            for (who, t) in threads {
+                match inspect_thread(t) {
+                    Ok(i) => println!(
+                        "smp_stress:   {who}: state {} on processor {}, ip {:#x}, waits on {:#x}",
+                        i.state, i.cpu, i.ip, i.waits_on
+                    ),
+                    Err(_) => println!("smp_stress:   {who}: cannot be inspected"),
+                }
+            }
+            return Err(e);
         }
         if revoke {
             // SAFETY: only the stress clients use the lent capability.
@@ -1248,12 +1314,11 @@ fn t_smp_timeouts() -> T {
     for cpu in 1..4 {
         let _ = spawn_on(cpu, hasty_sender, pause.0, Cap::NONE);
     }
-    let end = CLOCK.now() + 120_000_000_000;
-    let wait = |finished: u64| {
+    // Progress is anything done: a message sent or received, a timeout.
+    let mut progress = Progress::new("smp_timeouts: sends, receives and timeouts");
+    let mut wait = |finished: u64| {
         while TIMEOUT_STATS[FINISHED].load(SeqCst) < finished {
-            if CLOCK.now() > end {
-                return Err("the senders and receivers did not finish in two minutes");
-            }
+            progress.check(TIMEOUT_STATS[SENT].load(SeqCst) + TIMEOUT_STATS[GOT].load(SeqCst) + TIMEOUT_STATS[TIMED_OUT].load(SeqCst))?;
             sleep_ms(1);
         }
         Ok(())

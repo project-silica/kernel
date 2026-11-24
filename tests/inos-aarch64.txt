@@ -3,6 +3,7 @@
 # raise on demand).
 # "quiet" marks a test that judges a time (a scheduling latency): the
 # harness runs it with nothing beside it, where the others run at once.
+# "progress": as for x86_64 (a minute of silence ends it, not a total time).
 syscall
 fault_page
 fault_instruction
@@ -25,9 +26,9 @@ ipc_parked
 smp_run smp=8
 smp_ipc smp=2
 smp_shootdown smp=2
-smp_stress smp=8
-smp_revoke smp=8
-smp_timeouts smp=8
+smp_stress smp=8 progress
+smp_revoke smp=8 progress
+smp_timeouts smp=8 progress
 entropy
 sched quiet
 console

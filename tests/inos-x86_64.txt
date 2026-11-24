@@ -3,6 +3,9 @@
 # A test that names none runs twice: on one processor and on four.
 # "quiet" marks a test that judges a time (a scheduling latency): the
 # harness runs it with nothing beside it, where the others run at once.
+# "progress" marks a test that says how far it got every ten seconds and
+# fails when it stops getting anywhere: the harness ends it after a minute
+# of silence rather than at a total time.
 syscall
 fault_page
 fault_instruction
@@ -25,9 +28,9 @@ ipc_parked
 smp_run smp=8
 smp_ipc smp=2
 smp_shootdown smp=2
-smp_stress smp=8
-smp_revoke smp=8
-smp_timeouts smp=8
+smp_stress smp=8 progress
+smp_revoke smp=8 progress
+smp_timeouts smp=8 progress
 entropy
 console
 sched quiet
