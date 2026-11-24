@@ -303,6 +303,17 @@ pub unsafe fn unmap(frame: Cap) -> Result<()> {
     sys(Syscall::Unmap, [frame.0, 0, 0, 0, 0, 0]).map(|_| ())
 }
 
+/// Be told when the capability in slot `watched` goes: whatever deletes it
+/// (its object's owner ending, a revocation of what it derives from, or
+/// this program's own delete) signals `notification` with `bits`, once.
+/// `notice` (an empty slot) receives the watch's notice, a capability
+/// derived from `notification`; deleting it ends the watch without a
+/// signal. How a client learns at once that a peer it holds a capability
+/// to has gone, with nothing to poll (`Syscall::CapNotice`).
+pub fn cap_notice(watched: Cap, notification: Cap, notice: Cap, bits: u64) -> Result<()> {
+    sys(Syscall::CapNotice, [watched.0, notification.0, notice.0, bits, 0, 0]).map(|_| ())
+}
+
 /// Give a thread its CapSpace, address space, fault endpoint and IPC buffer
 /// frame. [`Cap::KEEP`] leaves a field unchanged; [`Cap::NONE`] clears it.
 pub fn thread_configure(thread: Cap, space: Cap, aspace: Cap, fault: Cap, ipc_buffer: Cap) -> Result<()> {

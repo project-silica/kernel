@@ -1759,3 +1759,91 @@ fn a_receive_can_signal_a_notification_first() {
     m.ok(S::Recv, [mine, 1, 0, 0, 0, 0]);
     assert_eq!(m.arg(m.root, 0), 1, "the failed receives took nothing");
 }
+
+/// What `CapNotice`'s watch shows of slot `i` of the root CapSpace: its
+/// notice's slot index, or for a notice the index of the slot it watches.
+fn watch_of(m: &Machine, i: u64) -> (u64, u64) {
+    let v = m.k.view(m.k.slot_addr(&m.cs, i).unwrap()).expect("a capability");
+    let index = |p: u64| if p == 0 { 0 } else { (p - m.cs.obj) >> silica_abi::SLOT_BITS };
+    (index(v.watched_by), index(v.notice_of))
+}
+
+#[test]
+fn a_notice_is_signalled_once_whenever_its_capability_goes_and_never_otherwise() {
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    let (n, ep, mine, notice) = (FREE, FREE + 1, FREE + 2, FREE + 3);
+    m.retype(ut, T::Notification, 0, n, 1);
+    m.retype(ut, T::Endpoint, 0, ep, 1);
+    let pending = || match m.sys(S::Recv, [n, 1, 0, 0, 0, 0]) {
+        r if r.status == 0 => m.arg(m.root, 0),
+        _ => 0,
+    };
+
+    // The capability goes because what it derives from is revoked (how a
+    // peer's end reaches a holder): the notification is signalled with the
+    // bits, once, and the notice goes with the watch.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, mine, ep, 15, 0, 0]);
+    m.ok(S::CapNotice, [mine, n, notice, 0b100, 0, 0]);
+    assert_eq!((watch_of(&m, mine), watch_of(&m, notice)), ((notice, 0), (0, mine)));
+    assert_eq!(m.cap(notice).map(|c| (c.ty, c.badge)), Some((T::Notification, 0b100)), "the notice is the notification, badged");
+    m.ok(S::CapRevoke, [ep, 0, 0, 0, 0, 0]);
+    assert!(m.cap(mine).is_none() && m.cap(notice).is_none());
+    assert_eq!(pending(), 0b100);
+    assert_eq!(pending(), 0, "signalled once");
+
+    // The holder's own delete.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, mine, ep, 15, 0, 0]);
+    m.ok(S::CapNotice, [mine, n, notice, 0b1, 0, 0]);
+    m.ok(S::CapDelete, [mine, 0, 0, 0, 0, 0]);
+    assert!(m.cap(notice).is_none());
+    assert_eq!(pending(), 0b1);
+
+    // Deleting the notice ends the watch, without a signal.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, mine, ep, 15, 0, 0]);
+    m.ok(S::CapNotice, [mine, n, notice, 0b1000, 0, 0]);
+    m.ok(S::CapDelete, [notice, 0, 0, 0, 0, 0]);
+    assert_eq!(watch_of(&m, mine), (0, 0));
+    m.ok(S::CapDelete, [mine, 0, 0, 0, 0, 0]);
+    assert_eq!(pending(), 0, "a watch ended by deleting its notice signals nothing");
+
+    // Both slots move and keep the watch.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, mine, ep, 15, 0, 0]);
+    m.ok(S::CapNotice, [mine, n, notice, 0b1_0000, 0, 0]);
+    m.ok(S::CapMove, [SLOT_CAPSPACE, FREE + 5, notice, 0, 0, 0]);
+    m.ok(S::CapMove, [SLOT_CAPSPACE, FREE + 6, mine, 0, 0, 0]);
+    assert_eq!((watch_of(&m, FREE + 6), watch_of(&m, FREE + 5)), ((FREE + 5, 0), (0, FREE + 6)));
+    m.ok(S::CapDelete, [FREE + 6, 0, 0, 0, 0, 0]);
+    assert!(m.cap(FREE + 5).is_none());
+    assert_eq!(pending(), 0b1_0000);
+
+    // The notification going ends the watch: the notice is a capability
+    // derived from it, so it never names a notification that is no more.
+    m.retype(ut, T::Notification, 0, FREE + 7, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, mine, ep, 15, 0, 0]);
+    m.ok(S::CapNotice, [mine, FREE + 7, notice, 0b1, 0, 0]);
+    m.ok(S::CapDelete, [FREE + 7, 0, 0, 0, 0, 0]);
+    assert!(m.cap(notice).is_none());
+    assert_eq!(watch_of(&m, mine), (0, 0));
+    m.ok(S::CapDelete, [mine, 0, 0, 0, 0, 0]);
+
+    // Refusals.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, mine, ep, 15, 0, 0]);
+    let frame = FREE + 8;
+    m.retype(ut, T::Frame, 12, frame, 1);
+    assert_eq!(m.err(S::CapNotice, [frame, n, notice, 1, 0, 0]), Error::WrongType, "a Frame");
+    assert_eq!(m.err(S::CapNotice, [mine, ep, notice, 1, 0, 0]), Error::WrongType, "not a notification");
+    assert_eq!(m.err(S::CapNotice, [mine, n, notice, 0, 0, 0]), Error::BadArg, "no bits");
+    assert_eq!(m.err(S::CapNotice, [mine, n, mine, 1, 0, 0]), Error::BadArg, "the notice in the watched slot");
+    assert_eq!(m.err(S::CapNotice, [FREE + 9, n, notice, 1, 0, 0]), Error::BadCap, "an empty slot");
+    assert_eq!(m.err(S::CapNotice, [mine, n, ep, 1, 0, 0]), Error::SlotFull, "a full notice slot");
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 10, n, 15, 0b1, 0]);
+    assert_eq!(m.err(S::CapNotice, [mine, FREE + 10, notice, 1, 0, 0]), Error::BadArg, "a badged notification");
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 11, n, 1, 0, 0]);
+    assert_eq!(m.err(S::CapNotice, [mine, FREE + 11, notice, 1, 0, 0]), Error::NoRights, "a notification it may not signal");
+    m.ok(S::CapNotice, [mine, n, notice, 1, 0, 0]);
+    assert_eq!(m.err(S::CapNotice, [mine, n, FREE + 12, 1, 0, 0]), Error::InUse, "watched already");
+    assert_eq!(m.err(S::CapNotice, [notice, n, FREE + 12, 1, 0, 0]), Error::InUse, "a notice is not watched");
+    assert_eq!(m.err(S::CapCopy, [SLOT_CAPSPACE, FREE + 12, notice, 15, 0, 0]), Error::InUse, "a notice is not copied");
+    assert_eq!(pending(), 0, "nothing signalled by any refusal");
+}

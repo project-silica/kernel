@@ -237,6 +237,16 @@ pub fn run(data: &[u8]) {
         } else {
             assert_eq!(v.depth, 0, "slot {i}: a derived capability with no predecessor");
         }
+        // A watch (`CapNotice`): each slot names the other, and a notice is
+        // a notification.
+        if v.watched_by != 0 {
+            let n = m.k.view(v.watched_by).expect("a watched capability's notice slot is empty");
+            assert_eq!((n.notice_of, n.cap.ty), (s, T::Notification), "slot {i}: its notice");
+            assert!(v.notice_of == 0, "slot {i}: watched and a notice");
+        }
+        if v.notice_of != 0 {
+            assert_eq!(m.k.view(v.notice_of).expect("a notice watches an empty slot").watched_by, s, "slot {i}: what its notice watches");
+        }
     }
     // Nothing leaks, and the Untyped balances.
     let r = m.sys(S::CapRevoke, [ut, 0, 0, 0, 0, 0]);

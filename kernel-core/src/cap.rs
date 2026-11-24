@@ -43,6 +43,14 @@ pub const FLAG_IO: u8 = 64;
 /// and which message interrupts they raise.
 pub const FLAG_DMA: u8 = 128;
 
+/// `meta` bits above the depth, for `CapNotice`: the capability is watched
+/// (`mnext` is the slot of its notice), or the slot is a notice (`mprev` is
+/// the slot it watches). Never on a Frame, whose `mprev`/`mnext` link its
+/// mappings. A notice is never copied or watched itself, so ending a watch
+/// deletes a leaf and never recurses further.
+pub(crate) const META_WATCHED: u64 = 1 << 48;
+pub(crate) const META_NOTICE: u64 = 1 << 49;
+
 /// One capability slot.
 ///
 /// Field use by type: `badge` is the endpoint or notification badge, the
@@ -185,6 +193,9 @@ impl<H: Hal> Kernel<H> {
     fn clear_slot(&self, s: Paddr) {
         let slot = self.slot(s);
         let Some(cap) = slot.cap() else { return };
+        if slot.meta.get() & (META_WATCHED | META_NOTICE) != 0 {
+            self.end_watch(s);
+        }
         if cap.ty == ObjectType::Frame {
             self.unmap_slot(s);
         }
@@ -241,6 +252,60 @@ impl<H: Hal> Kernel<H> {
             ObjectType::Endpoint | ObjectType::Notification => self.finalise_queue(cap.obj),
             ObjectType::SchedContext => self.finalise_sched(cap.obj),
             _ => {}
+        }
+    }
+
+    /// `CapNotice`: watch the capability in slot `watched`, signalling the
+    /// notification in slot `n` with `bits` when it is deleted; the notice,
+    /// a capability derived from `n` whose badge is `bits`, goes in the
+    /// empty slot `notice`.
+    pub(crate) fn notice(&self, watched: Paddr, n: Paddr, notice: Paddr, bits: u64) -> Result<(), Error> {
+        let w = self.slot(watched);
+        let cap = w.cap().ok_or(Error::BadCap)?;
+        if cap.ty == ObjectType::Frame {
+            return Err(Error::WrongType);
+        }
+        if bits == 0 || watched == notice || n == notice {
+            return Err(Error::BadArg);
+        }
+        if w.meta.get() & (META_WATCHED | META_NOTICE) != 0 {
+            return Err(Error::InUse);
+        }
+        // A real capability: it goes when the notification does, which
+        // ends the watch (`end_watch`) and never leaves it pointing nowhere.
+        self.copy(n, notice, Rights::WRITE, bits, false)?;
+        let ns = self.slot(notice);
+        ns.meta.set(ns.meta.get() | META_NOTICE);
+        ns.mprev.set(watched);
+        w.meta.set(w.meta.get() | META_WATCHED);
+        w.mnext.set(notice);
+        Ok(())
+    }
+
+    /// Slot `s`, about to be emptied, is watched or a notice. A notice ends
+    /// its watch; a watched capability's notification is signalled and its
+    /// notice deleted (a leaf: never copied, so without children, and never
+    /// watched, so this goes no deeper).
+    fn end_watch(&self, s: Paddr) {
+        let slot = self.slot(s);
+        let m = slot.meta.get();
+        slot.meta.set(m & !(META_WATCHED | META_NOTICE));
+        if m & META_NOTICE != 0 {
+            let w = self.slot(slot.mprev.get());
+            w.meta.set(w.meta.get() & !META_WATCHED);
+            w.mnext.set(0);
+            slot.mprev.set(0);
+        }
+        if m & META_WATCHED != 0 {
+            let at = slot.mnext.get();
+            slot.mnext.set(0);
+            let ns = self.slot(at);
+            ns.meta.set(ns.meta.get() & !META_NOTICE);
+            ns.mprev.set(0);
+            if let Some(nc) = ns.cap() {
+                self.signal(nc.obj, nc.badge);
+            }
+            self.clear_slot(at);
         }
     }
 
@@ -317,6 +382,14 @@ impl<H: Hal> Kernel<H> {
         }
         if n != 0 {
             self.slot(n).prev.set(dst);
+        }
+        // A watch follows its slots (`CapNotice`): each names the other.
+        let m = s.meta.get();
+        if m & META_WATCHED != 0 {
+            self.slot(mn).mprev.set(dst);
+        }
+        if m & META_NOTICE != 0 {
+            self.slot(mp).mnext.set(dst);
         }
         if s.cap().is_some_and(|c| c.ty == ObjectType::Frame) && s.badge.get() & MAPPED != 0 {
             if mp != 0 {

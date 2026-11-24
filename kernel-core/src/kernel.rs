@@ -726,6 +726,13 @@ impl<H: Hal> Kernel<H> {
                 }
                 Ok(Exit::Done)
             }
+            Syscall::CapNotice => {
+                let watched = self.cslot(t, a[0])?;
+                let (n, _) = self.ccap(t, a[1], ObjectType::Notification, Rights::WRITE)?;
+                let notice = self.cslot(t, a[2])?;
+                self.notice(watched, n, notice, a[3])?;
+                Ok(Exit::Done)
+            }
             Syscall::IrqWatch => {
                 let (_, hw) = self.ccap(t, a[0], ObjectType::Hw, Rights::WRITE)?;
                 if hw.flags & crate::cap::FLAG_IRQS == 0 {
@@ -953,6 +960,10 @@ impl<H: Hal> Kernel<H> {
         if !self.slot(d).is_empty() {
             return Err(Error::SlotFull);
         }
+        // A notice is never copied: it stays a leaf (`CapNotice`).
+        if self.slot(s).meta.get() & crate::cap::META_NOTICE != 0 {
+            return Err(Error::InUse);
+        }
         cap.rights = Rights(cap.rights.0 & mask.0);
         match cap.ty {
             // An Untyped has one owner; split it by retyping.
@@ -999,6 +1010,10 @@ pub struct SlotView {
     pub mapped: Option<(Paddr, u64)>,
     /// For an Untyped: bytes used, and bytes known to be zero from the start.
     pub watermark: (u64, u64),
+    /// `CapNotice`: the slot of this capability's notice (0: not watched).
+    pub watched_by: Paddr,
+    /// `CapNotice`: for a notice, the slot it watches (0: not a notice).
+    pub notice_of: Paddr,
 }
 
 /// A thread as an inspector sees it.
@@ -1029,7 +1044,10 @@ impl<H: Hal> Kernel<H> {
         let cap = slot.cap()?;
         let mapped = (cap.ty == ObjectType::Frame && slot.badge.get() & 1 != 0).then(|| (slot.aux.get(), slot.badge.get() & !0xFFF));
         let watermark = if cap.ty == ObjectType::Untyped { (slot.badge.get(), slot.aux.get()) } else { (0, 0) };
-        Some(SlotView { cap, depth: slot.depth(), prev: slot.prev.get(), next: slot.next.get(), mapped, watermark })
+        let m = slot.meta.get();
+        let watched_by = if m & crate::cap::META_WATCHED != 0 { slot.mnext.get() } else { 0 };
+        let notice_of = if m & crate::cap::META_NOTICE != 0 { slot.mprev.get() } else { 0 };
+        Some(SlotView { cap, depth: slot.depth(), prev: slot.prev.get(), next: slot.next.get(), mapped, watermark, watched_by, notice_of })
     }
 
     /// The state of the thread object at `t` (from a Thread capability).

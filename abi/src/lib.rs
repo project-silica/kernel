@@ -234,6 +234,21 @@ pub enum Syscall {
     /// interrupts nobody), and ends with the watch, its bits left clear. `BadArg` for a line not watched, a word outside the
     /// frame, or no bits.
     IrqQuiet = 25,
+    /// `a0` a slot holding a capability to watch (not a Frame), `a1` a
+    /// Notification (write, and no badge of its own), `a2` an empty slot,
+    /// `a3` bits (not 0). Puts in `a2` a notice: a capability derived from
+    /// `a1` whose badge is `a3`. When the capability in `a0` is deleted, by
+    /// whatever means (its object's memory taken back because its owner
+    /// ended, a revocation of what it derives from, or the holder's own
+    /// `CapDelete`), the notification is signalled with `a3` once and the
+    /// notice is deleted: how a program learns at once that a peer it holds
+    /// a capability to has gone, with nothing to poll. Deleting the notice
+    /// (or the capability it derives from) ends the watch without a signal.
+    /// `CapMove` of either slot keeps the watch. One watch per capability:
+    /// `InUse` for one already watched or a notice; `WrongType` for a Frame
+    /// or a notification that is not one; `BadArg` for bits of 0 or a
+    /// badged notification; `SlotFull` when `a2` is not empty.
+    CapNotice = 26,
 }
 
 /// Interrupt lines that can be watched (`IrqWatch`) at once.
@@ -241,7 +256,7 @@ pub const IRQ_WATCHES: usize = 16;
 
 impl Syscall {
     /// One past the highest syscall number.
-    pub const COUNT: u64 = 26;
+    pub const COUNT: u64 = 27;
 
     /// Decode a syscall number.
     pub const fn from_u64(n: u64) -> Option<Syscall> {
@@ -272,6 +287,7 @@ impl Syscall {
             23 => Syscall::SignalRecv,
             24 => Syscall::IrqWatch,
             25 => Syscall::IrqQuiet,
+            26 => Syscall::CapNotice,
             _ => return None,
         })
     }
