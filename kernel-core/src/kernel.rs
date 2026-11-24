@@ -40,6 +40,8 @@ pub struct Kernel<H: Hal> {
     /// Watched lines (`watch.rs`), and how many entries are in use.
     pub(crate) watches: [crate::watch::LineWatch; silica_abi::IRQ_WATCHES],
     pub(crate) nwatches: Cell<usize>,
+    /// How often programs may make the kernel write a console line.
+    pub(crate) log_rate: crate::log::Rate,
 }
 
 impl<H: Hal> Kernel<H> {
@@ -58,6 +60,7 @@ impl<H: Hal> Kernel<H> {
             irqs: [const { (Cell::new(0), Cell::new(0)) }; silica_abi::IRQ_LINES as usize],
             watches: [const { crate::watch::LineWatch::new() }; silica_abi::IRQ_WATCHES],
             nwatches: Cell::new(0),
+            log_rate: crate::log::Rate::new(),
         }
     }
 
@@ -285,7 +288,10 @@ impl<H: Hal> Kernel<H> {
     #[inline(never)]
     fn signal_recv(&self, t: Paddr, a: &[u64; 6]) -> Result<Exit, Error> {
         let (_, n) = self.ccap(t, a[3], ObjectType::Notification, Rights::WRITE)?;
-        self.notify(t, n.obj, n.badge.max(1))?;
+        // A signal, never a message: a call parked on the notification is
+        // not answered by it (this call's registers hold a deadline, not a
+        // message), and the bits accumulate for whoever answers it.
+        self.signal(n.obj, n.badge.max(1));
         let r = self.recv_any(t, a[0], a[1], a[2]);
         if r == Ok(Exit::Preempted) {
             // The signal is made; what runs again is the receive alone.
@@ -542,6 +548,13 @@ impl<H: Hal> Kernel<H> {
             Syscall::ThreadConfigure => {
                 let (_, th) = self.ccap(t, a[0], ObjectType::Thread, Rights::WRITE)?;
                 let want = [ObjectType::CapSpace, ObjectType::AddressSpace, ObjectType::Endpoint, ObjectType::Frame];
+                // What the thread does with each is a use of it the
+                // capability must allow: running in a CapSpace or an
+                // address space is full use of its slots or mappings (read
+                // and write), a fault is sent through the endpoint, the IPC
+                // buffer is read and written.
+                let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
+                let need = [rw, rw, Rights::WRITE, rw];
                 // Validate everything before changing anything.
                 let mut src = [0; 4];
                 for i in 0..4 {
@@ -549,8 +562,8 @@ impl<H: Hal> Kernel<H> {
                     if arg == KEEP || arg == 0 {
                         continue;
                     }
-                    let (s, cap) = self.ccap(t, arg, want[i], Rights::NONE)?;
-                    if i == 3 && (cap.bits != PAGE_BITS || cap.flags & FLAG_DEVICE != 0 || !cap.rights.has(Rights(3))) {
+                    let (s, cap) = self.ccap(t, arg, want[i], need[i])?;
+                    if i == 3 && (cap.bits != PAGE_BITS || cap.flags & FLAG_DEVICE != 0) {
                         return Err(Error::BadArg);
                     }
                     // No thread runs in an address space made for devices.
@@ -591,6 +604,7 @@ impl<H: Hal> Kernel<H> {
                     return Err(Error::BadArg);
                 }
                 self.cancel(th.obj, false);
+                self.fresh_extended_state(th.obj);
                 let r = &self.thread(th.obj).regs;
                 for c in r.iter() {
                     c.set(0);
@@ -670,17 +684,12 @@ impl<H: Hal> Kernel<H> {
                     let (_, n) = self.ccap(t, a[2], ObjectType::Notification, Rights::WRITE)?;
                     (n.obj, n.badge.max(1))
                 };
-                // Whatever the line signalled before no longer hears from it,
-                // and its news is no longer known.
-                self.unwatch_line(line);
-                let old = self.irqs[line].0.replace(0);
-                self.hal.irq_mask(line, true);
-                if old != 0 {
-                    let q = self.queue(old);
-                    q.bound.set(q.bound.get() - 1);
-                }
+                // Everything is checked, and the line routed anew (which
+                // changes nothing when it fails), before the old binding is
+                // touched: a bind that fails leaves the line as it was.
+                let msi = line >= self.hal.msi_first();
                 if to != 0 {
-                    if line >= self.hal.msi_first() {
+                    if msi {
                         // A message, raised by one device.
                         if a[3] != silica_abi::IRQ_MSI {
                             return Err(Error::BadArg);
@@ -700,6 +709,18 @@ impl<H: Hal> Kernel<H> {
                     ) {
                         return Err(Error::Unsupported);
                     }
+                }
+                // Whatever the line signalled before no longer hears from it,
+                // and its news is no longer known.
+                self.unwatch_line(line);
+                let old = self.irqs[line].0.replace(0);
+                if old != 0 {
+                    let q = self.queue(old);
+                    q.bound.set(q.bound.get() - 1);
+                }
+                if to == 0 {
+                    self.hal.irq_mask(line, true);
+                } else {
                     self.irqs[line].0.set(to);
                     self.irqs[line].1.set(badge);
                     let q = self.queue(to);
@@ -769,6 +790,10 @@ impl<H: Hal> Kernel<H> {
             Syscall::Inspect => {
                 let slot = self.cslot(t, a[0])?;
                 let cap = self.slot(slot).cap().ok_or(Error::BadCap)?;
+                // Looking is a use: it needs the read right.
+                if !cap.rights.has(Rights::READ) {
+                    return Err(Error::NoRights);
+                }
                 let r = &self.thread(t).regs;
                 let thread = |obj: Paddr| {
                     let th = self.thread(obj);
@@ -910,6 +935,28 @@ impl<H: Hal> Kernel<H> {
                 Ok(Exit::Done)
             }
         }
+    }
+
+    /// `ThreadStart`: thread `t` starts a new program, and none of the
+    /// previous one's vector and x87 state goes with the thread object. That
+    /// state may still be live in a processor's registers (the thread was
+    /// running, or that processor went idle with it loaded); that processor
+    /// forgets it is loaded, so it is never saved over the initial image put
+    /// in the save area now. Out of line: in line, the dispatch around it
+    /// cost the page fault 32 instructions (`bench.sh --only insns`). The
+    /// caller holds every lock.
+    #[cold]
+    #[inline(never)]
+    fn fresh_extended_state(&self, t: Paddr) {
+        for cpu in self.cpus.iter(self.ncpu.get()) {
+            if cpu.loaded.get() == t {
+                cpu.loaded.set(0);
+                cpu.dirty.set(true);
+            }
+        }
+        let fpu = t + crate::thread::FPU_OFFSET as u64;
+        self.phys.zero(fpu, (1 << silica_abi::THREAD_BITS) - crate::thread::FPU_OFFSET as u64);
+        self.hal.init_thread(&self.phys, t);
     }
 
     /// The device identity `id`, which the device-identity capability at

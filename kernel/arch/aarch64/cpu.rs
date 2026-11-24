@@ -110,19 +110,36 @@ pub unsafe fn install(p: &'static PerCpu) {
             "mov {t}, #(3 << 20)",
             "msr cpacr_el1, {t}",
             "mrs {t}, sctlr_el1",
-            "bic {t}, {t}, #(1 << 23)",
             // UCI and UCT: user code may clean and invalidate cache lines by
             // address and read the cache type (to run code it wrote).
             "orr {t}, {t}, #(1 << 26)",
             "orr {t}, {t}, #(1 << 15)",
             "msr sctlr_el1, {t}",
-            ".arch_extension pan",
-            "msr pan, #1",
             "isb",
             p = in(reg) core::ptr::from_ref(p),
             t = out(reg) _,
             options(nostack),
         )
+    }
+    // PAN where the processor has it (Armv8.1 on). On an Armv8.0 core
+    // (Cortex-A53, A57, A72), which the user programs are built for, the
+    // instruction that sets it is undefined and SCTLR_EL1 bit 23 is RES1:
+    // neither is touched there, and the kernel runs without that guard, as
+    // on x86_64 without SMAP (the boot says so).
+    if has_pan() {
+        // SAFETY: boot-time setup of this processor, PAN implemented.
+        unsafe {
+            core::arch::asm!(
+                "mrs {t}, sctlr_el1",
+                "bic {t}, {t}, #(1 << 23)",
+                "msr sctlr_el1, {t}",
+                ".arch_extension pan",
+                "msr pan, #1",
+                "isb",
+                t = out(reg) _,
+                options(nostack),
+            )
+        }
     }
 }
 
@@ -403,4 +420,13 @@ unsafe extern "C" {
     pub fn silica_simd_clear();
     pub fn silica_fp_control() -> u64;
     pub fn silica_fp_set_control(v: u64);
+}
+
+/// Whether this processor implements PAN (Privileged Access Never):
+/// ID_AA64MMFR1_EL1 bits 23..20 not 0.
+pub fn has_pan() -> bool {
+    let v: u64;
+    // SAFETY: reading an identification register has no effect.
+    unsafe { core::arch::asm!("mrs {}, id_aa64mmfr1_el1", out(reg) v, options(nomem, nostack, preserves_flags)) }
+    v >> 20 & 0xF != 0
 }

@@ -266,6 +266,12 @@ const MAP_BYTES: u64 = 256 * 1024;
 pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable) -> efi::Status {
     let loader_tsc = arch::counter();
     arch::console(st);
+    if let Some(what) = arch::unsupported() {
+        print("ERROR: loader: this processor lacks ");
+        print(what);
+        print(", which Silica requires\r\n");
+        arch::stop(kernel_core::ExitStatus::Failure.code(), HARNESS.load(Ordering::Relaxed))
+    }
     // SAFETY: the firmware passes a valid system table; boot services are
     // usable until ExitBootServices below.
     let (bs, rt, cfg) =

@@ -87,8 +87,13 @@ pub enum Syscall {
     Map = 10,
     /// `a0` frame. Removes this capability's mapping.
     Unmap = 11,
-    /// `a0` thread, `a1` CapSpace, `a2` address space, `a3` fault endpoint,
-    /// `a4` IPC buffer frame. [`KEEP`] leaves a field unchanged, 0 clears it.
+    /// `a0` thread (write), `a1` CapSpace, `a2` address space, `a3` fault
+    /// endpoint, `a4` IPC buffer frame. [`KEEP`] leaves a field unchanged, 0
+    /// clears it. Each capability must carry the use the thread makes of
+    /// it: read and write on the CapSpace, the address space and the IPC
+    /// buffer (running in them is full use of their slots and mappings),
+    /// write on the fault endpoint (faults are sent through it); `NoRights`
+    /// otherwise, with nothing changed.
     ThreadConfigure = 12,
     /// `a0` thread, `a1` instruction pointer, `a2` stack pointer, `a3`
     /// first argument, `a4` not 0: make the thread runnable.
@@ -117,11 +122,14 @@ pub enum Syscall {
     /// the identity of the one device allowed to raise the line (enforced
     /// where the machine remaps interrupts). `BadArg` for a line that is a
     /// wire, `Unsupported` where the machine has no message interrupts.
+    ///
+    /// A bind that fails changes nothing: the line keeps its binding.
     IrqBind = 16,
     /// `a0` interrupt-line capability, `a1` line. The device has been dealt
     /// with: let the line interrupt again.
     IrqAck = 17,
-    /// Look at kernel state through a capability, changing nothing.
+    /// Look at kernel state through a capability (which needs its read
+    /// right: `NoRights` without it), changing nothing.
     /// `a0` a CapSpace and `a1` a slot index: what that slot holds. Returns
     /// `a0` object type (0: empty), `a1` rights, `a2` size in bits, `a3` the
     /// object's identity (equal for capabilities to one object), `a4` badge,
@@ -188,7 +196,9 @@ pub enum Syscall {
     /// (`RootInfo::dma_top` is 0) or for a device its IOMMU does not cover;
     /// `NoMemory` when the kernel's device tables are full.
     DeviceAttach = 22,
-    /// Signal the notification `a3` as `Send` does, then `Recv` with
+    /// Signal the notification `a3` (OR the capability's badge into its
+    /// word, as `Send` does; a call parked on it is not answered: a signal
+    /// carries no message, and accumulates for whoever answers), then `Recv` with
     /// `a0..a2` as `Recv` takes them: the wake-up a thread gives its peer
     /// and its own wait for the answer, in one kernel entry, so a peer on
     /// the same processor runs at once. A signal that cannot be made (not a

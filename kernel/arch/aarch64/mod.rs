@@ -955,6 +955,12 @@ extern "C" fn kmain(info: u64) -> ! {
     // SAFETY: once, on the boot processor, with interrupts masked; the
     // per-processor data is a static.
     unsafe { cpu::install(&BOOT_CPU) };
+    if !cpu::has_pan() {
+        let _ = write!(
+            Out,
+            "kernel: this processor has no PAN (Armv8.0): the kernel runs without the guard against touching user memory by accident\r\n"
+        );
+    }
     smp::LOW_ROOT.store(ttbr0(), Ordering::Relaxed);
 
     // The interrupt controller.

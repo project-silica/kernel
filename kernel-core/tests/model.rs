@@ -324,13 +324,16 @@ impl Model {
             S::ThreadConfigure => {
                 let (_, th) = self.typed(a[0], T::Thread, 2)?;
                 let want = [T::CapSpace, T::AddressSpace, T::Endpoint, T::Frame];
+                // Read and write to run in a CapSpace or an address space
+                // or use an IPC buffer; write to send faults to an endpoint.
+                let need = [3, 3, 2, 3];
                 let mut src = [None; 4];
                 for i in 0..4 {
                     if a[i + 1] == KEEP || a[i + 1] == 0 {
                         continue;
                     }
-                    let (s, cap) = self.typed(a[i + 1], want[i], 0)?;
-                    if i == 3 && (cap.bits != 12 || cap.rights & 3 != 3) {
+                    let (s, cap) = self.typed(a[i + 1], want[i], need[i])?;
+                    if i == 3 && cap.bits != 12 {
                         return Err(Error::BadArg);
                     }
                     src[i] = Some(s);

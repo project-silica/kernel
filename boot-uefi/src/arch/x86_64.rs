@@ -161,3 +161,16 @@ pub unsafe fn handover(root: u64, _low_root: u64, entry: u64, info: u64) -> ! {
         )
     }
 }
+
+/// The first feature Silica requires that this processor lacks
+/// (`kernel_core::x86`), checked before EFER.NXE is set and before tables
+/// with the NX bit are built: without NX either faults with nothing said.
+pub fn unsupported() -> Option<&'static str> {
+    kernel_core::x86::check(|leaf, sub| {
+        // SAFETY: CPUID only reads identification registers.
+        #[allow(unused_unsafe)]
+        let r = unsafe { core::arch::x86_64::__cpuid_count(leaf, sub) };
+        [r.eax, r.ebx, r.ecx, r.edx]
+    })
+    .missing
+}

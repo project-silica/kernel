@@ -38,6 +38,9 @@ pub struct TestHal {
     pub console: RefCell<Vec<u8>>,
     pub flushes: Cell<u64>,
     pub switches: Cell<u64>,
+    /// The last switch: the thread whose state was saved (0: none) and the
+    /// one loaded.
+    pub last_switch: Cell<(Paddr, Paddr)>,
     pub left: Cell<u64>,
     /// The address-space root each simulated processor has loaded (0: the
     /// kernel's own), as CR3 would hold it. This HAL keeps the kernel in
@@ -161,6 +164,7 @@ impl Hal for TestHal {
     }
     fn switch_thread(&self, _phys: &Phys, _from: Paddr, _to: Paddr, root: Paddr) {
         self.switches.set(self.switches.get() + 1);
+        self.last_switch.set((_from, _to));
         self.roots[self.cpu.get()].set(root);
     }
     fn leave_aspace(&self, root: Paddr) {
@@ -411,6 +415,7 @@ impl Machine {
             console: RefCell::new(Vec::new()),
             flushes: Cell::new(0),
             switches: Cell::new(0),
+            last_switch: Cell::new((0, 0)),
             left: Cell::new(0),
             roots: [const { Cell::new(0) }; TEST_CPUS],
             answers: Cell::new(0),

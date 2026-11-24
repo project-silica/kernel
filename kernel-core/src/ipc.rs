@@ -516,21 +516,36 @@ impl<H: Hal> Kernel<H> {
                 self.thread(t).via_slot.set(0);
                 let _ = self.send(t, c.obj, c.badge, IPC_CALL | IPC_FAULT, true);
             }
-            _ => {
-                self.cancel(t, false);
-                crate::klog!(
-                    self,
-                    "thread {:#x}: {:?} fault at ip {:#x}, address {:#x}, code {:#x}; no fault endpoint, thread stopped",
-                    t,
-                    kind,
-                    th.regs[H::IP].get(),
-                    addr,
-                    code
-                );
-            }
+            _ => self.fault_unheard(t, kind, addr, code),
         }
         if global {
             self.go_local();
+        }
+    }
+}
+
+impl<H: Hal> Kernel<H> {
+    /// Thread `t` faulted with no fault endpoint: it stops, and the console
+    /// is told, as often as the ration allows (`log::Rate`: a program can
+    /// fault as often as it likes). Out of line: the fault path that has an
+    /// endpoint must not pay for this one's registers (in line it cost the
+    /// page fault 32 instructions).
+    #[cold]
+    #[inline(never)]
+    fn fault_unheard(&self, t: Paddr, kind: Fault, addr: u64, code: u64) {
+        self.cancel(t, false);
+        if let Some(dropped) = self.log_rate.allow(self.hal.now()) {
+            crate::klog!(
+                self,
+                "thread {:#x}: {:?} fault at ip {:#x}, address {:#x}, code {:#x}; no fault endpoint, thread stopped{}{}",
+                t,
+                kind,
+                self.thread(t).regs[H::IP].get(),
+                addr,
+                code,
+                if dropped != 0 { " (faults since not logged: " } else { "" },
+                crate::log::Count(dropped)
+            );
         }
     }
 }

@@ -297,9 +297,11 @@ impl Hal for X86 {
             if to_regs[REG_BY_SYSCALL].get() != 0 {
                 let ctl = to_regs[REG_FPCTL].get();
                 let ctl = [ctl as u32, (ctl >> 32) as u32];
-                if self.xcr0.get() & !0b111 != 0 || !self.xgetbv1.get() {
-                    // More than x87, SSE and AVX is enabled, or the processor
-                    // cannot say what is in use: restore the initial image.
+                if self.xcr0.get() != 0b111 || !self.xgetbv1.get() {
+                    // Other than exactly x87, SSE and AVX is enabled (more,
+                    // or no AVX, without which VZEROALL is undefined), or
+                    // the processor cannot say what is in use: restore the
+                    // initial image.
                     self.restore(INIT_STATE.0.get().cast());
                     hw = [MXCSR_DEFAULT, FCW_DEFAULT];
                 } else {
@@ -984,8 +986,15 @@ pub(super) fn init_processor(first: bool) {
     let k = kernel();
     let f1 = cpuid(1, 0);
     let f7 = cpuid(7, 0);
-    require(f1[2] & 1 << 21 != 0, "x2APIC");
-    require(f1[2] & 1 << 26 != 0, "XSAVE");
+    // x86-64-v3, NX, x2APIC, XSAVE and a constant TSC (`kernel_core::x86`),
+    // on every processor: the loader checked the boot processor already.
+    let v = kernel_core::x86::check(cpuid);
+    if let Some(m) = v.missing {
+        require(false, m);
+    }
+    if first && v.tsc_trusted {
+        klog!(k, "kernel: the hypervisor reports no invariant TSC; the clock trusts it to count at a constant rate");
+    }
     // SAFETY: boot-time processor setup with interrupts off. Each bit set
     // is one the processor reports supporting.
     unsafe {
@@ -1020,7 +1029,7 @@ pub(super) fn init_processor(first: bool) {
         // x87, SSE, AVX, and AVX-512 when its state fits the Thread object.
         let supported = cpuid(0xD, 0)[0] as u64;
         let mut xcr0 = supported & 0b111;
-        require(xcr0 & 0b11 == 0b11, "SSE state in XSAVE");
+        require(xcr0 & 0b111 == 0b111, "SSE and AVX state in XSAVE");
         if supported & 0xE0 == 0xE0 {
             xcr0 |= 0xE0;
         }

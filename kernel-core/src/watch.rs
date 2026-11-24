@@ -102,20 +102,31 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// Whether slot `slot` still holds a capability to frame `frame` with
-    /// `rights`: while it does, the frame is alive.
-    fn names(&self, slot: Paddr, frame: Paddr, rights: Rights) -> bool {
-        self.slot(slot).cap().is_some_and(|c| c.ty == ObjectType::Frame && c.obj == frame && c.rights.has(rights))
+    /// `rights`, of memory (not a device's), whose size covers the word at
+    /// `offset`: while it does, the frame is alive and the word is in it. The
+    /// size is checked at every use, not once: the slot may since hold a
+    /// smaller frame at the same address (the first was deleted and its
+    /// memory retyped into the same slot), and a word past that one's end is
+    /// memory its Untyped may have made a kernel object of.
+    fn names(&self, slot: Paddr, frame: Paddr, offset: u64, rights: Rights) -> bool {
+        self.slot(slot).cap().is_some_and(|c| {
+            c.ty == ObjectType::Frame
+                && c.obj == frame
+                && c.rights.has(rights)
+                && c.flags & crate::cap::FLAG_DEVICE == 0
+                && offset < 1u64 << c.bits
+        })
     }
 
     /// The watched word of `w`, while its frame is still named.
     fn word(&self, w: &LineWatch) -> Option<Paddr> {
-        self.names(w.slot.get(), w.frame.get(), Rights::READ).then(|| w.frame.get() + w.offset.get())
+        self.names(w.slot.get(), w.frame.get(), w.offset.get(), Rights::READ).then(|| w.frame.get() + w.offset.get())
     }
 
     /// The quiet word of `w`, if it has one and its frame is still named.
     fn quiet(&self, w: &LineWatch) -> Option<Paddr> {
         let s = w.quiet_slot.get();
-        (s != 0 && self.names(s, w.quiet_frame.get(), Rights(Rights::READ.0 | Rights::WRITE.0)))
+        (s != 0 && self.names(s, w.quiet_frame.get(), w.quiet_offset.get(), Rights(Rights::READ.0 | Rights::WRITE.0)))
             .then(|| w.quiet_frame.get() + w.quiet_offset.get())
     }
 
