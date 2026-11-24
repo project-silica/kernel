@@ -895,7 +895,8 @@ fn t_inspect() -> T {
 // ---- more than one processor ---------------------------------------------
 
 static CPUS: AtomicU64 = AtomicU64::new(1);
-/// `RootInfo::entropy` as four words, and `entropy_sources`.
+/// The boot secret as four words (the start registers), and
+/// `RootInfo::entropy_sources`.
 static ENTROPY: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// The root task's start-up record, for tests that read the firmware's tables.
 static INFO: AtomicU64 = AtomicU64::new(0);
@@ -1873,6 +1874,14 @@ fn t_entropy() -> T {
     if w.iter().all(|&x| x == w[0]) {
         return Err("the root task's secret is a repeated word");
     }
+    // The record is lent on to whoever manages the devices: no word of the
+    // secret may be in it.
+    // SAFETY: INFO is the kernel's read-only record, a whole page mapped
+    // for the root task's life.
+    let page = unsafe { core::slice::from_raw_parts(INFO.load(SeqCst) as *const u64, 512) };
+    if page.iter().any(|x| w.contains(x)) {
+        return Err("the start-up record, which is lent on, holds the boot secret");
+    }
     Ok(())
 }
 
@@ -1910,7 +1919,7 @@ const TESTS: &[(&str, fn() -> T)] = &[
 /// Program entry, called by libsys's `_start`.
 // SAFETY: the one definition of the symbol `_start` calls.
 #[unsafe(no_mangle)]
-extern "C" fn silica_main(info: &'static RootInfo) -> ! {
+extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3: u64) -> ! {
     if info.magic != ROOT_MAGIC {
         exit(false);
     }
@@ -1919,8 +1928,9 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     }
     NEXT_SLOT.store(info.first_free_slot, SeqCst);
     CPUS.store(info.cpus, SeqCst);
-    for (i, w) in info.entropy.as_chunks::<8>().0.iter().enumerate() {
-        ENTROPY[i].store(u64::from_le_bytes(*w), SeqCst);
+    // The boot secret: in the start registers, nowhere else (`root::secret`).
+    for (i, w) in [s0, s1, s2, s3].into_iter().enumerate() {
+        ENTROPY[i].store(w, SeqCst);
     }
     ENTROPY[4].store(info.entropy_sources, SeqCst);
     INFO.store(info as *const RootInfo as u64, SeqCst);

@@ -52,9 +52,10 @@ pub struct RootSpec<'a> {
     pub clock: [u64; 3],
     /// Wall-clock time, as in [`RootInfo::wall_clock`].
     pub wall_clock: [u64; 2],
-    /// As in [`RootInfo::entropy`] and [`RootInfo::entropy_sources`].
+    /// The boot secret, given to the root thread in its start registers
+    /// (`silica_abi::root::secret`); never written to a frame.
     pub entropy: [u8; 32],
-    /// See `entropy`.
+    /// As in [`RootInfo::entropy_sources`].
     pub entropy_sources: u64,
     /// Kernel command line.
     pub cmdline: &'a [u8],
@@ -244,7 +245,6 @@ impl<H: Hal> Kernel<H> {
         put(offset_of!(RootInfo, framebuffer), &spec.framebuffer);
         put(offset_of!(RootInfo, clock), &spec.clock);
         put(offset_of!(RootInfo, wall_clock), &spec.wall_clock);
-        self.phys.write_bytes(info + offset_of!(RootInfo, entropy) as u64, &spec.entropy);
         put(offset_of!(RootInfo, entropy_sources), &[spec.entropy_sources]);
         let cmd = &spec.cmdline[..spec.cmdline.len().min(256)];
         put(offset_of!(RootInfo, cmdline_len), &[cmd.len() as u64]);
@@ -265,6 +265,10 @@ impl<H: Hal> Kernel<H> {
         r[H::IP].set(elf.entry);
         r[H::SP].set(STACK_VADDR + (1 << STACK_BITS));
         r[H::ARG[0]].set(INFO_VADDR);
+        // The boot secret, in registers only (`silica_abi::root::secret`).
+        for (i, w) in spec.entropy.as_chunks::<8>().0.iter().enumerate() {
+            r[H::ARG[1 + i]].set(u64::from_le_bytes(*w));
+        }
         r[H::FLAGS].set(H::FLAGS_INIT);
         self.make_runnable(t);
         Ok(t)

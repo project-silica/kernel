@@ -94,7 +94,8 @@ pub struct BootInfo {
     pub fb_stride: u32,
     /// 0 none, 1 RGBX, 2 BGRX (8 bits each, byte order in memory).
     pub fb_format: u32,
-    /// The root task's secret (`RootInfo::entropy`).
+    /// The root task's secret, given to it in its start registers
+    /// (`silica_abi::root::secret`).
     pub entropy: [u8; 32],
     /// `RootInfo::entropy_sources`.
     pub entropy_sources: u64,

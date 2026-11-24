@@ -17,6 +17,17 @@ use std::cell::{Cell, RefCell};
 
 /// Physical address of the first byte of the host machine's memory.
 pub const RAM_BASE: u64 = 0x10_0000;
+/// The boot secret the test machines are booted with: no byte repeated,
+/// so a copy of any eight of them is found anywhere it lands.
+pub const BOOT_SECRET: [u8; 32] = {
+    let mut s = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        s[i] = 0xA0 + i as u8;
+        i += 1;
+    }
+    s
+};
 /// Processors a test machine can have.
 pub const TEST_CPUS: usize = 4;
 
@@ -389,6 +400,8 @@ pub struct Machine {
     pub cs: Cap,
     pub info: Paddr,
     pub mib: u64,
+    /// The root thread's argument registers as the kernel started it.
+    pub start_args: [u64; 6],
 }
 
 impl Machine {
@@ -455,7 +468,7 @@ impl Machine {
             framebuffer: [0; 5],
             clock: [1_000_000_000, 0, 0],
             wall_clock: [0; 2],
-            entropy: [7; 32],
+            entropy: BOOT_SECRET,
             entropy_sources: 0,
             cmdline: b"test=host",
             cpus: cpus as u64,
@@ -463,6 +476,7 @@ impl Machine {
         k.set_cpu_count(cpus);
         k.enter();
         let root = k.boot_root(&spec).expect("root task");
+        let start_args = core::array::from_fn(|i| k.regs(root)[TestHal::ARG[i]].get());
         let tv = k.thread_view(root);
         let cs = k.view(tv.slots[0]).expect("root cspace").cap;
         let asp = k.view(k.slot_addr(&cs, SLOT_ASPACE).unwrap()).unwrap().cap.obj;
@@ -470,7 +484,7 @@ impl Machine {
         k.schedule();
         k.leave();
         assert_eq!(k.current(), root);
-        Machine { k, _ram: ram, root, cs, info, mib }
+        Machine { k, _ram: ram, root, cs, info, mib, start_args }
     }
 
     pub fn info(&self) -> &RootInfo {

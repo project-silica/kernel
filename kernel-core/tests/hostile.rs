@@ -346,3 +346,18 @@ fn page_tables_are_given_back_when_their_mappings_go() {
         }
     }
 }
+
+/// The boot secret (`RootSpec::entropy`, what every seed and key on the
+/// machine descends from) reaches the root task in its first thread's
+/// registers, never in a frame: the RootInfo frame describes the machine
+/// and is lent on to whoever manages its devices (the device manager,
+/// which parses hostile device data).
+#[test]
+fn the_boot_secret_is_in_no_frame_the_root_task_lends() {
+    let m = Machine::new(16);
+    let secret = support::BOOT_SECRET;
+    let info = m.mem(m.info, 4096);
+    assert!(!info.windows(8).any(|w| secret.chunks(8).any(|c| c == w)), "the RootInfo frame holds the boot secret");
+    let words: Vec<u64> = secret.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(m.start_args[1..5], words[..], "the root thread does not start with the boot secret");
+}
