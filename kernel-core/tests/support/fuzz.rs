@@ -22,6 +22,12 @@ use silica_abi::{Fault, KEEP, NONBLOCK, ObjectType as T, Syscall as S};
 const WINDOW: u64 = 2000;
 const NWIN: u64 = 16;
 const THREADS: u64 = 1990;
+/// The syscall numbers an input can name: every syscall and a few unknown
+/// numbers. When the syscalls outgrow it, double it and carry the committed
+/// corpus across (see [`Src::arg`]): every seed's syscall bytes change
+/// meaning.
+const SYSCALL_SPACE: u64 = 32;
+const _: () = assert!(S::COUNT <= SYSCALL_SPACE, "more syscalls than the fuzzer's SYSCALL_SPACE: double it and carry the corpus across");
 const VADDRS: [u64; 6] = [0x10000, 0x11000, 0x20_0000, 0x4000_0000, 0x7FFF_FFE0_0000, 0xFFFF_8000_0000_0000];
 
 struct Src<'a>(&'a [u8]);
@@ -32,6 +38,15 @@ impl Src<'_> {
         Some(b)
     }
     /// One syscall argument: mostly a slot the test uses, sometimes anything.
+    ///
+    /// The committed corpus (and the regression inputs the host tests name)
+    /// is written in this grammar. Extend a table only where no existing
+    /// byte changes what it decodes to; a change that does (a modulus, a
+    /// category's meaning, SYSCALL_SPACE) must carry the corpus across in
+    /// the same commit: run each seed under the old decoding, write the
+    /// bytes that decode to the same values under the new one, and check
+    /// that each rewritten seed makes the same syscalls with the same
+    /// arguments (done once, for the commit that set SYSCALL_SPACE).
     fn arg(&mut self, ut: u64) -> Option<u64> {
         let b = self.byte()?;
         Some(match b >> 4 {
@@ -151,7 +166,13 @@ pub fn run(data: &[u8]) {
             }
             _ => {}
         }
-        let mut n = op as u64 % S::COUNT;
+        // The syscall number is the byte modulo SYSCALL_SPACE, not modulo
+        // the count: a syscall added later takes a number no seed used for
+        // anything else (it was an unknown number, answered BadSyscall),
+        // so the committed corpus keeps its meaning and its coverage.
+        // (Modulo S::COUNT reshuffled every seed with each new syscall: the
+        // corpus fell from 1487 to 1108 edges with DeviceAttach unseen.)
+        let mut n = op as u64 % SYSCALL_SPACE;
         let mut a = [0u64; 6];
         for x in &mut a {
             let Some(v) = src.arg(ut) else { break };
