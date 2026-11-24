@@ -1503,21 +1503,24 @@ extern "C" fn toucher(arg: u64) -> ! {
 
 /// First touch of a page, resolved by a pager thread in userspace.
 fn bench_page_fault() {
-    // One range of slots, emptied again at the end, so the benchmark can
-    // run more than once in a boot (bench=fault:<times>).
+    // One set of frames and one range of addresses, made by the first run
+    // and unmapped again at the end of each, so the benchmark can run any
+    // number of times in a boot (bench=fault:<times>) at the same cost each
+    // time: retyped anew per run, the frames' memory stayed with them (a
+    // deleted capability gives no memory back to the Untyped), and the
+    // tenth run of a boot failed for want of it.
     let first = match FAULT_SLOTS.load(SeqCst) {
         0 => {
             let f = NEXT_SLOT.fetch_add(FAULT_PAGES as u64, SeqCst);
+            for i in 0..FAULT_PAGES as u64 / 256 {
+                retype(Cap(UNTYPED.load(SeqCst)), ObjectType::Frame, 12, SPACE, f + i * 256, 256).expect("frames");
+            }
+            FAULT_BASE.store(region((FAULT_PAGES as u64) << 12) as u64, SeqCst);
             FAULT_SLOTS.store(f, SeqCst);
             f
         }
         f => f,
     };
-    for i in 0..FAULT_PAGES as u64 / 256 {
-        retype(Cap(UNTYPED.load(SeqCst)), ObjectType::Frame, 12, SPACE, first + i * 256, 256).expect("frames");
-    }
-    let base = region((FAULT_PAGES as u64) << 12);
-    FAULT_BASE.store(base as u64, SeqCst);
     SHARED[0].store(0, SeqCst);
     let ep = new(ObjectType::Endpoint, 0);
     let _ = spawn(toucher, 0, ep);
@@ -1532,9 +1535,9 @@ fn bench_page_fault() {
     let _ = wait_for(&SHARED[0], 99);
     report("page_fault", FAULT_PAGES, 1);
     for i in 0..FAULT_PAGES as u64 {
-        // SAFETY: the frames were mapped only at `base`, which nothing
-        // touches any more (the toucher has finished).
-        let _ = unsafe { cap_delete(Cap(first + i)) };
+        // SAFETY: the frames were mapped only at the benchmark's range,
+        // which nothing touches any more (the toucher has finished).
+        unsafe { unmap(Cap(first + i)) }.expect("unmap a faulted page");
     }
 }
 
