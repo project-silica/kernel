@@ -34,6 +34,8 @@ pub struct Kernel<H: Hal> {
     pub(crate) globals: Cell<u64>,
     /// Objects waiting to be emptied (only used holding every lock).
     pub(crate) reap: Cell<u64>,
+    /// The CapSpace being emptied, part done (0: none; `cap::drain_reap`).
+    pub(crate) reaping: Cell<u64>,
     /// The notification and badge each interrupt line signals (changed
     /// only by a holder of every lock).
     pub(crate) irqs: [(Cell<Paddr>, Cell<u64>); silica_abi::IRQ_LINES as usize],
@@ -57,6 +59,7 @@ impl<H: Hal> Kernel<H> {
             structure: crate::lock::Lock::new(),
             globals: Cell::new(0),
             reap: Cell::new(0),
+            reaping: Cell::new(0),
             irqs: [const { (Cell::new(0), Cell::new(0)) }; silica_abi::IRQ_LINES as usize],
             watches: [const { crate::watch::LineWatch::new() }; silica_abi::IRQ_WATCHES],
             nwatches: Cell::new(0),
@@ -426,6 +429,12 @@ impl<H: Hal> Kernel<H> {
 
     fn dispatch(&self, s: Syscall, t: Paddr, a: [u64; 6]) -> Result<Exit, Error> {
         let grant = |cap: &Cap| if cap.rights.has(Rights::GRANT) { IPC_GRANT } else { 0 };
+        // Emptying left over from an earlier entry (a large CapSpace,
+        // `drain_reap`) is finished before any system call that holds every
+        // lock does anything: its memory is reused only once it is done.
+        if self.reap_pending() && (self.ncpu.get() == 1 || self.global.get()) && !self.finish_reap() {
+            return Ok(Exit::Preempted);
+        }
         match s {
             Syscall::Call => {
                 let (slot, ep) = self.ccap(t, a[0], ObjectType::Endpoint, Rights::WRITE)?;
@@ -525,7 +534,9 @@ impl<H: Hal> Kernel<H> {
                     return Ok(Exit::Preempted);
                 }
                 self.delete(s);
-                Ok(Exit::Done)
+                // Made again until what it destroyed is emptied: the
+                // deleter pays for it, not the next caller.
+                Ok(if self.reap_pending() { Exit::Preempted } else { Exit::Done })
             }
             Syscall::CapRevoke => {
                 let s = self.cslot(t, a[0])?;
@@ -847,7 +858,18 @@ impl<H: Hal> Kernel<H> {
             }
             Syscall::SchedConfigure => {
                 let (_, sc) = self.ccap(t, a[0], ObjectType::SchedContext, Rights::WRITE)?;
-                self.sched_configure(sc.obj, a[1], a[2], a[3], a[4])?;
+                // The processors whose time the caller may give out (a5: a
+                // processor-time capability; 0: none, its own share only).
+                let time = if a[5] == 0 {
+                    0..0
+                } else {
+                    let (_, hw) = self.ccap(t, a[5], ObjectType::Hw, Rights::WRITE)?;
+                    if hw.flags & crate::cap::FLAG_SCHED == 0 {
+                        return Err(Error::WrongType);
+                    }
+                    hw.obj..hw.badge
+                };
+                self.sched_configure(sc.obj, a[1], a[2], a[3], a[4], time)?;
                 // Its threads' processors look at their queues again.
                 let mut b = self.sched(sc.obj).threads.get();
                 while b != 0 {
@@ -935,6 +957,14 @@ impl<H: Hal> Kernel<H> {
                 Ok(Exit::Done)
             }
         }
+    }
+
+    /// Finish emptying what an earlier entry left (`drain_reap`); false
+    /// when an interrupt stops it again. Holding every lock.
+    #[cold]
+    #[inline(never)]
+    fn finish_reap(&self) -> bool {
+        self.drain_reap()
     }
 
     /// `ThreadStart`: thread `t` starts a new program, and none of the

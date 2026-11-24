@@ -224,3 +224,125 @@ fn thread_start_resets_the_extended_state() {
     assert_eq!(u64::from_le_bytes(m.mem(area, 8).try_into().unwrap()), 0x1F80, "not the initial image");
     assert!(m.is_zero(area + 8, len - 8), "the previous program's state is still in the save area");
 }
+
+/// Processor time is authority (`SLOT_SCHED`, narrowed by processor): a
+/// scheduling context made from memory alone may lower its threads' share
+/// and not raise it, nor reserve a processor. Without this, any holder of
+/// an Untyped took 1,024 times a service's share, or 90% of the processor
+/// every service runs on.
+#[test]
+fn processor_time_takes_a_capability_to_processor_time() {
+    use silica_abi::{SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_MAX_WEIGHT};
+    const MS: u64 = 1_000_000;
+    let m = Machine::with_cpus(16, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::SchedContext, 0, FREE, 2);
+    let (sc, other) = (FREE, FREE + 1);
+    // Memory alone: down, not up.
+    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, 0]), Error::NoRights);
+    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_DEFAULT_WEIGHT + 1, 0, 0, 0]), Error::NoRights);
+    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_DEADLINE, 9 * MS, 10 * MS, 0, 0]), Error::NoRights);
+    m.ok(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_DEFAULT_WEIGHT / 2, 0, 0, 0]);
+    m.ok(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, 0]);
+    // Not any capability: one to processor time.
+    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, SLOT_IRQS]), Error::WrongType);
+    // Narrowed to processor 1: a reservation there, not on processor 0, and
+    // no weight above the default (a fair thread runs wherever it is moved).
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2, SLOT_SCHED, 15, 1 | 2 << 32, 0]);
+    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_DEADLINE, 9 * MS, 10 * MS, 0, FREE + 2]), Error::NoRights);
+    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, FREE + 2]), Error::NoRights);
+    m.ok(S::SchedConfigure, [sc, SCHED_DEADLINE, 9 * MS, 10 * MS, 1, FREE + 2]);
+    // The whole machine's: anything.
+    m.ok(S::SchedConfigure, [other, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, SLOT_SCHED]);
+    m.ok(S::SchedConfigure, [other, SCHED_FAIR, 1, 0, 0, 0]);
+    // A capability without its write right is no authority.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 3, SLOT_SCHED, Rights::READ.0 as u64, 0, 0]);
+    assert_eq!(m.err(S::SchedConfigure, [other, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, FREE + 3]), Error::NoRights);
+}
+
+/// Destroying a CapSpace empties every slot it has (up to 2^32), holding
+/// every processor's lock: a program with the memory for a large one must
+/// not stop the machine with one call. The emptying stops for a pending
+/// interrupt and goes on where it stopped; anything that could reuse
+/// memory (a global system call) finishes it first.
+#[test]
+fn destroying_a_large_capspace_is_preemptible_and_finished_before_anything_else() {
+    let m = Machine::new(64);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.retype(ut, T::CapSpace, 16, FREE + 1, 1);
+    let n = m.k.slot_addr(&m.cs, FREE).unwrap();
+    // Capabilities derived from the root's, in slots across the space.
+    for i in [1u64, 1000, 30_000, 65_535] {
+        m.ok(S::CapCopy, [FREE + 1, i, FREE, 15, 0, 0]);
+    }
+    let held = || {
+        let v = m.k.view(n).unwrap();
+        v.next != 0 && m.k.view(v.next).is_some_and(|c| c.depth > v.depth)
+    };
+    assert!(held());
+    // One kernel entry with an interrupt pending: it stops, to be made again.
+    let t = m.root;
+    let r = m.k.regs(t);
+    r[TestHal::IP].set(0x40_0002);
+    r[TestHal::SYS].set(S::CapDelete as u64);
+    r[TestHal::ARG[0]].set(FREE + 1);
+    m.k.hal.pending.set(1);
+    m.k.enter();
+    m.k.syscall();
+    m.k.leave();
+    assert_eq!(r[TestHal::IP].get(), 0x40_0000, "the whole CapSpace was emptied in one go");
+    assert!(m.cap(FREE + 1).is_none(), "the capability itself is gone at once");
+    assert!(held(), "nothing was left for later");
+    // The next system call that needs every lock finishes it first.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2, FREE, 15, 0, 0]);
+    assert!(m.k.view(m.k.slot_addr(&m.cs, FREE + 2).unwrap()).is_some());
+    let v = m.k.view(n).unwrap();
+    assert_eq!(v.next, m.k.slot_addr(&m.cs, FREE + 2).unwrap(), "the destroyed CapSpace's capabilities are still there");
+    assert!(m.k.view(v.next).unwrap().next == 0 || m.k.view(m.k.view(v.next).unwrap().next).unwrap().depth <= v.depth);
+}
+
+/// One `Map` writes at most `MAP_MAX_ENTRIES` page-table entries: a frame
+/// that would need more (a huge frame where only small pages are
+/// available) is refused, so no mapping or unmapping holds the machine for
+/// longer than that.
+#[test]
+fn a_mapping_too_large_for_one_call_is_refused() {
+    let m = Machine::new(1024);
+    m.k.hal.io_large.set(false);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 20 | silica_abi::ASPACE_IO, FREE, 1);
+    m.retype(ut, T::Frame, 27, FREE + 2, 1);
+    m.retype(ut, T::Frame, 28, FREE + 1, 1);
+    let rw = (Rights::READ.0 | Rights::WRITE.0) as u64;
+    assert_eq!(m.err(S::Map, [FREE, FREE + 1, 0, rw, 0, 0]), Error::BadArg, "256 MiB in 4 KiB pages");
+    m.ok(S::Map, [FREE, FREE + 2, 0, rw, 0, 0]);
+    m.ok(S::Unmap, [FREE + 2, 0, 0, 0, 0, 0]);
+}
+
+/// Table pages come back when what they mapped is unmapped. A program that
+/// maps a peer's memory at a fresh address each time (as a service mapping
+/// what its clients lend it does) ran its address space out of tables:
+/// 120 lend-and-end cycles of a 1 MiB frame in an 18-bit space.
+#[test]
+fn page_tables_are_given_back_when_their_mappings_go() {
+    for (bits, io) in [(14u64, false), (20, false), (22, false), (20, true)] {
+        let m = Machine::new(64);
+        let (ut, _) = m.big_untyped();
+        m.retype(ut, T::AddressSpace, 18 | if io { silica_abi::ASPACE_IO } else { 0 }, FREE + 10, 1);
+        m.retype(ut, T::Frame, bits, FREE, 1);
+        let space = m.cap(FREE + 10).unwrap().obj;
+        let step = 1u64 << bits.max(21);
+        let mut at: u64 = if io { 0x40_0000 } else { 0x80_0000_0000 };
+        for cycle in 0..5000u64 {
+            let r = m.sys(S::Map, [FREE + 10, FREE, at, 3, 0, 0]);
+            assert_eq!(r.status, 0, "2^{bits} (io {io}): {:?} after {cycle} cycles", Error::result(r.status));
+            assert!(m.k.translate(space, at).is_some() || io);
+            m.ok(S::Unmap, [FREE, 0, 0, 0, 0, 0]);
+            assert!(m.k.translate(space, at).is_none());
+            // Fresh addresses, spread over the space's reach.
+            at = if io { (at + step) % (1 << 38) } else { 0x80_0000_0000 + (at + step * 1031) % (1 << 46) };
+            at &= !(step - 1);
+        }
+    }
+}

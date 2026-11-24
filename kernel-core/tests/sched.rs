@@ -7,7 +7,7 @@
 mod support;
 
 use kernel_core::hal::Hal;
-use silica_abi::root::{SLOT_CAPSPACE, SLOT_THREAD};
+use silica_abi::root::{SLOT_CAPSPACE, SLOT_SCHED, SLOT_THREAD};
 use silica_abi::{Error, ObjectType as T, SCHED_DEADLINE, SCHED_FAIR, Syscall as S};
 use std::collections::HashMap;
 use support::*;
@@ -26,7 +26,7 @@ fn machine() -> (Machine, u64) {
 /// A scheduling context in `slot`, configured as asked.
 fn sched(m: &Machine, ut: u64, slot: u64, class: u64, a: u64, b: u64) {
     m.ok(S::Retype, [ut, T::SchedContext as u64, 0, SLOT_CAPSPACE, slot, 1]);
-    m.ok(S::SchedConfigure, [slot, class, a, b, 0, 0]);
+    m.ok(S::SchedConfigure, [slot, class, a, b, 0, SLOT_SCHED]);
 }
 
 /// When the current processor's timer fires next (`u64::MAX`: not armed).
@@ -133,13 +133,13 @@ fn admission_control_refuses_to_promise_more_than_the_processor_has() {
     let (m, ut) = machine();
     sched(&m, ut, FREE, SCHED_DEADLINE, 5 * MS, 10 * MS);
     m.ok(S::Retype, [ut, T::SchedContext as u64, 0, SLOT_CAPSPACE, FREE + 1, 1]);
-    assert_eq!(m.err(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 5 * MS, 10 * MS, 0, 0]), Error::Overload, "100% promised");
-    m.ok(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 4 * MS, 10 * MS, 0, 0]);
+    assert_eq!(m.err(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 5 * MS, 10 * MS, 0, SLOT_SCHED]), Error::Overload, "100% promised");
+    m.ok(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 4 * MS, 10 * MS, 0, SLOT_SCHED]);
     // Changing a reservation counts what it held already.
-    m.ok(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 3 * MS, 10 * MS, 0, 0]);
+    m.ok(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 3 * MS, 10 * MS, 0, SLOT_SCHED]);
     // Making it fair gives its share back.
-    m.ok(S::SchedConfigure, [FREE, SCHED_FAIR, 1024, 0, 0, 0]);
-    m.ok(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 8 * MS, 10 * MS, 0, 0]);
+    m.ok(S::SchedConfigure, [FREE, SCHED_FAIR, 1024, 0, 0, SLOT_SCHED]);
+    m.ok(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 8 * MS, 10 * MS, 0, SLOT_SCHED]);
     // Destroying one gives its share back too.
     m.ok(S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]);
     sched(&m, ut, FREE + 2, SCHED_DEADLINE, 9 * MS, 10 * MS);
@@ -148,10 +148,10 @@ fn admission_control_refuses_to_promise_more_than_the_processor_has() {
     for a in [
         [FREE + 3, SCHED_FAIR, 0, 0, 0, 0],
         [FREE + 3, SCHED_FAIR, (1 << 20) + 1, 0, 0, 0],
-        [FREE + 3, SCHED_DEADLINE, 0, 10 * MS, 0, 0],
-        [FREE + 3, SCHED_DEADLINE, 11 * MS, 10 * MS, 0, 0],
-        [FREE + 3, SCHED_DEADLINE, 1000, 50_000, 0, 0],
-        [FREE + 3, SCHED_DEADLINE, MS, 10 * MS, 1, 0],
+        [FREE + 3, SCHED_DEADLINE, 0, 10 * MS, 0, SLOT_SCHED],
+        [FREE + 3, SCHED_DEADLINE, 11 * MS, 10 * MS, 0, SLOT_SCHED],
+        [FREE + 3, SCHED_DEADLINE, 1000, 50_000, 0, SLOT_SCHED],
+        [FREE + 3, SCHED_DEADLINE, MS, 10 * MS, 1, SLOT_SCHED],
         [FREE + 3, 7, 1, 1, 0, 0],
     ] {
         assert_eq!(m.err(S::SchedConfigure, a), Error::BadArg, "{a:?}");

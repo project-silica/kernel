@@ -23,6 +23,8 @@ use silica_formats::acpi;
 const PORTS: Cap = Cap(SLOT_PORTS);
 const SPACE: Cap = Cap(SLOT_CAPSPACE);
 const ASPACE: Cap = Cap(SLOT_ASPACE);
+/// The machine's processor time (a weight above the default, a reservation).
+const TIME: Cap = Cap(SLOT_SCHED);
 const RW: Rights = Rights(3);
 
 struct Serial;
@@ -1790,7 +1792,13 @@ fn t_sched() -> T {
     let cpu = cpus - 1;
     // 1. Weights 1024 and 3072 share the processor about 1:3.
     let heavy = new(ObjectType::SchedContext, 0);
-    sched_fair(heavy, 3072).map_err(|_| "cannot configure a fair context")?;
+    // Without processor time, memory buys no more than the default share.
+    if sched_fair(heavy, 3072, Cap::NONE) != Err(Error::NoRights)
+        || sched_deadline(heavy, 1_000_000, 10_000_000, cpu, Cap::NONE) != Err(Error::NoRights)
+    {
+        return Err("a scheduling context was given more than the default share without processor time");
+    }
+    sched_fair(heavy, 3072, TIME).map_err(|_| "cannot configure a fair context")?;
     let c = spin_on(cpu, &[(0, Cap::NONE), (1, heavy)], 300)?;
     let ratio = c[1] as f64 / c[0].max(1) as f64;
     println!("sched: weights 1024 and 3072 counted {} and {} (ratio {:.2})", c[0], c[1], ratio);
@@ -1799,7 +1807,7 @@ fn t_sched() -> T {
     }
     // 2. A 2 ms in 10 ms reservation beside three fair spinners gets a fifth.
     let dl = new(ObjectType::SchedContext, 0);
-    sched_deadline(dl, 2_000_000, 10_000_000, cpu).map_err(|_| "cannot reserve 20% of a processor")?;
+    sched_deadline(dl, 2_000_000, 10_000_000, cpu, TIME).map_err(|_| "cannot reserve 20% of a processor")?;
     let c = spin_on(cpu, &[(0, Cap::NONE), (1, Cap::NONE), (2, Cap::NONE), (3, dl)], 400)?;
     let total: u64 = c[..4].iter().sum();
     let share = c[3] as f64 / total.max(1) as f64;
@@ -1812,7 +1820,7 @@ fn t_sched() -> T {
     }
     // 3. More than 90% of a processor is not promised.
     let more = new(ObjectType::SchedContext, 0);
-    if sched_deadline(more, 8_000_000, 10_000_000, cpu) != Err(Error::Overload) {
+    if sched_deadline(more, 8_000_000, 10_000_000, cpu, TIME) != Err(Error::Overload) {
         return Err("a reservation that would take the processor past 90% was accepted");
     }
     // SAFETY: nothing is bound to them any more.
@@ -1820,7 +1828,7 @@ fn t_sched() -> T {
         let _ = cap_delete(dl);
         let _ = cap_delete(heavy);
     }
-    sched_deadline(more, 8_000_000, 10_000_000, cpu).map_err(|_| "a reservation's share was not given back when it was destroyed")?;
+    sched_deadline(more, 8_000_000, 10_000_000, cpu, TIME).map_err(|_| "a reservation's share was not given back when it was destroyed")?;
     // SAFETY: nothing is bound to it.
     let _ = unsafe { cap_delete(more) };
     // 4. A thread waking from 1 ms sleeps beside two spinners runs promptly.

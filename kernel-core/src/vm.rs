@@ -31,6 +31,10 @@ pub struct AsHeader {
     pub(crate) io: Cell<u64>,
     /// Devices attached to it (a device address space).
     pub(crate) attached: Cell<u64>,
+    /// Table pages given back (their mappings all gone), linked through
+    /// their first word, and how many: taken before new ones.
+    pub(crate) free: Cell<Paddr>,
+    pub(crate) nfree: Cell<u64>,
 }
 impl KObj for AsHeader {}
 
@@ -75,13 +79,20 @@ impl<H: Hal> Kernel<H> {
 
     /// Walk to the requested level, stopping at a missing entry or a leaf.
     fn walk(&self, a: Paddr, va: u64, level: u8) -> (&Cell<u64>, u8) {
+        let (p, at) = self.walk_to(a, va, level);
+        (self.phys.word(p), at)
+    }
+
+    /// [`Kernel::walk`], giving where the entry is.
+    #[inline(always)]
+    fn walk_to(&self, a: Paddr, va: u64, level: u8) -> (Paddr, u8) {
         let mut table = a + PAGE;
         let mut at = 3;
         loop {
-            let entry = self.phys.word(table + ((va >> (PAGE_BITS + 9 * at)) & 511) * 8);
-            let value = entry.get();
+            let p = table + ((va >> (PAGE_BITS + 9 * at)) & 511) * 8;
+            let value = self.phys.word(p).get();
             if at == level || !H::pte_present(value) || H::pte_is_leaf(value, at) {
-                return (entry, at);
+                return (p, at);
             }
             table = H::pte_addr(value);
             at -= 1;
@@ -92,13 +103,18 @@ impl<H: Hal> Kernel<H> {
     /// space. Each missing subtree is counted once, even for a frame that
     /// crosses several table boundaries. Inlined into `map`, its one
     /// caller: the call measured 23 instructions on the page fault's path.
+    /// Returns the walk to `va` (where its entry is, and at what level the
+    /// walk stopped), which nothing changes before `map` uses it: `map`
+    /// does not walk to its first address twice. `va < end` (a frame is
+    /// never empty).
     #[inline(always)]
-    fn check_map(&self, a: Paddr, mut va: u64, end: u64, level: u8) -> Result<(), Error> {
+    fn check_map(&self, a: Paddr, mut va: u64, end: u64, level: u8) -> Result<(Paddr, u8), Error> {
         let h = self.aspace(a);
-        let mut available = (1 << (h.bits.get() - PAGE_BITS as u64)) - 2 - h.used.get();
-        while va < end {
-            let (entry, at) = self.walk(a, va, level);
-            if H::pte_present(entry.get()) {
+        let mut available = (1 << (h.bits.get() - PAGE_BITS as u64)) - 2 - h.used.get() + h.nfree.get();
+        let first = self.walk_to(a, va, level);
+        let (mut p, mut at) = first;
+        loop {
+            if H::pte_present(self.phys.word(p).get()) {
                 return Err(Error::Overlap);
             }
             let span = 1 << (PAGE_BITS + 9 * at);
@@ -109,8 +125,11 @@ impl<H: Hal> Kernel<H> {
                 available = available.checked_sub(tables).ok_or(Error::NoMemory)?;
             }
             va = stop;
+            if va >= end {
+                return Ok(first);
+            }
+            (p, at) = self.walk_to(a, va, level);
         }
-        Ok(())
     }
 
     /// Map the frame in slot `fs` at `vaddr` in address space `a`.
@@ -160,23 +179,30 @@ impl<H: Hal> Kernel<H> {
         let (level, step) = self.leaf(cap.bits, IO);
         let size = 1u64 << cap.bits;
         let top = if IO { self.hal.io_top() } else { H::USER_TOP };
-        // Executing means nothing to a device.
-        if vaddr & (step - 1) != 0 || vaddr >= top || size > top - vaddr || (IO && rights.has(Rights::EXEC)) {
+        // Executing means nothing to a device. No mapping writes more
+        // than MAP_MAX_ENTRIES entries (nor its unmapping clears more).
+        if vaddr & (step - 1) != 0
+            || vaddr >= top
+            || size > top - vaddr
+            || (IO && rights.has(Rights::EXEC))
+            || size / step > silica_abi::MAP_MAX_ENTRIES
+        {
             return Err(Error::BadArg);
         }
-        self.check_map(a, vaddr, vaddr + size, level)?;
+        let first = self.check_map(a, vaddr, vaddr + size, level)?;
         let device = cap.flags & FLAG_DEVICE != 0;
         // Taken only now: live across the check, it cost the page fault
         // spills (measured).
         let h = self.aspace(a);
         for i in 0..size / step {
             let va = vaddr + i * step;
-            let (mut entry, at) = self.walk(a, va, level);
+            // The first entry's walk was made by the check: not again.
+            let (p, at) = if i == 0 { first } else { self.walk_to(a, va, level) };
+            let mut entry = self.phys.word(p);
             for child in (level..at).rev() {
-                let used = h.used.get();
-                let page = a + (used + 2) * PAGE;
-                self.phys.zero(page, PAGE);
-                h.used.set(used + 1);
+                // Zero already: a new one was zeroed with the object (Retype),
+                // one given back was empty but for its link (`take_table`).
+                let page = self.take_table(a, h);
                 entry.set(if IO { H::io_pte_table(page) } else { H::pte_table(page) });
                 entry = self.phys.word(page + ((va >> (PAGE_BITS + 9 * child)) & 511) * 8);
             }
@@ -209,10 +235,32 @@ impl<H: Hal> Kernel<H> {
         let io = h.io.get() != 0;
         let (level, step) = self.leaf(cap.bits, io);
         let size = 1u64 << cap.bits;
-        for i in 0..size / step {
-            let (entry, at) = self.walk(a, vaddr + i * step, level);
+        let n = size / step;
+        let mut last = 0;
+        for i in 0..n {
+            let (p, at) = self.walk_to(a, vaddr + i * step, level);
             debug_assert_eq!(at, level);
-            entry.set(0);
+            self.phys.word(p).set(0);
+            last = p;
+        }
+        // Tables left with nothing in them go back to the space's pool; the
+        // flush below drops what any processor or device cached of them
+        // (every one lies on the walk of the addresses flushed). When the
+        // cleared entries lie in one table (consecutive, ending at `last`),
+        // that table is looked at first, from beside them (a live entry
+        // there, the usual case, is one read), and the tables above only
+        // when it is empty: nothing above a live table can be.
+        let in_table = last & (PAGE - 1);
+        let still_used = if (n - 1) * 8 <= in_table {
+            let table = last - in_table;
+            let first = last - (n - 1) * 8;
+            let live = |p: Paddr| self.phys.word(p).get() != 0;
+            (in_table != PAGE - 8 && live(last + 8)) || (first != table && live(first - 8)) || !self.page_zero(table)
+        } else {
+            false
+        };
+        if !still_used {
+            self.prune(a, vaddr, vaddr + size, level, io);
         }
         if io {
             // Nothing is cached of an address space no device uses.
@@ -236,6 +284,114 @@ impl<H: Hal> Kernel<H> {
         slot.aux.set(0);
         slot.mprev.set(0);
         slot.mnext.set(0);
+    }
+
+    /// A table page for address space `a`: one given back, else a new one
+    /// from its pool (the caller has checked there is one, `check_map`).
+    #[inline(always)]
+    fn take_table(&self, a: Paddr, h: &AsHeader) -> Paddr {
+        let f = h.free.get();
+        if f != 0 {
+            h.free.set(self.phys.word(f).get());
+            self.phys.word(f).set(0);
+            h.nfree.set(h.nfree.get() - 1);
+            return f;
+        }
+        let used = h.used.get();
+        h.used.set(used + 1);
+        a + (used + 2) * PAGE
+    }
+
+    /// Entries of `level` in `[start, end)` of address space `a` were just
+    /// cleared: each table on their walks below the root that holds nothing
+    /// any more is unlinked from its parent and given back, lowest first so
+    /// that its parent may be empty in turn. A device space's first table,
+    /// under the root's entry 0 from its making, stays (`init_io_space`).
+    #[cold]
+    #[inline(never)]
+    fn prune(&self, a: Paddr, start: u64, end: u64, level: u8, io: bool) {
+        let h = self.aspace(a);
+        // One table of leaves at a time: the walk to it gives every table
+        // above it, and the first that still holds something ends the look
+        // upward (nothing above a live table is empty).
+        let span = 1u64 << (PAGE_BITS as u32 + 9 * (level as u32 + 1));
+        let mut v = start;
+        while v < end {
+            let chunk_end = end.min((v & !(span - 1)).saturating_add(span));
+            // The entries naming each table on the walk, root down: at
+            // levels 3, 2 and 1 (only those above the leaves are used).
+            let mut parents = [None; 4];
+            let mut table = a + PAGE;
+            for at in (level + 1..=3).rev() {
+                let e = self.phys.word(table + ((v >> (PAGE_BITS as u32 + 9 * at as u32)) & 511) * 8);
+                let ev = e.get();
+                if !H::pte_present(ev) || H::pte_is_leaf(ev, at) {
+                    break;
+                }
+                parents[at as usize] = Some(e);
+                table = H::pte_addr(ev);
+            }
+            for l in level..3 {
+                let Some(parent) = parents[l as usize + 1] else { break };
+                let table = H::pte_addr(parent.get());
+                // The entries of this table in the range: cleared at the
+                // leaves' level, maybe not above it.
+                let shift = PAGE_BITS as u32 + 9 * l as u32;
+                let (lo, hi) = ((v >> shift) & 511, ((chunk_end - 1) >> shift) & 511);
+                if (io && table == a + 2 * PAGE) || !self.table_empty(table, lo, hi, l == level) {
+                    break;
+                }
+                parent.set(0);
+                // The link is written into the freed table, which a
+                // processor of this space running in user mode may still
+                // walk until the flush that follows (a device until its
+                // invalidation): it reads as an entry that is not there in
+                // every format (a page's address: bit 0, present or valid,
+                // clear), so it can only fault, as the empty entry would.
+                let link = h.free.get();
+                debug_assert!(!H::pte_present(link) && link & (PAGE - 1) == 0);
+                self.phys.word(table).set(link);
+                h.free.set(table);
+                h.nfree.set(h.nfree.get() + 1);
+            }
+            v = chunk_end;
+        }
+    }
+
+    /// Whether the page at `p` is all zero: eight words at a time, so a
+    /// table that empties costs a pass of plain loads, once per table.
+    #[cold]
+    #[inline(never)]
+    fn page_zero(&self, p: Paddr) -> bool {
+        (0..PAGE / 64).all(|c| (0..8).fold(0, |acc, i| acc | self.phys.word(p + c * 64 + i * 8).get()) == 0)
+    }
+
+    /// Whether the table at `table` holds no entry, its entries `lo..=hi`
+    /// being the ones just looked at (`cleared`: known to be 0). Looked at
+    /// outward from those, alternately above and below: a table being
+    /// unmapped in order, either way, has a live entry beside the cleared
+    /// ones until it is empty, so this costs a read or two per unmapping
+    /// and a whole table only when it really is empty.
+    fn table_empty(&self, table: Paddr, lo: u64, hi: u64, cleared: bool) -> bool {
+        let live = |i: u64| self.phys.word(table + i * 8).get() != 0;
+        if !cleared && (lo..=hi).any(live) {
+            return false;
+        }
+        for d in 1..512 {
+            let (up, down) = (hi + d, lo.checked_sub(d));
+            if up < 512 && live(up) {
+                return false;
+            }
+            if let Some(i) = down
+                && live(i)
+            {
+                return false;
+            }
+            if up >= 512 && down.is_none() {
+                break;
+            }
+        }
+        true
     }
 
     /// The last capability to address space `a` is gone: its frames become unmapped.

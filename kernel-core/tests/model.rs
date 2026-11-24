@@ -87,6 +87,18 @@ impl Model {
             for i in 0..(1u64 << c.bits) / step {
                 sp.leaves.remove(&(level, v + i * step));
             }
+            // A table with nothing below it goes back to the pool.
+            loop {
+                let empty = sp.tables.iter().copied().find(|&(l, i)| {
+                    let shift = 12 + 9 * l as u64;
+                    !sp.leaves.keys().any(|&(lev, va)| lev < l && va >> shift == i)
+                        && !sp.tables.iter().any(|&(l2, j)| l2 < l && (j << (12 + 9 * l2 as u64)) >> shift == i)
+                });
+                match empty {
+                    Some(t) => drop(sp.tables.remove(&t)),
+                    None => break,
+                }
+            }
         }
     }
     /// Delete a capability: its descendants first, then the object if this

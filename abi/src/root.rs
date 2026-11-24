@@ -25,6 +25,11 @@ pub const SLOT_POWER: u64 = 9;
 /// PCI segment, bus, device and function (`Syscall::DeviceAttach`,
 /// `Syscall::IrqBind` with `IRQ_MSI`).
 pub const SLOT_DEVICES: u64 = 10;
+/// Slot of the processor-time capability: every processor of the machine,
+/// by index (`Syscall::SchedConfigure`: a weight above the default, or a
+/// deadline reservation, on the processors it covers). Narrowed by
+/// `CapCopy` as any range is.
+pub const SLOT_SCHED: u64 = 11;
 /// Slot of the Untyped the root task's own objects were made from; what is
 /// left of it is the root task's to use.
 pub const SLOT_BOOT_UNTYPED: u64 = 7;

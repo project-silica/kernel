@@ -528,17 +528,21 @@ pub fn inspect_thread(thread: Cap) -> Result<ThreadInfo> {
 
 /// Make `sc` a weighted fair share: threads bound to it share their
 /// processor with others in proportion to `weight` (an unbound thread
-/// weighs [`SCHED_DEFAULT_WEIGHT`]).
-pub fn sched_fair(sc: Cap, weight: u64) -> Result<()> {
-    sys(Syscall::SchedConfigure, [sc.0, SCHED_FAIR, weight, 0, 0, 0]).map(|_| ())
+/// weighs [`SCHED_DEFAULT_WEIGHT`]). A weight above the default needs
+/// `time`, a processor-time capability covering every processor
+/// (`root::SLOT_SCHED` or one narrowed from it; `Cap::NONE`: none, and
+/// `NoRights` for more than the default).
+pub fn sched_fair(sc: Cap, weight: u64, time: Cap) -> Result<()> {
+    sys(Syscall::SchedConfigure, [sc.0, SCHED_FAIR, weight, 0, 0, time.0]).map(|_| ())
 }
 
 /// Make `sc` a reservation of `budget` nanoseconds in every `period` on
 /// processor `cpu`: threads bound to it run first while it lasts, and wait
 /// for the next period once it is spent. `Overload` when the processor's
-/// reservations would take more than 90% of it.
-pub fn sched_deadline(sc: Cap, budget: u64, period: u64, cpu: usize) -> Result<()> {
-    sys(Syscall::SchedConfigure, [sc.0, SCHED_DEADLINE, budget, period, cpu as u64, 0]).map(|_| ())
+/// reservations would take more than 90% of it. Needs `time`, a
+/// processor-time capability covering `cpu` (`NoRights` otherwise).
+pub fn sched_deadline(sc: Cap, budget: u64, period: u64, cpu: usize, time: Cap) -> Result<()> {
+    sys(Syscall::SchedConfigure, [sc.0, SCHED_DEADLINE, budget, period, cpu as u64, time.0]).map(|_| ())
 }
 
 /// Run `thread` on the scheduling context `sc` (`Cap::NONE`: the default

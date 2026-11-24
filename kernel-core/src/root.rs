@@ -5,7 +5,7 @@
 //! Untyped, so it owns and is accounted for its own memory.
 
 use crate::boot::{Region, RegionKind};
-use crate::cap::{Cap, FLAG_CONSOLE, FLAG_DEVICE, FLAG_DMA, FLAG_IRQS, FLAG_KEPT, FLAG_PORTS, FLAG_POWER};
+use crate::cap::{Cap, FLAG_CONSOLE, FLAG_DEVICE, FLAG_DMA, FLAG_IRQS, FLAG_KEPT, FLAG_PORTS, FLAG_POWER, FLAG_SCHED};
 use crate::elf::{Elf, ElfError, PF_W, PF_X};
 use crate::hal::Hal;
 use crate::kernel::{Exit, Kernel};
@@ -132,6 +132,7 @@ impl<H: Hal> Kernel<H> {
         self.insert_root(slot(SLOT_CONSOLE), &hw(FLAG_CONSOLE, 1));
         self.insert_root(slot(SLOT_POWER), &hw(FLAG_POWER, 1));
         self.insert_root(slot(SLOT_DEVICES), &hw(FLAG_DMA, u32::MAX as u64));
+        self.insert_root(slot(SLOT_SCHED), &hw(FLAG_SCHED, spec.cpus.max(1)));
         let asp = self.slot(slot(SLOT_ASPACE)).obj.get();
 
         // Every other piece of memory, as Untyped capabilities.

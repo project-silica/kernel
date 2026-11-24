@@ -75,7 +75,11 @@ pub enum Syscall {
     /// The capability keeps its place in the derivation tree.
     CapMove = 7,
     /// `a0` slot. Deletes the capability and every capability derived from
-    /// it; an object is destroyed with its last capability.
+    /// it; an object is destroyed with its last capability. A large CapSpace
+    /// is emptied in pieces between pending interrupts (the call is made
+    /// again until it is done, invisibly to the caller); what is left when
+    /// its caller is stopped is finished by the next system call that takes
+    /// every lock, before any memory can be reused.
     CapDelete = 8,
     /// `a0` slot. Deletes every capability derived from this one.
     CapRevoke = 9,
@@ -184,6 +188,15 @@ pub enum Syscall {
     /// processor's reservations would take more than 90% of it. `InUse` to
     /// change the class, or a deadline context's processor, while threads
     /// are bound to it.
+    ///
+    /// Processor time is authority, as memory is: `a5` is a processor-time
+    /// capability (write; [`root::SLOT_SCHED`] or one narrowed from it to
+    /// a range of processors), or 0 for none. Without one a context may be
+    /// configured fair with at most [`SCHED_DEFAULT_WEIGHT`]: memory buys a
+    /// share no better than a thread without a context has. A greater
+    /// weight needs one covering every processor (a fair thread runs
+    /// wherever it is moved); a reservation, one covering `a4`. `NoRights`
+    /// otherwise, `WrongType` for a capability that is not processor time.
     SchedConfigure = 21,
     /// `a0` device-identity capability, `a1` a device's identity (its PCI
     /// segment, bus, device and function: `segment << 16 | bus << 8 |
@@ -431,6 +444,12 @@ pub const ASPACE_MIN_BITS: u8 = 13;
 pub const UNTYPED_MAX_BITS: u8 = 47;
 /// Most objects one `Retype` creates.
 pub const RETYPE_MAX: u64 = 256;
+/// Most page-table entries one `Map` of a frame writes (and its `Unmap`
+/// clears): a frame that would need more, because only small pages are
+/// available where it is mapped (128 MiB in 4 KiB pages; 64 GiB in 2 MiB
+/// pages), is refused with `BadArg`. The bound is what keeps one mapping
+/// from holding the machine.
+pub const MAP_MAX_ENTRIES: u64 = 1 << 15;
 
 /// What a capability lets its holder do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
