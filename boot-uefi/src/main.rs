@@ -30,8 +30,10 @@ use silica_formats::blake2s::Blake2s;
 const PAGE: u64 = 4096;
 const HUGE: u64 = 2 << 20;
 
-/// A test harness is listening for the exit status (command line
-/// `exit=semihosting`; aarch64 only, see `arch/aarch64.rs`).
+/// A test harness is listening for the exit status: the command line says
+/// how (`exit=semihosting` on aarch64, see `arch/aarch64.rs`; `exit=port`,
+/// QEMU's debug-exit device, on x86_64). On a machine with neither, the
+/// loader writes nothing it was not told is there.
 static HARNESS: AtomicBool = AtomicBool::new(false);
 
 fn print(s: &str) {
@@ -315,12 +317,6 @@ const MAP_BYTES: u64 = 256 * 1024;
 pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable) -> efi::Status {
     let loader_tsc = arch::counter();
     arch::console(st);
-    if let Some(what) = arch::unsupported() {
-        print("ERROR: loader: this processor lacks ");
-        print(what);
-        print(", which Silica requires\r\n");
-        arch::stop(kernel_core::ExitStatus::Failure.code(), HARNESS.load(Ordering::Relaxed))
-    }
     // SAFETY: the firmware passes a valid system table; boot services are
     // usable until ExitBootServices below.
     let (bs, rt, cfg) =
@@ -343,7 +339,16 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     let t_files = arch::counter();
     // SAFETY: the command line was read into `cmdline.1` bytes at `cmdline.0`.
     let words = unsafe { core::slice::from_raw_parts(cmdline.0 as *const u8, cmdline.1 as usize) };
-    HARNESS.store(words.split(|b| b.is_ascii_whitespace()).any(|w| w == b"exit=semihosting"), Ordering::Relaxed);
+    HARNESS.store(words.split(|b| b.is_ascii_whitespace()).any(|w| w == b"exit=semihosting" || w == b"exit=port"), Ordering::Relaxed);
+    // Refused here, once the command line says whether a harness hears the
+    // status (the loader is built for plain x86-64 and Armv8.0, so reading
+    // two files first is safe on any processor of either).
+    if let Some(what) = arch::unsupported() {
+        print("ERROR: loader: this processor lacks ");
+        print(what);
+        print(", which Silica requires\r\n");
+        arch::stop(kernel_core::ExitStatus::Failure.code(), HARNESS.load(Ordering::Relaxed))
+    }
 
     // Entropy and time, while the firmware can still be asked.
     let (seed, entropy_sources) = gather_entropy(&boot);

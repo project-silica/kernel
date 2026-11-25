@@ -6,7 +6,7 @@ use crate::mem::{Paddr, Phys};
 use crate::smp::Held;
 use crate::thread::{INACTIVE, IPC_CALL, IPC_GRANT, RUNNABLE, Thread};
 use core::cell::Cell;
-use silica_abi::{Error, KEEP, MsgInfo, NONBLOCK, ObjectType, PAGE_BITS, Rights, Syscall};
+use silica_abi::{CALL_SLOT, CALL_TIMEOUT_SHIFT, Error, KEEP, MsgInfo, NONBLOCK, ObjectType, PAGE_BITS, Rights, Syscall};
 
 /// How a syscall handler finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,7 +226,8 @@ impl<H: Hal> Kernel<H> {
             // it under the interrupt controller's own lock.
             Syscall::Yield | Syscall::PortIo | Syscall::Map | Syscall::Console | Syscall::PowerOff | Syscall::IrqAck => true,
             // Passing capabilities changes capability slots.
-            Syscall::Call | Syscall::Send => MsgInfo(a[1]).caps() == 0 && queue(a[0] & !NONBLOCK),
+            Syscall::Call => MsgInfo(a[1]).caps() == 0 && queue(a[0] & CALL_SLOT),
+            Syscall::Send => MsgInfo(a[1]).caps() == 0 && queue(a[0] & !NONBLOCK),
             Syscall::Recv => queue(crate::ipc::recv_slot(a[0])) && self.park_is_local(h, t, a[2]) && self.listen_is_local(h, t, a[0]),
             Syscall::SignalRecv => self.signal_recv_is_local(h, t, a),
             Syscall::ReplyRecv => {
@@ -319,7 +320,8 @@ impl<H: Hal> Kernel<H> {
         let other = |cpu: u64| (cpu != me).then_some(cpu as usize);
         let of_queue = |index: u64| self.queue_partner(t, index, me);
         match s {
-            Syscall::Call | Syscall::Send if MsgInfo(a[1]).caps() == 0 => of_queue(a[0] & !NONBLOCK),
+            Syscall::Call if MsgInfo(a[1]).caps() == 0 => of_queue(a[0] & CALL_SLOT),
+            Syscall::Send if MsgInfo(a[1]).caps() == 0 => of_queue(a[0] & !NONBLOCK),
             Syscall::Recv => of_queue(crate::ipc::recv_slot(a[0])),
             Syscall::SignalRecv => self.signal_recv_partner(t, a),
             Syscall::ReplyRecv if MsgInfo(a[1]).caps() == 0 => {
@@ -445,9 +447,14 @@ impl<H: Hal> Kernel<H> {
         }
         match s {
             Syscall::Call => {
-                let (slot, ep) = self.ccap(t, a[0], ObjectType::Endpoint, Rights::WRITE)?;
+                if a[0] & NONBLOCK != 0 {
+                    return Err(Error::BadArg);
+                }
+                let (slot, ep) = self.ccap(t, a[0] & CALL_SLOT, ObjectType::Endpoint, Rights::WRITE)?;
                 self.thread(t).via_slot.set(slot);
-                self.send(t, ep.obj, ep.badge, IPC_CALL | grant(&ep), true)
+                let us = a[0] >> CALL_TIMEOUT_SHIFT;
+                let deadline = if us == 0 { 0 } else { self.hal.now().saturating_add(us * 1000) };
+                self.send(t, ep.obj, ep.badge, IPC_CALL | grant(&ep), true, deadline)
             }
             Syscall::Send => {
                 let slot = self.cslot(t, a[0] & !NONBLOCK)?;
@@ -457,7 +464,7 @@ impl<H: Hal> Kernel<H> {
                 }
                 self.thread(t).via_slot.set(slot);
                 match cap.ty {
-                    ObjectType::Endpoint => self.send(t, cap.obj, cap.badge, grant(&cap), a[0] & NONBLOCK == 0),
+                    ObjectType::Endpoint => self.send(t, cap.obj, cap.badge, grant(&cap), a[0] & NONBLOCK == 0, 0),
                     // A capability without a badge signals bit 0.
                     ObjectType::Notification => self.notify(t, cap.obj, cap.badge.max(1)),
                     _ => Err(Error::WrongType),
@@ -560,6 +567,14 @@ impl<H: Hal> Kernel<H> {
                 Ok(Exit::Done)
             }
             Syscall::Unmap => {
+                let s = self.cslot(t, a[0])?;
+                if self.slot(s).cap().is_some_and(|c| c.ty == ObjectType::AddressSpace) {
+                    let (_, space) = self.ccap(t, a[0], ObjectType::AddressSpace, Rights::WRITE)?;
+                    let end = a[1].checked_add(a[2]).ok_or(Error::BadArg)?;
+                    let n = self.unmap_range(space.obj, a[1], end);
+                    self.thread(t).regs[H::ARG[0]].set(n);
+                    return Ok(Exit::Done);
+                }
                 let (fs, _) = self.ccap(t, a[0], ObjectType::Frame, Rights::NONE)?;
                 self.unmap_slot(fs);
                 Ok(Exit::Done)
@@ -1151,67 +1166,73 @@ impl<H: Hal> Kernel<H> {
         }
     }
 
-    /// Whether every processor's run queues are well formed: linked both
-    /// ways, ending, holding only runnable threads of that processor that
-    /// are not running, the fair queue in order of virtual runtime and the
-    /// deadline queue only threads bound to deadline contexts. For tests and
-    /// fuzzing.
+    /// Whether every processor's run queues are well formed: the fair
+    /// queue a balanced tree in order of virtual runtime, the deadline
+    /// queue a list linked both ways, each ending and holding only runnable
+    /// threads of that processor that are not running, of the queue's
+    /// class. For tests and fuzzing.
     pub fn check_runqueues(&self) -> Result<(), &'static str> {
+        use crate::order;
         for (i, cpu) in self.cpus.iter(self.ncpu()).enumerate() {
-            for (head, tail, dl) in [(&cpu.rq_head, &cpu.rq_tail, false), (&cpu.dl_head, &cpu.dl_tail, true)] {
-                let (mut t, mut prev, mut last, mut n) = (head.get(), 0, 0, 0usize);
-                while t != 0 {
-                    let th = self.thread(t);
-                    if th.qprev.get() != prev {
-                        return Err("a run queue's back link is wrong");
-                    }
-                    if th.cpu.get() as usize != i || th.state.get() != RUNNABLE || t == cpu.cur.get() {
-                        return Err("a run queue holds a thread that is not a waiting runnable thread of its processor");
-                    }
-                    if self.dl_of(t).is_some() != dl {
-                        return Err("a thread is on the run queue of the wrong class");
-                    }
-                    if !dl && th.vr.get() < last {
-                        return Err("the fair run queue is out of order");
-                    }
-                    last = th.vr.get();
-                    n += 1;
-                    if n > 1 << 20 {
-                        return Err("a run queue does not end");
-                    }
-                    (prev, t) = (t, th.qnext.get());
+            let fair = crate::sched::RunQueue(self, cpu);
+            let n = order::check(&fair, 1 << 20)?;
+            let waiting = |t: Paddr, dl: bool| {
+                let th = self.thread(t);
+                if th.cpu.get() as usize != i || th.state.get() != RUNNABLE || t == cpu.cur.get() {
+                    return Err("a run queue holds a thread that is not a waiting runnable thread of its processor");
                 }
-                if tail.get() != prev {
-                    return Err("a run queue's tail is wrong");
+                if self.dl_of(t).is_some() != dl {
+                    return Err("a thread is on the run queue of the wrong class");
                 }
+                Ok(())
+            };
+            let (mut t, mut seen) = (cpu.rq_head.get(), 0usize);
+            while t != 0 {
+                waiting(t, false)?;
+                seen += 1;
+                t = order::next(&fair, t);
+            }
+            if seen != n {
+                return Err("the fair run queue's order does not reach every thread in it");
+            }
+            let (mut t, mut prev, mut n) = (cpu.dl_head.get(), 0, 0usize);
+            while t != 0 {
+                let th = self.thread(t);
+                if th.qprev.get() != prev {
+                    return Err("a run queue's back link is wrong");
+                }
+                waiting(t, true)?;
+                n += 1;
+                if n > 1 << 20 {
+                    return Err("a run queue does not end");
+                }
+                (prev, t) = (t, th.qnext.get());
+            }
+            if cpu.dl_tail.get() != prev {
+                return Err("a run queue's tail is wrong");
             }
         }
         Ok(())
     }
 
-    /// Whether every processor's timer list is well formed: linked both
-    /// ways, in deadline order, ending, and holding only threads of that
-    /// processor that have a deadline. For tests and fuzzing.
+    /// Whether every processor's timers are well formed: a balanced tree
+    /// in deadline order holding only threads of that processor that have
+    /// a deadline. For tests and fuzzing.
     pub fn check_timers(&self) -> Result<(), &'static str> {
+        use crate::order;
         for (i, cpu) in self.cpus.iter(self.ncpu()).enumerate() {
-            let (mut t, mut prev, mut last, mut n) = (cpu.timers.get(), 0, 0, 0usize);
+            let timers = crate::thread::Timers(self, cpu);
+            order::check(&timers, 1 << 20)?;
+            let mut t = cpu.timers.get();
             while t != 0 {
                 let th = self.thread(t);
-                if th.tprev.get() != prev {
-                    return Err("a timer list's back link is wrong");
-                }
                 if th.cpu.get() as usize != i {
-                    return Err("a thread waits on the timer list of a processor that is not its home");
+                    return Err("a thread waits on the timers of a processor that is not its home");
                 }
-                let d = th.deadline.get();
-                if d == 0 || d < last {
-                    return Err("a timer list holds a thread with no deadline, or is out of order");
+                if th.deadline.get() == 0 {
+                    return Err("a processor's timers hold a thread with no deadline");
                 }
-                n += 1;
-                if n > 1 << 20 {
-                    return Err("a timer list does not end");
-                }
-                (prev, last, t) = (t, d, th.tnext.get());
+                t = order::next(&timers, t);
             }
         }
         Ok(())

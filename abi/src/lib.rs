@@ -23,8 +23,14 @@ pub mod root;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub enum Syscall {
-    /// `a0` endpoint, `a1` [`MsgInfo`], `a2..a5` message words 0..3. Sends
-    /// and blocks until the receiver replies. Returns the reply the same way.
+    /// `a0` endpoint (its low 32 bits), `a1` [`MsgInfo`], `a2..a5` message
+    /// words 0..3. Sends and blocks until the receiver replies. Returns the
+    /// reply the same way. Bits 32 to 62 of `a0` ([`CALL_TIMEOUT_SHIFT`]) are
+    /// the longest the whole call may take, in microseconds (0: no limit):
+    /// past it the call fails with `Timeout`, whether it still waits for a
+    /// receiver or was received and waits for its answer (which then goes
+    /// nowhere, as an answer to a caller that has gone does). How a program
+    /// calls one it trusts less than itself without being held by it.
     Call = 0,
     /// `a0` endpoint or notification, `a1` [`MsgInfo`], `a2..a5` words,
     /// `a0` bit 63 set: do not block. On a notification, ORs the capability's
@@ -89,7 +95,13 @@ pub enum Syscall {
     /// read it and `WRITE` write it; it must lie below the machine's
     /// `RootInfo::dma_top`.
     Map = 10,
-    /// `a0` frame. Removes this capability's mapping.
+    /// `a0` frame: removes this capability's mapping. Or `a0` an address
+    /// space (write), `a1` an address, `a2` a length in bytes: removes
+    /// every mapping in that space that overlaps the range, whole, whoever's
+    /// frame it is; returns how many in `a0`. What a program does before
+    /// it maps something new where lent memory was: a frame its lender
+    /// took back is unmapped already, but a page its supervisor mapped in
+    /// its place (`silica_rt::mem`) is not.
     Unmap = 11,
     /// `a0` thread (write), `a1` CapSpace, `a2` address space, `a3` fault
     /// endpoint, `a4` IPC buffer frame. [`KEEP`] leaves a field unchanged, 0
@@ -360,6 +372,11 @@ pub const LISTEN_SHIFT: u32 = 32;
 pub const KEEP: u64 = u64::MAX;
 /// `Send`: flag in `a0` asking not to block.
 pub const NONBLOCK: u64 = 1 << 63;
+/// `Call`: the call's time limit, in microseconds, is in `a0` from this
+/// bit up (31 bits, about 35 minutes; 0: none).
+pub const CALL_TIMEOUT_SHIFT: u32 = 32;
+/// `Call`: the bits of `a0` that name the endpoint.
+pub const CALL_SLOT: u64 = (1 << CALL_TIMEOUT_SHIFT) - 1;
 
 /// The kernel object types (`spec/ARCHITECTURE.md` section 6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

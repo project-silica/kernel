@@ -93,10 +93,13 @@ pub fn print(s: &str) {
     }
 }
 
-/// Report `code` through the emulator's exit device (harmless where there
-/// is none) and halt.
-pub fn stop(code: u8, _harness: bool) -> ! {
-    outb(0xF4, code);
+/// Report `code` through the emulator's debug-exit device when `harness`
+/// says one is there (on other machines port 0xF4 is nobody's to write),
+/// and halt.
+pub fn stop(code: u8, harness: bool) -> ! {
+    if harness {
+        outb(0xF4, code);
+    }
     loop {
         // SAFETY: halting with interrupts as the firmware left them.
         unsafe { asm!("hlt", options(nomem, nostack)) }

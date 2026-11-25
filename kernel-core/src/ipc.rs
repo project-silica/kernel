@@ -150,7 +150,7 @@ impl<H: Hal> Kernel<H> {
     /// notification (the `park` argument of `Recv`), the caller waits there
     /// and any thread holding that notification can answer by sending to it;
     /// otherwise the caller waits for the server's `ReplyRecv`.
-    fn await_reply(&self, caller: Paddr, server: Paddr, ep: Paddr) {
+    fn await_reply(&self, caller: Paddr, server: Paddr, ep: Paddr, deadline: u64) {
         // Linked on the endpoint, so destroying it, or revoking the
         // capability the call came through, finds the call.
         let q = self.queue(ep);
@@ -182,14 +182,14 @@ impl<H: Hal> Kernel<H> {
                 q.tail.set(caller);
                 let ct = self.thread(caller);
                 ct.ipc_flags.set(ct.ipc_flags.get() | IPC_PARKED);
-                self.block(caller, REPLY, n.obj, 0);
+                self.block(caller, REPLY, n.obj, deadline);
                 return;
             }
         }
         self.drop_caller(server);
         self.thread(server).caller.set(caller);
         // Keeps the IPC_FAULT flag: the reply path needs it.
-        self.block(caller, REPLY, server, 0);
+        self.block(caller, REPLY, server, deadline);
     }
 
     /// Take `caller` (its call delivered and unanswered) off its endpoint's
@@ -203,7 +203,7 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// Send the current thread's message to endpoint `ep`.
-    pub(crate) fn send(&self, t: Paddr, ep: Paddr, badge: u64, flags: u64, blocking: bool) -> Result<Exit, Error> {
+    pub(crate) fn send(&self, t: Paddr, ep: Paddr, badge: u64, flags: u64, blocking: bool, deadline: u64) -> Result<Exit, Error> {
         let q = self.queue(ep);
         let th = self.thread(t);
         th.ipc_flags.set(flags);
@@ -217,7 +217,7 @@ impl<H: Hal> Kernel<H> {
                 // The caller waits for the receiver, so the receiver runs now.
                 self.thread(r).regs[H::SYS].set(0);
                 self.hand_off(r);
-                self.await_reply(t, r, ep);
+                self.await_reply(t, r, ep, deadline);
                 return Ok(Exit::Blocked);
             }
             self.thread(r).park.set(0);
@@ -232,7 +232,7 @@ impl<H: Hal> Kernel<H> {
         th.ipc_badge.set(badge);
         q.kind.set(SENDERS);
         self.q_push(&q.head, &q.tail, t);
-        self.block(t, SENDING, ep, 0);
+        self.block(t, SENDING, ep, deadline);
         Ok(Exit::Blocked)
     }
 
@@ -294,7 +294,7 @@ impl<H: Hal> Kernel<H> {
             let st = self.thread(s);
             self.transfer(s, t, st.ipc_badge.get(), st.ipc_flags.get() & IPC_GRANT != 0);
             if st.ipc_flags.get() & IPC_CALL != 0 {
-                self.await_reply(s, t, ep);
+                self.await_reply(s, t, ep, 0);
             } else {
                 st.ipc_flags.set(0);
                 self.wake(s, Ok(()));
@@ -514,7 +514,7 @@ impl<H: Hal> Kernel<H> {
         match th.fault_ep.cap() {
             Some(c) if c.ty == ObjectType::Endpoint => {
                 self.thread(t).via_slot.set(0);
-                let _ = self.send(t, c.obj, c.badge, IPC_CALL | IPC_FAULT, true);
+                let _ = self.send(t, c.obj, c.badge, IPC_CALL | IPC_FAULT, true, 0);
             }
             _ => self.fault_unheard(t, kind, addr, code),
         }

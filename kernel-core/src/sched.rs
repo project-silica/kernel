@@ -167,26 +167,7 @@ impl<H: Hal> Kernel<H> {
         if self.dl_of(t).is_some() {
             return self.q_push(&cpu.dl_head, &cpu.dl_tail, t);
         }
-        let vr = self.thread(t).vr.get();
-        // From the back: a thread that yields, or has just run, goes last.
-        let mut at = cpu.rq_tail.get();
-        while at != 0 && (self.thread(at).vr.get() > vr || (first && self.thread(at).vr.get() == vr)) {
-            at = self.thread(at).qprev.get();
-        }
-        let th = self.thread(t);
-        let next = if at == 0 { cpu.rq_head.get() } else { self.thread(at).qnext.get() };
-        th.qprev.set(at);
-        th.qnext.set(next);
-        if at == 0 {
-            cpu.rq_head.set(t);
-        } else {
-            self.thread(at).qnext.set(t);
-        }
-        if next == 0 {
-            cpu.rq_tail.set(t);
-        } else {
-            self.thread(next).qprev.set(t);
-        }
+        crate::order::insert(&RunQueue(self, cpu), t, first);
     }
 
     /// [`Kernel::enqueue_at`] after any equals.
@@ -199,7 +180,7 @@ impl<H: Hal> Kernel<H> {
         if self.dl_of(t).is_some() {
             self.q_remove(&cpu.dl_head, &cpu.dl_tail, t);
         } else {
-            self.q_remove(&cpu.rq_head, &cpu.rq_tail, t);
+            crate::order::remove(&RunQueue(self, cpu), t);
         }
     }
 
@@ -307,7 +288,7 @@ impl<H: Hal> Kernel<H> {
     pub(crate) fn pick(&self, cpu: &Cpu, now: u64) -> Paddr {
         // The common case: no deadline work on this processor.
         if cpu.dl_head.get() == 0 {
-            return self.q_pop(&cpu.rq_head, &cpu.rq_tail);
+            return crate::order::pop(&RunQueue(self, cpu));
         }
         self.pick_deadline(cpu, now)
     }
@@ -329,7 +310,7 @@ impl<H: Hal> Kernel<H> {
             self.q_remove(&cpu.dl_head, &cpu.dl_tail, best);
             return best;
         }
-        self.q_pop(&cpu.rq_head, &cpu.rq_tail)
+        crate::order::pop(&RunQueue(self, cpu))
     }
 
     /// When processor `cpu`, running its current thread, must next look at
@@ -529,5 +510,31 @@ impl<H: Hal> Kernel<H> {
     pub fn sched_view(&self, t: Paddr) -> (u64, u64, Paddr) {
         let cpu = self.home(t);
         (self.thread(t).vr.get(), cpu.min_vr.get(), cpu.cur.get())
+    }
+}
+
+/// A processor's fair run queue as `order.rs` sees it: threads in order of
+/// virtual runtime, linked through `qprev` (left), `qnext` (right) and
+/// `rq_up`.
+pub(crate) struct RunQueue<'a, H: Hal>(pub(crate) &'a Kernel<H>, pub(crate) &'a Cpu);
+
+impl<H: Hal> crate::order::Tree for RunQueue<'_, H> {
+    #[inline(always)]
+    fn node(&self, t: Paddr) -> crate::order::Node<'_> {
+        let th = self.0.thread(t);
+        crate::order::Node { left: &th.qprev, right: &th.qnext, up: &th.rq_up, meta: &th.rq_meta }
+    }
+    #[inline(always)]
+    fn key(&self, t: Paddr) -> u64 {
+        self.0.thread(t).vr.get()
+    }
+    fn root(&self) -> &crate::order::Root {
+        &self.1.rq_tree
+    }
+    fn first(&self) -> &Cell<Paddr> {
+        &self.1.rq_head
+    }
+    fn last(&self) -> &Cell<Paddr> {
+        &self.1.rq_tail
     }
 }

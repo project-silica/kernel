@@ -1847,3 +1847,93 @@ fn a_notice_is_signalled_once_whenever_its_capability_goes_and_never_otherwise()
     assert_eq!(m.err(S::CapCopy, [SLOT_CAPSPACE, FREE + 12, notice, 15, 0, 0]), Error::InUse, "a notice is not copied");
     assert_eq!(pending(), 0, "nothing signalled by any refusal");
 }
+
+/// `Call` with a time limit (`a0` bits 32 to 62, microseconds): a call
+/// nobody answers in time fails with `Timeout`, wherever it waits; the
+/// server's late answer goes nowhere; the limit follows a moved caller;
+/// an answer in time is unchanged. How a service calls a driver it trusts
+/// less than itself without being held by it.
+#[test]
+fn a_call_with_a_time_limit_ends_at_it() {
+    use silica_abi::CALL_TIMEOUT_SHIFT;
+    let within = |slot: u64, us: u64| slot | us << CALL_TIMEOUT_SHIFT;
+    let check = |m: &Machine| {
+        assert_eq!(m.k.check_runqueues(), Ok(()));
+        assert_eq!(m.k.check_timers(), Ok(()));
+        assert_eq!(m.k.check_queue(m.cap(FREE).unwrap().obj, false), Ok(()));
+    };
+    // Received and never answered, the server on another processor.
+    let (m, t) = two_processors();
+    m.on(0);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(1);
+    let called = m.k.hal.now.get();
+    assert!(m.raw(S::Call as u64, [within(FREE + 1, 1000), MsgInfo::new(3, 1).0, 10, 0, 0, 0]).blocked);
+    m.settle(0);
+    assert_eq!((m.k.current(), m.arg(m.root, 2)), (m.root, 10), "the call was delivered");
+    m.k.hal.now.set(m.k.hal.now.get().max(called + 1_000_000));
+    m.on(1);
+    m.tick();
+    m.settle(1);
+    assert_eq!(m.k.current(), t);
+    assert_eq!(Error::result(m.status(t)), Err(Error::Timeout));
+    assert!(m.k.hal.now.get() >= called + 1_000_000, "it ended before its limit");
+    check(&m);
+    // The late answer goes nowhere, and the server carries on.
+    m.on(0);
+    let r = m.raw(S::ReplyRecv as u64, [0, MsgInfo::new(0, 1).0, 11, 0, 0, 0]);
+    assert_eq!((Error::result(r.status), r.blocked), (Err(Error::NoCaller), false));
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked, "the server takes its next call");
+    check(&m);
+
+    // Never received.
+    let (m, t) = two_processors();
+    m.on(1);
+    assert!(m.raw(S::Call as u64, [within(FREE + 1, 50), MsgInfo::new(3, 1).0, 10, 0, 0, 0]).blocked);
+    m.k.hal.now.set(m.k.hal.now.get() + 51_000);
+    m.tick();
+    m.settle(1);
+    assert_eq!(Error::result(m.status(t)), Err(Error::Timeout));
+    check(&m);
+    m.on(0);
+    assert_eq!(m.err(S::Recv, [FREE, 1, 0, 0, 0, 0]), Error::WouldBlock, "the call that timed out is still queued");
+
+    // Received, then the caller moved: its limit moves with it.
+    let (m, t) = two_processors();
+    m.on(0);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(1);
+    assert!(m.raw(S::Call as u64, [within(FREE + 1, 1000), MsgInfo::new(3, 1).0, 10, 0, 0, 0]).blocked);
+    m.settle(0);
+    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    check(&m);
+    m.k.hal.now.set(m.k.hal.now.get() + 1_001_000);
+    m.on(0);
+    m.tick();
+    assert_eq!(m.k.thread_view(t).state, RUNNABLE);
+    assert_eq!(Error::result(m.status(t)), Err(Error::Timeout));
+    check(&m);
+
+    // Answered in time: the reply, and no timer left behind. (A thread
+    // that keeps processor 1 busy, or its idle wait would skip ahead to
+    // the caller's limit.)
+    let (m, t) = two_processors();
+    let (ut, _) = m.big_untyped();
+    m.spawn(ut, FREE + 3);
+    m.ok(S::ThreadControl, [FREE + 3, 2, 1, 0, 0, 0]);
+    m.on(0);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(1);
+    assert!(m.raw(S::Call as u64, [within(FREE + 1, 1000), MsgInfo::new(3, 1).0, 10, 0, 0, 0]).blocked);
+    m.settle(0);
+    assert!(m.raw(S::ReplyRecv as u64, [FREE, MsgInfo::new(0, 1).0, 11, 0, 0, 0]).blocked);
+    m.settle(1);
+    assert_eq!((m.status(t), m.arg(t, 2)), (0, 11));
+    check(&m);
+    m.k.hal.now.set(m.k.hal.now.get() + 2_000_000);
+    m.tick();
+    assert_eq!((m.status(t), m.arg(t, 2)), (0, 11));
+    // The flag that asks not to block is not a call's.
+    let r = m.sys_as(t, S::Call, [(FREE + 1) | NONBLOCK, MsgInfo::new(3, 0).0, 0, 0, 0, 0]);
+    assert_eq!((Error::result(r.status), r.blocked), (Err(Error::BadArg), false));
+}

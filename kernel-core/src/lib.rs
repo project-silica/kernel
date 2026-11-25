@@ -25,6 +25,7 @@ pub mod kernel;
 pub mod lock;
 pub mod log;
 pub mod mem;
+mod order;
 #[cfg(kani)]
 mod proofs;
 pub mod root;

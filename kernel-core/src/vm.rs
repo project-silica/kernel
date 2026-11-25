@@ -286,6 +286,25 @@ impl<H: Hal> Kernel<H> {
         slot.mnext.set(0);
     }
 
+    /// Remove every mapping of address space `a` that overlaps `start` to
+    /// `end`, each whole, whoever holds its frame; returns how many. One
+    /// pass over the space's mapped frames.
+    pub(crate) fn unmap_range(&self, a: Paddr, start: u64, end: u64) -> u64 {
+        let (mut s, mut n) = (self.aspace(a).maps.get(), 0);
+        while s != 0 {
+            let slot = self.slot(s);
+            let next = slot.mnext.get();
+            let va = slot.badge.get() & !(PAGE - 1);
+            let bits = slot.cap().map_or(PAGE_BITS, |c| c.bits);
+            if va < end && va.saturating_add(1 << bits) > start {
+                self.unmap_slot(s);
+                n += 1;
+            }
+            s = next;
+        }
+        n
+    }
+
     /// A table page for address space `a`: one given back, else a new one
     /// from its pool (the caller has checked there is one, `check_map`).
     #[inline(always)]

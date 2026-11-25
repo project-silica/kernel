@@ -51,8 +51,14 @@ pub struct Thread {
     pub(crate) fault_ep: Slot,
     pub(crate) ipcbuf: Slot,
     pub(crate) state: Cell<u64>,
+    /// Links in the queue the thread is on: an endpoint's or a
+    /// notification's list, the deadline run queue (a list), or the fair
+    /// run queue (a tree, `order.rs`: `qprev` and `qnext` its left and
+    /// right child, `rq_up` its parent, `rq_meta` its height and place).
     pub(crate) qnext: Cell<Paddr>,
     pub(crate) qprev: Cell<Paddr>,
+    pub(crate) rq_up: Cell<Paddr>,
+    pub(crate) rq_meta: Cell<u64>,
     /// The endpoint or notification queued on, or the thread owing a reply.
     pub(crate) blocked_on: Cell<Paddr>,
     /// The thread whose call this thread has received and not yet answered.
@@ -60,8 +66,13 @@ pub struct Thread {
     pub(crate) ipc_badge: Cell<u64>,
     pub(crate) ipc_flags: Cell<u64>,
     pub(crate) deadline: Cell<u64>,
+    /// Links in its processor's timer tree (`order.rs`): `tprev` and
+    /// `tnext` its left and right child, `t_up` its parent, `t_meta` its
+    /// height and place.
     pub(crate) tnext: Cell<Paddr>,
     pub(crate) tprev: Cell<Paddr>,
+    pub(crate) t_up: Cell<Paddr>,
+    pub(crate) t_meta: Cell<u64>,
     pub(crate) fault: [Cell<u64>; 3],
     pub(crate) reap_next: Cell<u64>,
     /// The processor this thread runs on.
@@ -196,39 +207,13 @@ impl<H: Hal> Kernel<H> {
         if th.deadline.get() == 0 {
             return;
         }
-        let (p, n) = (th.tprev.get(), th.tnext.get());
-        if p != 0 {
-            self.thread(p).tnext.set(n);
-        } else {
-            self.home(t).timers.set(n);
-        }
-        if n != 0 {
-            self.thread(n).tprev.set(p);
-        }
+        crate::order::remove(&Timers(self, self.home(t)), t);
         th.deadline.set(0);
-        th.tnext.set(0);
-        th.tprev.set(0);
     }
 
     fn timer_insert(&self, t: Paddr, deadline: u64) {
-        let th = self.thread(t);
-        let cpu = self.home(t);
-        th.deadline.set(deadline);
-        let (mut prev, mut at) = (0, cpu.timers.get());
-        while at != 0 && self.thread(at).deadline.get() <= deadline {
-            prev = at;
-            at = self.thread(at).tnext.get();
-        }
-        th.tprev.set(prev);
-        th.tnext.set(at);
-        if prev != 0 {
-            self.thread(prev).tnext.set(t);
-        } else {
-            cpu.timers.set(t);
-        }
-        if at != 0 {
-            self.thread(at).tprev.set(t);
-        }
+        self.thread(t).deadline.set(deadline);
+        crate::order::insert(&Timers(self, self.home(t)), t, false);
     }
 
     /// Block thread `t` (current on its processor) in `state` on `on`, with
@@ -386,7 +371,16 @@ impl<H: Hal> Kernel<H> {
         // Its standing among the fair threads, carried over to the new
         // processor's scale.
         th.vr.set(th.vr.get().saturating_sub(old.min_vr.get()).saturating_add(new.min_vr.get()));
+        // A call waiting for its answer keeps its time limit, among the new
+        // processor's timers.
+        let deadline = th.deadline.get();
+        if deadline != 0 {
+            self.timer_remove(t);
+        }
         th.cpu.set(to as u64);
+        if deadline != 0 {
+            self.timer_insert(t, deadline);
+        }
         if again {
             self.make_runnable(t);
         }
@@ -555,12 +549,15 @@ impl<H: Hal> Kernel<H> {
             // waiter of this processor in a queue another one owns (several
             // processors receive on it) is taken out holding every lock,
             // and the deadlines are looked at afresh.
+            // A call waiting for its answer past its time limit is unlinked from
+            // whoever owes it, which may be any processor's, likewise.
             let th = self.thread(t);
-            if !global
-                && self.ncpu() > 1
-                && matches!(th.state.get(), SENDING | RECEIVING)
-                && self.queue(th.blocked_on.get()).owner.get() != self.hal.cpu() as u64 + 1
-            {
+            let elsewhere = match th.state.get() {
+                SENDING | RECEIVING => self.queue(th.blocked_on.get()).owner.get() != self.hal.cpu() as u64 + 1,
+                REPLY => true,
+                _ => false,
+            };
+            if !global && self.ncpu() > 1 && elsewhere {
                 self.go_global();
                 global = true;
                 continue;
@@ -666,7 +663,7 @@ impl<H: Hal> Kernel<H> {
                 if me.yielded.replace(false) && tail != 0 && (th.sc.get() == 0 || self.dl_of(cur).is_none()) {
                     // A yield: behind every fair thread waiting.
                     th.vr.set(th.vr.get().max(self.thread(tail).vr.get()));
-                    self.q_push(&me.rq_head, &me.rq_tail, cur);
+                    self.enqueue(me, cur);
                 } else {
                     self.enqueue(me, cur);
                 }
@@ -793,5 +790,30 @@ impl<H: Hal> Kernel<H> {
             me.timer_at.set(want);
             self.hal.set_timer(want);
         }
+    }
+}
+
+/// A processor's timers as `order.rs` sees them: threads in order of
+/// deadline, linked through `tprev` (left), `tnext` (right) and `t_up`.
+pub(crate) struct Timers<'a, H: Hal>(pub(crate) &'a Kernel<H>, pub(crate) &'a Cpu);
+
+impl<H: Hal> crate::order::Tree for Timers<'_, H> {
+    #[inline(always)]
+    fn node(&self, t: Paddr) -> crate::order::Node<'_> {
+        let th = self.0.thread(t);
+        crate::order::Node { left: &th.tprev, right: &th.tnext, up: &th.t_up, meta: &th.t_meta }
+    }
+    #[inline(always)]
+    fn key(&self, t: Paddr) -> u64 {
+        self.0.thread(t).deadline.get()
+    }
+    fn root(&self) -> &crate::order::Root {
+        &self.1.timer_tree
+    }
+    fn first(&self) -> &Cell<Paddr> {
+        &self.1.timers
+    }
+    fn last(&self) -> &Cell<Paddr> {
+        &self.1.timers_last
     }
 }

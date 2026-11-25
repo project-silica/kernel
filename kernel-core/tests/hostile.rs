@@ -472,3 +472,111 @@ fn switching_into_and_out_of_an_isolated_address_space_flushes_predictors() {
     m.sys(S::Yield, [0; 6]);
     assert_eq!(isolations()[before..], ["isolate false"], "leaving a destroyed isolated space did not flush");
 }
+
+/// Threads are made from any memory, and a program may put as many as it
+/// has memory for on the processor every service runs on. Making one of
+/// them runnable placed it in a list kept in order of virtual runtime,
+/// walked with interrupts off, and blocking with a deadline did the same
+/// in the timer list: the more threads a program queued there, the longer
+/// every wake-up and every timed wait on that processor took. Both are
+/// trees now. Measured as the fastest of many operations beside 1,700
+/// threads (600 with deadlines) against beside ten.
+#[test]
+fn many_queued_threads_do_not_slow_a_processors_wake_ups_or_timed_waits() {
+    const SLEEPERS: u64 = 48;
+    /// The fastest wake-up of a thread that slept, beside `hogs` runnable
+    /// threads that have run more than it. Each woken sleeper wakes the
+    /// next, so the waker is always the processor's current thread.
+    fn fastest_wake_ns(hogs: u64) -> u128 {
+        let m = Machine::new(64);
+        let (ut, _) = m.big_untyped();
+        m.retype(ut, T::Notification, 0, FREE, SLEEPERS);
+        let sleepers: Vec<_> = (0..SLEEPERS)
+            .map(|i| {
+                let t = m.spawn(ut, FREE + 100 + i);
+                assert!(m.sys_as(t, S::Recv, [FREE + i, 0, 0, 0, 0, 0]).blocked);
+                t
+            })
+            .collect();
+        // The root runs 10 ms alone, so the threads made next start level
+        // with it, past where a sleeper is placed when it wakes (at most
+        // 3 ms behind the least-run thread).
+        m.k.hal.now.set(m.k.hal.now.get() + 10_000_000);
+        m.ok(S::Yield, [0; 6]);
+        for i in 0..hogs {
+            m.spawn(ut, FREE + 200 + i);
+        }
+        let (mut best, mut waker) = (u128::MAX, m.root);
+        for (i, s) in sleepers.into_iter().enumerate() {
+            let start = std::time::Instant::now();
+            let r = m.sys_as(waker, S::Send, [FREE + i as u64, 0, 0, 0, 0, 0]);
+            best = best.min(start.elapsed().as_nanos());
+            assert_eq!(r.status, 0);
+            waker = s;
+        }
+        m.k.check_runqueues().unwrap();
+        best
+    }
+    /// The fastest timed wait (a receive with a deadline after every
+    /// other) beside `hogs` threads blocked with deadlines.
+    fn fastest_timed_wait_ns(hogs: u64) -> u128 {
+        let m = Machine::new(64);
+        let (ut, _) = m.big_untyped();
+        m.retype(ut, T::Notification, 0, FREE, SLEEPERS);
+        let walkers: Vec<_> = (0..SLEEPERS).map(|i| m.spawn(ut, FREE + 100 + i)).collect();
+        let far = m.k.hal.now.get() + 1_000_000_000_000;
+        for i in 0..hogs {
+            let t = m.spawn(ut, FREE + 200 + i);
+            m.retype(ut, T::Notification, 0, FREE + 900 + i, 1);
+            assert!(m.sys_as(t, S::Recv, [FREE + 900 + i, far - 1_000_000 + i, 0, 0, 0, 0]).blocked);
+        }
+        let mut best = u128::MAX;
+        for (i, w) in walkers.into_iter().enumerate() {
+            let start = std::time::Instant::now();
+            assert!(m.sys_as(w, S::Recv, [FREE + i as u64, far, 0, 0, 0, 0]).blocked);
+            best = best.min(start.elapsed().as_nanos());
+        }
+        m.k.check_timers().unwrap();
+        best
+    }
+    let (few, many) = (fastest_wake_ns(10), fastest_wake_ns(1700));
+    assert!(many < few * 3, "a wake-up beside 1,700 runnable threads took {many} ns, beside 10 {few} ns");
+    let (few, many) = (fastest_timed_wait_ns(10), fastest_timed_wait_ns(600));
+    assert!(many < few * 3, "a timed wait beside 600 others took {many} ns, beside 10 {few} ns");
+}
+
+/// A program reuses the addresses where lent memory was only once nothing
+/// is mapped there any more, including the page of zeros its supervisor
+/// mapped in place of memory the lender took back (whose capability is the
+/// supervisor's, not the program's). `Unmap` of an address space clears a
+/// range whole, whoever's frames are in it; it takes the write right.
+#[test]
+fn unmapping_a_range_clears_every_mapping_in_it_with_the_write_right_only() {
+    let m = Machine::new(64);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 18, FREE + 10, 1);
+    m.retype(ut, T::Frame, 12, FREE, 3);
+    m.retype(ut, T::Frame, 21, FREE + 3, 1);
+    let space = m.cap(FREE + 10).unwrap().obj;
+    let base: u64 = 0x80_0000_0000;
+    // Two pages inside the range, a 2 MiB frame overlapping its end, and a
+    // page past it.
+    m.ok(S::Map, [FREE + 10, FREE, base, 3, 0, 0]);
+    m.ok(S::Map, [FREE + 10, FREE + 1, base + 0x5000, 3, 0, 0]);
+    m.ok(S::Map, [FREE + 10, FREE + 3, base + 0x20_0000, 3, 0, 0]);
+    m.ok(S::Map, [FREE + 10, FREE + 2, base + 0x60_0000, 3, 0, 0]);
+    narrowed(&m, FREE + 10, FREE + 11, Rights::READ);
+    assert_eq!(m.err(S::Unmap, [FREE + 11, base, 0x30_0000, 0, 0, 0]), Error::NoRights);
+    assert_eq!(m.err(S::Unmap, [FREE + 10, u64::MAX, 2, 0, 0, 0]), Error::BadArg);
+    assert!(m.k.translate(space, base).is_some());
+    m.ok(S::Unmap, [FREE + 10, base, 0x30_0000, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 3, "three mappings overlapped the range");
+    for at in [base, base + 0x5000, base + 0x20_0000, base + 0x3F_F000] {
+        assert!(m.k.translate(space, at).is_none(), "{at:#x} still mapped");
+    }
+    assert!(m.k.translate(space, base + 0x60_0000).is_some(), "a page past the range went");
+    // The frames are unmapped, not gone: each maps again, at the same place.
+    m.ok(S::Map, [FREE + 10, FREE, base, 3, 0, 0]);
+    m.ok(S::Map, [FREE + 10, FREE + 3, base + 0x20_0000, 3, 0, 0]);
+    assert!(m.k.translate(space, base + 0x20_0000).is_some());
+}

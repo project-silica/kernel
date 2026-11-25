@@ -737,9 +737,15 @@ impl Hal for X86 {
     }
 }
 
-/// QEMU's debug-exit device: a test harness learns the status from it. (On
-/// a machine without the device the write goes nowhere.)
+/// QEMU's debug-exit device: a test harness learns the status from it,
+/// when the command line says one is listening (`exit=port`; on a machine
+/// without the device, port 0xF4 is nobody's to write).
+static HARNESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn harness_exit(status: u64) {
+    if !HARNESS.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let code = if status == 0 { kernel_core::ExitStatus::Success } else { kernel_core::ExitStatus::Failure }.code();
     serial::outb(0xF4, code);
 }
@@ -965,7 +971,7 @@ impl Write for Out {
 }
 
 fn die() -> ! {
-    serial::outb(0xF4, ExitStatus::Failure.code());
+    harness_exit(ExitStatus::Failure.code() as u64);
     loop {
         // SAFETY: stop this processor; interrupts are off.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) }
@@ -1432,6 +1438,7 @@ pub extern "C" fn kmain(info: u64) -> ! {
         table.fill(from);
         (table, k.phys.bytes(bi.cmdline, bi.cmdline_len), k.phys.bytes(bi.ramdisk, bi.ramdisk_len))
     };
+    HARNESS.store(Cmdline(cmdline).get("exit") == Some(b"port"), core::sync::atomic::Ordering::Relaxed);
     // Physical page 0 is never an object (address 0 means "none" in the
     // kernel), so it is unmapped in the physical map: a kernel bug that
     // reaches an object through a null address faults at once, as on

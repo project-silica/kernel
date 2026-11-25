@@ -329,6 +329,23 @@ impl Model {
                 Ok(())
             }
             S::Unmap => {
+                let s = self.root(a[0])?;
+                if self.slots.get(&s).is_some_and(|c| c.ty == T::AddressSpace) {
+                    // A range of an address space (write): every frame mapped
+                    // there that overlaps it, whole.
+                    let (_, sp) = self.typed(a[0], T::AddressSpace, 2)?;
+                    let end = a[1].checked_add(a[2]).ok_or(Error::BadArg)?;
+                    let hit: Vec<Sid> = self
+                        .slots
+                        .iter()
+                        .filter(|(_, c)| c.mapped.is_some_and(|(asp, v)| asp == sp.obj && v < end && v + (1u64 << c.bits) > a[1]))
+                        .map(|(s, _)| *s)
+                        .collect();
+                    for s in hit {
+                        self.unmap(s);
+                    }
+                    return Ok(());
+                }
                 let (fs, _) = self.typed(a[0], T::Frame, 0)?;
                 self.unmap(fs);
                 Ok(())
@@ -517,7 +534,14 @@ fn run(seed: u64, ops: u32) {
                 let (a, f) = (of(&mut r, &model, T::AddressSpace), of(&mut r, &model, T::Frame));
                 (S::Map, [a, f, r.pick(&VADDRS) + r.pick(&[0, 0, 0, 0, 0, 0x800]), r.pick(&[1, 3, 3, 3, 5, 7, 2]), 0, 0])
             }
-            90..94 => (S::Unmap, [of(&mut r, &model, T::Frame), 0, 0, 0, 0, 0]),
+            90..93 => (S::Unmap, [of(&mut r, &model, T::Frame), 0, 0, 0, 0, 0]),
+            93 => {
+                let a = of(&mut r, &model, T::AddressSpace);
+                (
+                    S::Unmap,
+                    [a, r.pick(&VADDRS) + r.pick(&[0, 0x1000, 0x800]), r.pick(&[0, 1, 0x1000, 0x20_0000, 1 << 30, u64::MAX]), 0, 0, 0],
+                )
+            }
             _ => {
                 let mut f = |ty| match r.below(4) {
                     0 => KEEP,

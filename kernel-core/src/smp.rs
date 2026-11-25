@@ -122,10 +122,16 @@ pub struct Cpu {
     /// is forgotten (`forget_root`): the next switch, whatever it loads,
     /// still leaves the isolated space's predictions behind.
     pub(crate) isolated: Cell<u8>,
+    /// The fair run queue, a tree in order of virtual runtime (`order.rs`):
+    /// its first (least-run) and last threads, and the tree.
     pub(crate) rq_head: Cell<Paddr>,
     pub(crate) rq_tail: Cell<Paddr>,
-    /// Threads with deadlines, soonest first.
+    pub(crate) rq_tree: crate::order::Root,
+    /// Threads with deadlines, a tree in deadline order: the soonest, the
+    /// latest, and the tree.
     pub(crate) timers: Cell<Paddr>,
+    pub(crate) timers_last: Cell<Paddr>,
+    pub(crate) timer_tree: crate::order::Root,
     /// When the timer is set to fire (`u64::MAX`: not armed).
     pub(crate) timer_at: Cell<u64>,
     /// When the running thread must next be looked at again (its share or
@@ -195,7 +201,10 @@ impl Cpu {
             isolated: Cell::new(0),
             rq_head: Cell::new(0),
             rq_tail: Cell::new(0),
+            rq_tree: crate::order::Root::new(),
             timers: Cell::new(0),
+            timers_last: Cell::new(0),
+            timer_tree: crate::order::Root::new(),
             timer_at: Cell::new(u64::MAX),
             preempt_at: Cell::new(u64::MAX),
             dl_head: Cell::new(0),

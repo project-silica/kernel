@@ -102,6 +102,18 @@ pub fn call(ep: Cap, info: MsgInfo, w: [u64; 4]) -> Result<Message> {
     sys(Syscall::Call, [ep.0, info.0, w[0], w[1], w[2], w[3]]).map(message)
 }
 
+/// [`call`], failing with `Timeout` if the reply has not come within
+/// `limit_ns` nanoseconds (rounded up to whole microseconds; at most some
+/// 35 minutes, beyond which it is that): whether the call still waits for a
+/// receiver or was received and waits for its answer. A reply sent after
+/// the limit goes nowhere. How a program calls one it trusts less than
+/// itself (a service calling a driver) without being held by it.
+pub fn call_within(ep: Cap, info: MsgInfo, w: [u64; 4], limit_ns: u64) -> Result<Message> {
+    let us = limit_ns.div_ceil(1000).clamp(1, (1 << 31) - 1);
+    let a0 = (ep.0 & silica_abi::CALL_SLOT) | us << silica_abi::CALL_TIMEOUT_SHIFT;
+    sys(Syscall::Call, [a0, info.0, w[0], w[1], w[2], w[3]]).map(message)
+}
+
 /// Send a message to an endpoint, waiting for a receiver; or signal a notification.
 pub fn send(to: Cap, info: MsgInfo, w: [u64; 4]) -> Result<()> {
     sys(Syscall::Send, [to.0, info.0, w[0], w[1], w[2], w[3]]).map(|_| ())
@@ -301,6 +313,18 @@ pub fn map(aspace: Cap, frame: Cap, vaddr: usize, rights: Rights) -> Result<()> 
 #[allow(unsafe_code)]
 pub unsafe fn unmap(frame: Cap) -> Result<()> {
     sys(Syscall::Unmap, [frame.0, 0, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// Remove every mapping in address space `space` (a capability with the
+/// write right) that overlaps the `len` bytes from `at`, each whole,
+/// whoever holds the frame: what a program does before it maps something
+/// where lent memory was. Returns how many mappings went.
+///
+/// # Safety
+/// Nothing the program still uses may be mapped in the range.
+#[allow(unsafe_code)]
+pub unsafe fn unmap_range(space: Cap, at: usize, len: usize) -> Result<u64> {
+    sys(Syscall::Unmap, [space.0, at as u64, len as u64, 0, 0, 0]).map(|r| r[0])
 }
 
 /// Be told when the capability in slot `watched` goes: whatever deletes it
