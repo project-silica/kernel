@@ -1,12 +1,12 @@
 //! Revoke completeness, by exhaustion (`spec/MILESTONES.md` M2, `spec/TESTING.md`
 //! section 3).
 //!
-//! The kernel's own `revoke` runs on every derivation list of up to
-//! [`SLOTS`] slots that the capability system can produce: every assignment
-//! of depths in which each slot is at most one deeper than the one before
-//! it, every mix of capabilities whose destruction differs (a frame; an
-//! endpoint, sharing its object with others or not, so that deleting it may
-//! or may not destroy a queue), every slot to revoke, and every pattern of
+//! The kernel's own `revoke` runs on lists of up to [`SLOTS`] slots. The
+//! first depth ranges from zero to two and each subsequent slot is at most
+//! one deeper than the previous one. Each slot can name an unmapped frame
+//! or either of two empty endpoints. For those shapes and objects the test
+//! covers both full rights with no badges and a fixed assignment of mixed
+//! rights and badges, every slot to revoke, and every pattern of
 //! interrupts arriving at the points where revoke looks for them, each
 //! interrupted revoke restarted as the system call is. After every call:
 //!
@@ -127,13 +127,17 @@ fn slot_addr(i: usize) -> Paddr {
 }
 
 /// What slot `i` of a list holds: 0 a frame, 1 an endpoint to the first
-/// queue, 2 an endpoint to the second.
-fn cap_of(kind: u32) -> Cap {
+/// queue, 2 an endpoint to the second; with rights and (an endpoint) a
+/// badge that differ from slot to slot, so that every capability left
+/// unchanged is seen to keep its own.
+fn cap_of(kind: u32, i: usize, mixed: bool) -> Cap {
     let (ty, obj) = match kind {
         0 => (ObjectType::Frame, FRAME),
         k => (ObjectType::Endpoint, QUEUE[k as usize - 1]),
     };
-    Cap { ty, rights: Rights::ALL, bits: if ty == ObjectType::Frame { 12 } else { 6 }, flags: 0, obj, badge: 0 }
+    let rights = if mixed { Rights((i as u8 * 7 + kind as u8) & 15) } else { Rights::ALL };
+    let badge = if mixed && ty == ObjectType::Endpoint { (i as u64) * 0x101 } else { 0 };
+    Cap { ty, rights, bits: if ty == ObjectType::Frame { 12 } else { 6 }, flags: 0, obj, badge }
 }
 
 /// Every depth sequence of length `n`: the first at most 2, each next at most one deeper.
@@ -212,6 +216,12 @@ fn revoke_is_complete_on_every_list_of_up_to_five_slots_part_3() {
 }
 
 fn revoke_is_complete(part: u64) {
+    for mixed in [false, true] {
+        check_revoke_lists(part, mixed);
+    }
+}
+
+fn check_revoke_lists(part: u64, mixed: bool) {
     let mut mem = Mem([0; 64 * (SLOTS + 3)]);
     // SAFETY: every address the kernel is given here is inside `mem` (the
     // slots and the two queues) or is a frame address that is only compared;
@@ -240,7 +250,7 @@ fn revoke_is_complete(part: u64) {
                         let mut caps = [None; SLOTS + 1];
                         let mut kk = kinds;
                         for i in 1..=n {
-                            let c = cap_of(kk % 3);
+                            let c = cap_of(kk % 3, i, mixed);
                             kk /= 3;
                             k.slot(slot_addr(i)).set(&c, depth[i - 1]);
                             if i > 1 {

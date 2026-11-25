@@ -1,23 +1,26 @@
-//! Kani proofs of the capability system's two promises
-//! (`spec/TESTING.md` section 3, `spec/MILESTONES.md` M2):
+//! Kani proofs about the capability system (`spec/TESTING.md` section 3,
+//! `spec/MILESTONES.md` M2). What is proved, and what only tested, is said
+//! exactly here, because a reader trusts a proof further than a test:
 //!
-//! - **No forge.** Whatever sequence of derive, duplicate, move, delete and
-//!   revoke a holder performs, every capability that exists refers to an
-//!   object a capability existed for at the start, carries no right the
-//!   capability it was made from did not have, and keeps the badge it was
-//!   given (a badge, once set, is never changed or removed).
-//! - **Revoke completeness** is proved by exhaustion in `exhaustive.rs`
-//!   (every derivation list of up to five slots, every interrupt pattern),
-//!   run with the host tests: harnesses here on a symbolic list of three
-//!   slots did not finish in 30 minutes (every slot address read back from
-//!   memory is symbolic).
+//! - **Proved here** (`copy_never_amplifies`): a single derive or duplicate
+//!   from a populated slot into an empty slot in a three-slot machine.
+//!   The harness checks rights attenuation, object identity or hardware
+//!   range containment, badge handling, and linkage to the source. The
+//!   assumptions on source frames, ranges and depth are in the harness.
+//! - **Exhaustive within its bounds** (`exhaustive.rs`, with the host tests):
+//!   revoke on depth lists of up to five slots with unmapped frames and
+//!   empty endpoints, under each interrupt schedule. The generator defines
+//!   the depth, rights and badge assignments it covers.
+//! - **Tested against a reference model, not proved** (`tests/model.rs`):
+//!   random sequences of retype, copy, move, delete, revoke, map, unmap and
+//!   thread configuration, every slot compared with the model's after each
+//!   step, rights included (the rights each use of a capability needs, as
+//!   in `ThreadConfigure`, are the model's as well as the kernel's).
+//! - **Attacked** (`tests/hostile.rs`): each way a program was found to get
+//!   more than its capabilities' rights, refused.
 //!
-//! Each proof runs one operation of the kernel's own code on a machine of a
-//! few capability slots in any well-formed state and checks its result, so
-//! the properties hold after any sequence of operations by induction. Within
-//! the bounds (`SLOTS`, `#[kani::unwind]`) each proof covers every
-//! capability type, rights mask, badge, derivation shape and interrupt
-//! timing.
+//! Nothing here covers the rights checks of the other system calls as a
+//! whole: those are the attack tests and the model, not a proof.
 //!
 //! Run with `cargo kani -p kernel-core` (the `kani` suite of
 //! `tools/test.sh --deep`).
@@ -31,8 +34,6 @@ use silica_abi::{ObjectType, Rights, SLOT_BITS};
 
 /// Capability slots in the machine (indices 1 to `SLOTS`).
 const SLOTS: usize = 3;
-/// Operations in one sequence.
-
 /// The memory the kernel sees: physical address 0 is never used, slots
 /// from 64, the endpoint's queue after them.
 #[repr(C, align(4096))]
