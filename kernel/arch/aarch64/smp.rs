@@ -10,7 +10,7 @@
 //!
 //! Each processor uses a kernel stack alias with an unmapped page below it.
 
-use super::{PHYS_MAP_BASE, acpi_table, acpi8, acpi32, acpi64, cpu, gic, image_phys, kernel};
+use super::{PHYS_MAP_BASE, acpi_table, cpu, gic, image_phys, kernel, madt_entries, t32, t64};
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -132,7 +132,7 @@ pub fn system_reset() {
     }
 }
 
-fn psci(f: u64, a: u64, b: u64, c: u64) -> i64 {
+pub(super) fn psci(f: u64, a: u64, b: u64, c: u64) -> i64 {
     let r: u64;
     // SAFETY: a PSCI call to the firmware; CPU_ON does not touch this
     // processor's state beyond the result.
@@ -148,39 +148,54 @@ fn psci(f: u64, a: u64, b: u64, c: u64) -> i64 {
 
 /// The other enabled processors' MPIDR affinities, from the MADT.
 fn others(rsdp: u64, out: &mut [u64; MAX_CPUS]) -> usize {
-    let Some((t, len)) = acpi_table(rsdp, b"APIC") else { return 0 };
+    let Some(t) = acpi_table(rsdp, b"APIC") else { return 0 };
     let me = gic::my_affinity();
-    let (mut n, mut at) = (0, t + 44);
-    while at + 2 <= t + len && n < MAX_CPUS - 1 {
-        let (kind, l) = (acpi8(at)[0], acpi8(at)[1] as u64);
-        if l < 2 {
+    let mut n = 0;
+    for (kind, e) in madt_entries(t) {
+        if n == MAX_CPUS - 1 {
             break;
         }
-        if kind == 0x0B && l >= 76 && acpi32(at + 12) & 1 != 0 {
-            let m = gic::affinity(acpi64(at + 68));
-            if m != me {
-                out[n] = m;
-                n += 1;
-            }
+        // A GICC entry, enabled (flags bit 0): one online-capable but not
+        // enabled (a hot-plug slot) is not there.
+        if kind == 0x0B
+            && e.len() >= 76
+            && t32(e, 12).is_some_and(|f| f & 1 != 0)
+            && let Some(m) = t64(e, 68).map(gic::affinity)
+            && m != me
+        {
+            out[n] = m;
+            n += 1;
         }
-        at += l;
     }
     n
+}
+
+/// Whether the firmware has PSCI (and SMCCC with it), from the FADT's Arm
+/// boot flags, which also say its conduit (HVC or SMC). Once, at boot.
+pub fn detect_psci(rsdp: u64) -> bool {
+    let Some(fadt) = acpi_table(rsdp, b"FACP") else { return false };
+    let flags = fadt.get(129).copied().unwrap_or(0);
+    if flags & 1 == 0 {
+        return false;
+    }
+    HVC.store(flags & 2 != 0, Ordering::Relaxed);
+    PSCI.store(true, Ordering::Relaxed);
+    true
+}
+
+/// Whether `detect_psci` found PSCI.
+pub fn psci_present() -> bool {
+    PSCI.load(Ordering::Relaxed)
 }
 
 /// Find the other processors and take memory for each, before the root task
 /// is given the rest. Returns how many processors there will be, this one
 /// included; `launch` starts them.
 pub fn prepare(rsdp: u64, regions: &mut RegionTable, gicr: (u64, u64)) -> usize {
-    // PSCI: the FADT's Arm boot flags say whether it exists and its conduit.
-    let Some((fadt, flen)) = acpi_table(rsdp, b"FACP") else { return 1 };
-    let flags = if flen >= 131 { acpi8(fadt + 129)[0] } else { 0 };
-    if flags & 1 == 0 {
+    if !detect_psci(rsdp) {
         let _ = core::fmt::Write::write_str(&mut super::Out, "kernel: the firmware has no PSCI: one processor\r\n");
         return 1;
     }
-    HVC.store(flags & 2 != 0, Ordering::Relaxed);
-    PSCI.store(true, Ordering::Relaxed);
     let mut ids = [0u64; MAX_CPUS];
     let found = others(rsdp, &mut ids);
     if found == 0 {
@@ -252,13 +267,21 @@ pub fn prepare(rsdp: u64, regions: &mut RegionTable, gicr: (u64, u64)) -> usize 
     found + 1
 }
 
-/// Start the processors `prepare` set up, one at a time, each within a
-/// second; say which did not start.
-pub fn launch(cpus: usize, panic_secondary: bool) {
+/// The secondaries that arrived (`kernel_core::smp::Admission`).
+static ADMISSION: kernel_core::smp::Admission = kernel_core::smp::Admission::new();
+
+/// Start the processors `prepare` set up in slots `1..slots`, all at once,
+/// and count those that arrive: the number of processors the machine has,
+/// the boot one included, which is what the root task is told. Waits while
+/// they keep arriving (a second with none arriving ends it); a processor
+/// the firmware refused to start, or one that never arrived, is said and
+/// not counted.
+pub fn launch(slots: usize, panic_secondary: bool) -> usize {
     PANIC_SECONDARY.store(panic_secondary, Ordering::Release);
     let entry_pa = image_phys(&raw const ap_entry as u64);
-    for index in 1..cpus {
-        let p = PAGES[index].load(Ordering::Acquire);
+    let mut woken = 0;
+    for slot in 1..slots {
+        let p = PAGES[slot].load(Ordering::Acquire);
         // SAFETY: `prepare` wrote this processor's PerCpu there.
         let mpidr = unsafe { &*(p as *const cpu::PerCpu) }.mpidr.load(Ordering::Relaxed);
         let r = psci(0xC400_0003, mpidr, entry_pa, p - 256 - PHYS_MAP_BASE);
@@ -266,15 +289,27 @@ pub fn launch(cpus: usize, panic_secondary: bool) {
             let _ = core::fmt::Write::write_fmt(&mut super::Out, format_args!("kernel: PSCI CPU_ON {mpidr:#x} failed: {r}\r\n"));
             continue;
         }
-        let (t0, freq) = (super::counter(), super::counter_frequency());
-        while cpu::percpu_of(index).is_none_or(|c| !c.online.load(Ordering::Acquire)) {
-            if super::counter().wrapping_sub(t0) > freq {
-                let _ = core::fmt::Write::write_fmt(&mut super::Out, format_args!("kernel: processor {mpidr:#x} did not start\r\n"));
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        woken += 1;
     }
+    let freq = super::counter_frequency();
+    let mut last = (ADMISSION.arrived(), super::counter());
+    while ADMISSION.arrived() < woken {
+        let now = (ADMISSION.arrived(), super::counter());
+        if now.0 != last.0 {
+            last = now;
+        } else if now.1.wrapping_sub(last.1) > freq {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let cpus = ADMISSION.close();
+    if cpus < slots {
+        let _ = core::fmt::Write::write_fmt(
+            &mut super::Out,
+            format_args!("kernel: {cpus} of the {slots} processors the firmware describes started; the others are not used\r\n"),
+        );
+    }
+    cpus
 }
 
 static PANIC_SECONDARY: AtomicBool = AtomicBool::new(false);
@@ -282,9 +317,42 @@ static GICR_REGION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// The redistributor region's physical address.
 pub static GICR_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
 
-extern "C" fn ap_main(index: usize) -> ! {
-    // SAFETY: the page was filled for this processor before it was started.
-    let p = unsafe { &*(PAGES[index].load(Ordering::Acquire) as *const cpu::PerCpu) };
+/// A secondary, in slot `slot` (its page, stack and data), arrives: it
+/// takes the next index, or stops for good if the boot processor has
+/// already closed the count (said by `launch`).
+extern "C" fn ap_main(slot: usize) -> ! {
+    let stop = |why: &str| -> ! {
+        let _ = core::fmt::Write::write_fmt(
+            &mut super::Out,
+            format_args!("kernel: a processor ({:#x}) {why}; it stops and is not used\r\n", gic::my_affinity()),
+        );
+        loop {
+            // SAFETY: stopping this processor, interrupts masked, touching nothing.
+            unsafe { asm!("wfe", options(nomem, nostack)) }
+        }
+    };
+    // Its interrupt controller first: a processor that cannot take
+    // interrupts is not admitted, so it is never counted.
+    let region = (GICR_REGION[0].load(Ordering::Relaxed), GICR_REGION[1].load(Ordering::Relaxed));
+    let Some(r) = gic::find_redistributor(region.0, region.1, gic::my_affinity()) else { stop("has no GIC redistributor") };
+    if !gic::wake(r) {
+        stop("has a GIC redistributor that did not wake within 100 ms");
+    }
+    let Some(index) = ADMISSION.admit() else {
+        loop {
+            // SAFETY: stopping this processor, interrupts masked, touching nothing.
+            unsafe { asm!("wfe", options(nomem, nostack)) }
+        }
+    };
+    let page = PAGES[slot].load(Ordering::Acquire) as *mut cpu::PerCpu;
+    // SAFETY: the page was filled for this processor before it was started
+    // and is this processor's alone; it takes the index it was admitted
+    // with before anything reads its data.
+    let p = unsafe {
+        let (stack_top, mpidr) = ((*page).kstack_top.load(Ordering::Relaxed), (*page).mpidr.load(Ordering::Relaxed));
+        page.write(cpu::PerCpu::new(index, stack_top, mpidr));
+        &*page
+    };
     // SAFETY: this processor's own data, on its first and only pass here,
     // interrupts masked.
     unsafe { cpu::install(p) };
@@ -293,20 +361,8 @@ extern "C" fn ap_main(index: usize) -> ! {
         super::deliberate_panic(index);
     }
     super::reset_ttbr0(kernel().hal.empty_root());
-    let region = (GICR_REGION[0].load(Ordering::Relaxed), GICR_REGION[1].load(Ordering::Relaxed));
-    match gic::find_redistributor(region.0, region.1, gic::my_affinity()) {
-        Some(r) => {
-            gic::init_processor(index, r);
-            super::its::enable_processor(index, r, GICR_PHYS_BASE.load(Ordering::Relaxed) + (r - region.0));
-        }
-        None => {
-            let _ = core::fmt::Write::write_str(&mut super::Out, "kernel: no GIC redistributor for a processor; it stops\r\n");
-            loop {
-                // SAFETY: waiting with interrupts masked.
-                unsafe { asm!("wfe", options(nomem, nostack)) }
-            }
-        }
-    }
+    gic::init_processor(index, r);
+    super::its::enable_processor(index, r, GICR_PHYS_BASE.load(Ordering::Relaxed) + (r - region.0));
     p.online.store(true, Ordering::Release);
     let k = kernel();
     k.enter();

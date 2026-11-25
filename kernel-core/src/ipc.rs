@@ -361,7 +361,7 @@ impl<H: Hal> Kernel<H> {
         // Its waiter, or its listener and the endpoint that one waits on,
         // must be this processor's.
         let mine = |t: Paddr| t == 0 || self.thread(t).cpu.get() == me;
-        let local = self.ncpu.get() == 1
+        let local = self.ncpu() == 1
             || (q.owner.get() == me + 1 && mine(q.head.get()) && mine(q.listener().get()) && {
                 let l = self.listener(n);
                 l == 0 || self.queue(self.thread(l).blocked_on.get()).owner.get() == me + 1
@@ -499,7 +499,7 @@ impl<H: Hal> Kernel<H> {
             return;
         }
         let th = self.thread(t);
-        let global = self.ncpu.get() > 1 && !th.fault_ep.cap().is_some_and(|c| self.queue_is_local(self.held(), t, &c));
+        let global = self.ncpu() > 1 && !th.fault_ep.cap().is_some_and(|c| self.queue_is_local(self.held(), t, &c));
         if global {
             self.go_global();
             if me.cur.get() != t || th.state.get() != crate::thread::RUNNABLE {

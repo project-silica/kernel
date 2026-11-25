@@ -32,6 +32,27 @@ fn the_baseline_processor_is_accepted() {
 }
 
 #[test]
+fn comparing_counters_requires_a_fresh_sample_and_a_bounded_interval() {
+    use core::cell::Cell;
+    use kernel_core::x86::counters_agree;
+    let check = |offset: i64, stalled: u64| {
+        let ticks = Cell::new(0u64);
+        counters_agree(
+            || {
+                ticks.set(ticks.get() + 1);
+                ticks.get()
+            },
+            || if ticks.get() < stalled { 0 } else { ticks.get().wrapping_add_signed(offset) },
+            100_000,
+        )
+    };
+    assert!(check(0, 200), "a descheduled publisher can resume");
+    assert!(!check(40, 0));
+    assert!(!check(-40, 0));
+    assert!(!check(0, u64::MAX), "a stopped publisher cannot hold boot forever");
+}
+
+#[test]
 fn a_processor_without_avx_avx2_or_nx_is_refused_by_name() {
     assert_eq!(check(cpu(&[(1, 2, 28)], &[])).missing, Some("AVX (x86-64-v3)"));
     assert_eq!(check(cpu(&[(7, 1, 5)], &[])).missing, Some("AVX2 (x86-64-v3)"));
@@ -50,4 +71,18 @@ fn a_tsc_that_is_not_invariant_is_refused_on_bare_metal_and_trusted_under_a_hype
     assert_eq!(v.missing, Some("an invariant TSC"));
     let v = check(cpu(&[(0x8000_0007, 3, 8)], &[(1, 2, 31)]));
     assert_eq!((v.missing, v.tsc_trusted), (None, true));
+}
+
+#[test]
+fn an_iommu_unit_that_cannot_be_driven_confines_nothing() {
+    use kernel_core::x86::{UnitUse as U, unit_use};
+    let limit = 1 << 40;
+    assert_eq!(unit_use(0xFED9_0000, 0, limit, 0, 32), U::Drive);
+    assert_eq!(unit_use(0xFED9_0800, 0, limit, 0, 32), U::Undriven, "registers not page-aligned");
+    assert_eq!(unit_use(limit, 0, limit, 0, 32), U::Undriven, "registers past the physical map");
+    assert_eq!(unit_use(!0xFFF, 0, u64::MAX, 0, 32), U::Undriven, "a base whose end wraps");
+    assert_eq!(unit_use(0xFED9_0000, 0, limit, 32, 32), U::Undriven, "one unit too many");
+    assert_eq!(unit_use(0, 0, limit, 0, 32), U::Undriven);
+    assert_eq!(unit_use(0xFED9_0000, 1, limit, 0, 32), U::Block);
+    assert_eq!(unit_use(0xFED9_0800, 1, limit, 0, 32), U::Unreachable);
 }

@@ -26,7 +26,12 @@ pub struct Kernel<H: Hal> {
     /// Physical memory.
     pub phys: Phys,
     pub(crate) cpus: crate::smp::CpuTable,
-    pub(crate) ncpu: Cell<usize>,
+    pub(crate) ncpu: core::sync::atomic::AtomicUsize,
+    /// An address space isolated against speculation (`ASPACE_ISOLATED`)
+    /// has been made since boot: only then does a switch look at whether it
+    /// enters or leaves one (`Kernel::isolate`), so a machine without one
+    /// pays a load and a branch for it.
+    pub(crate) isolating: core::sync::atomic::AtomicBool,
     /// This processor holds every lock (see `smp.rs`).
     pub(crate) global: Cell<bool>,
     /// Held, with the holder's own processor lock, while mapping.
@@ -54,7 +59,8 @@ impl<H: Hal> Kernel<H> {
             hal,
             phys,
             cpus: crate::smp::CpuTable::new(),
-            ncpu: Cell::new(1),
+            ncpu: core::sync::atomic::AtomicUsize::new(1),
+            isolating: core::sync::atomic::AtomicBool::new(false),
             global: Cell::new(false),
             structure: crate::lock::Lock::new(),
             globals: Cell::new(0),
@@ -206,7 +212,7 @@ impl<H: Hal> Kernel<H> {
     /// Whether syscall `s` can run holding only the locks this entry holds:
     /// this processor's, and after [`Kernel::go_pair`] one other's.
     fn is_local(&self, s: Syscall, t: Paddr, a: &[u64; 6]) -> bool {
-        if self.ncpu.get() == 1 {
+        if self.ncpu() == 1 {
             return true;
         }
         let h = self.held();
@@ -215,8 +221,10 @@ impl<H: Hal> Kernel<H> {
             None => true, // BadCap, reported without touching anything
         };
         match s {
-            // `Map` takes the structure lock itself.
-            Syscall::Yield | Syscall::PortIo | Syscall::Map | Syscall::Console | Syscall::PowerOff => true,
+            // `Map` takes the structure lock itself. `IrqAck` reads the
+            // line's binding (changed only holding every lock) and unmasks
+            // it under the interrupt controller's own lock.
+            Syscall::Yield | Syscall::PortIo | Syscall::Map | Syscall::Console | Syscall::PowerOff | Syscall::IrqAck => true,
             // Passing capabilities changes capability slots.
             Syscall::Call | Syscall::Send => MsgInfo(a[1]).caps() == 0 && queue(a[0] & !NONBLOCK),
             Syscall::Recv => queue(crate::ipc::recv_slot(a[0])) && self.park_is_local(h, t, a[2]) && self.listen_is_local(h, t, a[0]),
@@ -432,7 +440,7 @@ impl<H: Hal> Kernel<H> {
         // Emptying left over from an earlier entry (a large CapSpace,
         // `drain_reap`) is finished before any system call that holds every
         // lock does anything: its memory is reused only once it is done.
-        if self.reap_pending() && (self.ncpu.get() == 1 || self.global.get()) && !self.finish_reap() {
+        if self.reap_pending() && (self.ncpu() == 1 || self.global.get()) && !self.finish_reap() {
             return Ok(Exit::Preempted);
         }
         match s {
@@ -650,7 +658,7 @@ impl<H: Hal> Kernel<H> {
                         // Move the thread to processor `a2`, doing what it
                         // was doing. A deadline reservation is on one
                         // processor: unbind it first.
-                        if a[2] >= self.ncpu.get() as u64 {
+                        if a[2] >= self.ncpu() as u64 {
                             return Err(Error::BadArg);
                         }
                         if self.dl_of(th.obj).is_some() {
@@ -731,6 +739,10 @@ impl<H: Hal> Kernel<H> {
                 }
                 if to == 0 {
                     self.hal.irq_mask(line, true);
+                    // A message line unbound: no device may raise it.
+                    if msi && old != 0 {
+                        self.hal.msi_release(line);
+                    }
                 } else {
                     self.irqs[line].0.set(to);
                     self.irqs[line].1.set(badge);
@@ -978,7 +990,7 @@ impl<H: Hal> Kernel<H> {
     #[cold]
     #[inline(never)]
     fn fresh_extended_state(&self, t: Paddr) {
-        for cpu in self.cpus.iter(self.ncpu.get()) {
+        for cpu in self.cpus.iter(self.ncpu()) {
             if cpu.loaded.get() == t {
                 cpu.loaded.set(0);
                 cpu.dirty.set(true);
@@ -1145,7 +1157,7 @@ impl<H: Hal> Kernel<H> {
     /// deadline queue only threads bound to deadline contexts. For tests and
     /// fuzzing.
     pub fn check_runqueues(&self) -> Result<(), &'static str> {
-        for (i, cpu) in self.cpus.iter(self.ncpu.get()).enumerate() {
+        for (i, cpu) in self.cpus.iter(self.ncpu()).enumerate() {
             for (head, tail, dl) in [(&cpu.rq_head, &cpu.rq_tail, false), (&cpu.dl_head, &cpu.dl_tail, true)] {
                 let (mut t, mut prev, mut last, mut n) = (head.get(), 0, 0, 0usize);
                 while t != 0 {
@@ -1181,7 +1193,7 @@ impl<H: Hal> Kernel<H> {
     /// ways, in deadline order, ending, and holding only threads of that
     /// processor that have a deadline. For tests and fuzzing.
     pub fn check_timers(&self) -> Result<(), &'static str> {
-        for (i, cpu) in self.cpus.iter(self.ncpu.get()).enumerate() {
+        for (i, cpu) in self.cpus.iter(self.ncpu()).enumerate() {
             let (mut t, mut prev, mut last, mut n) = (cpu.timers.get(), 0, 0, 0usize);
             while t != 0 {
                 let th = self.thread(t);

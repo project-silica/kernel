@@ -401,7 +401,7 @@ impl<H: Hal> Kernel<H> {
                 if !(1..=SCHED_MAX_WEIGHT).contains(&a) {
                     return Err(Error::BadArg);
                 }
-                if a > SCHED_DEFAULT_WEIGHT && !(time.start == 0 && time.end >= self.ncpu.get() as u64) {
+                if a > SCHED_DEFAULT_WEIGHT && !(time.start == 0 && time.end >= self.ncpu() as u64) {
                     return Err(Error::NoRights);
                 }
                 if bound && sc.class.get() != SCHED_FAIR {
@@ -413,7 +413,7 @@ impl<H: Hal> Kernel<H> {
                 Ok(())
             }
             SCHED_DEADLINE => {
-                if a == 0 || b < MIN_PERIOD || a > b || cpu >= self.ncpu.get() as u64 {
+                if a == 0 || b < MIN_PERIOD || a > b || cpu >= self.ncpu() as u64 {
                     return Err(Error::BadArg);
                 }
                 if !time.contains(&cpu) {

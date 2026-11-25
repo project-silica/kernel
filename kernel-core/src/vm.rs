@@ -154,7 +154,7 @@ impl<H: Hal> Kernel<H> {
 
     #[inline(always)]
     fn map_with_lock<const IO: bool>(&self, a: Paddr, fs: Paddr, vaddr: u64, rights: Rights) -> Result<(), Error> {
-        let shared = self.ncpu.get() > 1 && !self.global.get();
+        let shared = self.ncpu() > 1 && !self.global.get();
         if shared {
             self.structure.lock();
         }
@@ -417,8 +417,8 @@ impl<H: Hal> Kernel<H> {
         }
         self.hal.leave_aspace(a + PAGE);
         let me = self.me();
-        if me.loaded_root.get() == a + PAGE {
-            me.loaded_root.set(0);
+        if me.runs_on(a + PAGE) {
+            me.forget_root();
             me.dirty.set(true);
         }
         self.evict(a + PAGE);
@@ -433,12 +433,12 @@ impl<H: Hal> Kernel<H> {
     /// its watch: into waiting for its lock), and answers there; this waits
     /// for every answer. Elsewhere the shoot-down is enough.
     fn evict(&self, root: Paddr) {
-        if !H::KERNEL_IN_ROOT || self.ncpu.get() == 1 {
+        if !H::KERNEL_IN_ROOT || self.ncpu() == 1 {
             self.shoot_down(root);
             return;
         }
         for (i, cpu) in self.others() {
-            if cpu.loaded_root.get() == root {
+            if cpu.runs_on(root) {
                 cpu.flush.set(true);
                 cpu.dirty.set(true);
                 cpu.leave.ask(root);
@@ -449,9 +449,9 @@ impl<H: Hal> Kernel<H> {
         }
         // All asked before any is waited for: they leave at once.
         for (i, cpu) in self.others() {
-            if cpu.loaded_root.get() == root {
+            if cpu.runs_on(root) {
                 self.hal.wait_left(i, &cpu.leave);
-                cpu.loaded_root.set(0);
+                cpu.forget_root();
             }
         }
     }
@@ -461,11 +461,11 @@ impl<H: Hal> Kernel<H> {
     /// brought into the kernel and starts over with nothing cached; the
     /// others forget what they had.
     fn shoot_down(&self, root: Paddr) {
-        if self.ncpu.get() == 1 {
+        if self.ncpu() == 1 {
             return;
         }
         for (i, cpu) in self.others() {
-            if cpu.loaded_root.get() == root {
+            if cpu.runs_on(root) {
                 cpu.flush.set(true);
                 cpu.dirty.set(true);
                 self.hal.kick(i, true);

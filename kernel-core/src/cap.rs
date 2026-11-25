@@ -39,6 +39,12 @@ pub const FLAG_POWER: u8 = 16;
 /// firmware tables, the ramdisk). It is never zeroed, so it becomes only
 /// frames and smaller Untyped, never kernel objects.
 pub const FLAG_KEPT: u8 = 32;
+/// AddressSpace flag: isolated against speculative execution
+/// (`ASPACE_ISOLATED`): switching into or out of it flushes the branch
+/// predictors (`Hal::isolate`). On the capability, which the scheduler
+/// reads anyway on a switch, so other address spaces pay nothing to look.
+/// (Bit 1 means a port range on a Hw capability; an AddressSpace is never one.)
+pub const FLAG_ISOLATED: u8 = 2;
 /// AddressSpace flag: an address space for devices (`ASPACE_IO`). Its
 /// tables are the IOMMU's, and no thread runs in it.
 pub const FLAG_IO: u8 = 64;
@@ -212,7 +218,7 @@ impl<H: Hal> Kernel<H> {
             // It may be a running thread's own, on any processor: each
             // looks again at what it should have loaded.
             self.me().dirty.set(true);
-            if self.ncpu.get() > 1 {
+            if self.ncpu() > 1 {
                 for (i, cpu) in self.others() {
                     cpu.dirty.set(true);
                     self.hal.kick(i, true);

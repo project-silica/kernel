@@ -106,6 +106,14 @@ pub struct X86 {
     /// Bits: 1 enhanced IBRS on, 2 BHI_DIS_S on, 4 VERW on exit, 8 no
     /// enhanced IBRS (indirect branches unprotected), 16 Meltdown-affected.
     mitigations: Cell<u8>,
+    /// Isolation against speculation (`Hal::isolate`): whether the
+    /// processor has IA32_SPEC_CTRL and IBPB, the SPEC_CTRL bits always on
+    /// (enhanced IBRS, BHI), and those added while an isolated address
+    /// space runs (STIBP, SSBD).
+    spec_ctrl: Cell<bool>,
+    ibpb: Cell<bool>,
+    spec_base: Cell<u64>,
+    spec_isolated: Cell<u64>,
 }
 
 struct Global(Kernel<X86>);
@@ -129,6 +137,10 @@ static KERNEL: Global = Global(Kernel::new(
         fsgsbase: Cell::new(false),
         pcid: Cell::new(false),
         mitigations: Cell::new(0),
+        spec_ctrl: Cell::new(false),
+        ibpb: Cell::new(false),
+        spec_base: Cell::new(0),
+        spec_isolated: Cell::new(0),
     },
     // SAFETY: the loader maps all physical memory at PHYS_MAP_BASE and the
     // kernel only uses addresses from the boot regions through it.
@@ -215,6 +227,40 @@ impl Hal for X86 {
     }
     fn msi_first(&self) -> usize {
         ioapic::lines()
+    }
+    fn isolate(&self, entering: bool) {
+        // SAFETY: IA32_SPEC_CTRL and IA32_PRED_CMD exist where the flags say
+        // (CPUID, `init_mitigations`); the bits written are enumerated. The
+        // return-stack fill calls and returns within this asm only, on the
+        // kernel stack (the kernel has no red zone), and leaves it as it was.
+        unsafe {
+            if self.spec_ctrl.get() {
+                wrmsr(0x48, self.spec_base.get() | if entering { self.spec_isolated.get() } else { 0 });
+            }
+            if self.ibpb.get() {
+                wrmsr(0x49, 1); // IBPB: forget what earlier code taught the indirect predictors
+            }
+            // The return stack: 32 entries of this code's own, so a return in
+            // the next address space never predicts to an address the
+            // previous one left there.
+            asm!(
+                "mov {n:e}, 16",
+                "2:",
+                "call 3f",
+                "int3",
+                "3:",
+                "call 4f",
+                "int3",
+                "4:",
+                "dec {n:e}",
+                "jnz 2b",
+                "add rsp, 256",
+                n = out(reg) _,
+            );
+        }
+    }
+    fn msi_release(&self, line: usize) {
+        iommu::unremap(&kernel().phys, line);
     }
     fn msi_route(&self, line: usize, cpu: usize, source: u64) -> Option<(u64, u64)> {
         let apic = cpu::percpu_of(cpu)?.apic_id;
@@ -386,7 +432,8 @@ impl Hal for X86 {
     }
 
     fn set_timer(&self, deadline: u64) {
-        let tsc = self.tsc_at(deadline);
+        // No later than the console must be fed again (`serial::due`).
+        let tsc = self.tsc_at(deadline.min(serial::due()));
         let per_ns = self.apic_per_ns.get();
         // Writing the timer leaves a virtual machine; writing what it holds
         // already (above all: disarming a timer that has fired, on every
@@ -442,6 +489,11 @@ impl Hal for X86 {
     }
 
     fn idle(&self, until: u64, words: Option<&[kernel_core::hal::Watched]>) -> bool {
+        // An idle processor feeds the console first, and wakes no later
+        // than when it must be fed again.
+        report_nmis(kernel());
+        serial::drain(self.now());
+        let until = until.min(serial::due());
         // The timer is armed ahead of `until` by how long this processor
         // has been taking to come out of the wait (on a virtual machine,
         // mostly the host waking the virtual processor's thread), and the
@@ -643,7 +695,7 @@ impl Hal for X86 {
     }
 
     fn console(&self, bytes: &[u8]) {
-        serial::write_whole(bytes);
+        serial::write_whole(bytes, self.now());
         fbcon::write(bytes);
     }
 
@@ -843,9 +895,13 @@ pub fn irq(vector: u64, locked: bool) {
     match vector {
         TIMER_VECTOR if locked => {
             percpu().deadline.set(u64::MAX);
+            console_tick(k);
             k.on_timer()
         }
-        TIMER_VECTOR => percpu().deadline.set(u64::MAX),
+        TIMER_VECTOR => {
+            percpu().deadline.set(u64::MAX);
+            console_tick(k);
+        }
         KICK_VECTOR => {}
         iommu::FAULT_VECTOR => iommu::fault(&k.phys),
         SPURIOUS_VECTOR => return,
@@ -940,6 +996,7 @@ fn backtrace(first: u64, mut rbp: u64) {
 
 /// The kernel panicked: say why, show where, stop.
 pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    stop_others();
     fbcon::panic();
     let _ = write!(Out, "\r\nPANIC: {}\r\n", info.message());
     if let Some(l) = info.location() {
@@ -955,6 +1012,7 @@ pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 
 /// A processor exception in kernel mode: a kernel bug.
 pub fn kernel_fault(f: &cpu::KernelFrame) -> ! {
+    stop_others();
     let cr2: u64;
     // SAFETY: reading CR2 in ring 0 has no side effect.
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) }
@@ -1002,8 +1060,15 @@ pub(super) fn init_processor(first: bool) {
         asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
         cr0 = (cr0 & !(1 << 2 | 1 << 3)) | 1 << 1 | 1 << 5 | 1 << 16; // no EM/TS; MP, NE, WP
         asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
+        // The PAT as reset, but for entry 1 (PWT alone): write-combining,
+        // which the loader gives the framebuffer (`page_framebuffer`). No
+        // other mapping uses that entry, so nothing else changes type;
+        // global translations of the framebuffer cached as write-through
+        // go with the PGE toggle below.
+        wrmsr(0x277, 0x0007_0406_0007_0106);
         let mut cr4: u64;
         asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        asm!("mov cr4, {}", in(reg) cr4 & !(1 << 7), options(nomem, nostack, preserves_flags));
         cr4 |= 1 << 7 | 1 << 9 | 1 << 10 | 1 << 18; // PGE, OSFXSR, OSXMMEXCPT, OSXSAVE
         if f7[1] & 1 != 0 {
             cr4 |= 1 << 16; // FSGSBASE
@@ -1025,7 +1090,17 @@ pub(super) fn init_processor(first: bool) {
         if f7[2] & 1 << 2 != 0 {
             cr4 |= 1 << 11; // UMIP
         }
+        // Machine checks are taken (CR4.MCE) and every bank reports
+        // (`init_mca`): without this a memory error shuts the processor
+        // down with nothing said.
+        let mca = f1[3] & (1 << 7 | 1 << 14) == 1 << 7 | 1 << 14;
+        if mca {
+            cr4 |= 1 << 6;
+        }
         asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
+        if mca {
+            init_mca(first);
+        }
         // x87, SSE, AVX, and AVX-512 when its state fits the Thread object.
         let supported = cpuid(0xD, 0)[0] as u64;
         let mut xcr0 = supported & 0b111;
@@ -1116,6 +1191,17 @@ unsafe fn init_mitigations(first: bool) {
         // SAFETY: IA32_SPEC_CTRL exists (CPUID.7:EDX[26]); the bits set are enumerated.
         unsafe { wrmsr(0x48, spec) };
     }
+    // What isolating an address space can use (`X86::isolate`): IA32_SPEC_CTRL
+    // and IBPB (Intel: CPUID.7:EDX 26; AMD: 0x80000008 EBX 14 and 12), STIBP
+    // (EDX 27; EBX 15) and SSBD (EDX 31; EBX 24).
+    let amd = if cpuid(0x8000_0000, 0)[0] >= 0x8000_0008 { cpuid(0x8000_0008, 0)[1] } else { 0 };
+    let has = |intel_bit: u32, amd_bit: u32| f7[3] & 1 << intel_bit != 0 || amd & 1 << amd_bit != 0;
+    if first {
+        k.hal.spec_ctrl.set(has(26, 14) || has(27, 15) || has(31, 24));
+        k.hal.ibpb.set(has(26, 12));
+        k.hal.spec_base.set(spec);
+        k.hal.spec_isolated.set(if has(27, 15) { 1 << 1 } else { 0 } | if has(31, 24) { 1 << 2 } else { 0 });
+    }
     // Buffers that can leak across the user/kernel boundary (MDS, RFDS):
     // overwrite them on the way back to user mode.
     if caps & 1 << 28 != 0 || (intel && f7[3] & 1 << 10 != 0 && caps & 1 << 5 == 0) {
@@ -1140,16 +1226,24 @@ fn init_oneshot_timer(tsc_hz: u64) {
     if cpuid(1, 0)[2] & 1 << 24 != 0 {
         return;
     }
-    // SAFETY: x2APIC timer registers, present on every x2APIC.
-    let counted = unsafe {
-        wrmsr(MSR_X2APIC_TIMER_COUNT, u32::MAX as u64);
-        let t0 = rdtsc();
-        while rdtsc() - t0 < tsc_hz / 500 {}
-        let left = rdmsr(MSR_X2APIC_TIMER_NOW);
-        wrmsr(MSR_X2APIC_TIMER_COUNT, 0);
-        wrmsr(MSR_X2APIC_LVT_TIMER, TIMER_VECTOR); // one-shot, unmasked
-        u32::MAX as u64 - left
-    };
+    // The median of three samples of 2 ms: one disturbed sample does not
+    // become every timer's error.
+    let mut samples = [0u64; 3];
+    for s in &mut samples {
+        // SAFETY: x2APIC timer registers, present on every x2APIC.
+        *s = unsafe {
+            wrmsr(MSR_X2APIC_TIMER_COUNT, u32::MAX as u64);
+            let t0 = rdtsc();
+            while rdtsc() - t0 < tsc_hz / 500 {}
+            let left = rdmsr(MSR_X2APIC_TIMER_NOW);
+            wrmsr(MSR_X2APIC_TIMER_COUNT, 0);
+            u32::MAX as u64 - left
+        };
+    }
+    samples.sort_unstable();
+    let counted = samples[1];
+    // SAFETY: as above: one-shot, unmasked.
+    unsafe { wrmsr(MSR_X2APIC_LVT_TIMER, TIMER_VECTOR) };
     // `counted` ticks in 2 ms.
     let per_ns = ((counted as u128 * 500) << 32) / 1_000_000_000;
     kernel().hal.apic_per_ns.set((per_ns as u64).max(1));
@@ -1188,14 +1282,13 @@ fn tsc_frequency(bi: &BootInfo, phys: &Phys) -> u64 {
             return if shift >= 0 { (hz >> shift) as u64 } else { (hz << -shift) as u64 };
         }
     }
-    // 3. Measure against the ACPI power-management timer (3.579545 MHz).
-    if let Some(port) = acpi_pm_timer(bi, phys) {
-        let read = || kernel().hal.port_io(port, 4, false, 0) & 0xFF_FFFF;
-        let start = read();
-        let t0 = rdtsc();
-        let ticks = 35_795; // 10 ms
-        while read().wrapping_sub(start) & 0xFF_FFFF < ticks {}
-        return (rdtsc() - t0) * 100;
+    // 3. Measure against the ACPI power-management timer (3.579545 MHz):
+    // the median of three 10 ms samples, each bounded (a timer that does
+    // not count is not waited for for ever: the next way is tried).
+    if let Some(port) = acpi_pm_timer(bi, phys)
+        && let Some(hz) = pm_timer_hz(port)
+    {
+        return hz;
     }
     // 4. The processor's nominal frequency.
     if cpuid(0, 0)[0] >= 0x16 && cpuid(0x16, 0)[0] != 0 {
@@ -1208,25 +1301,21 @@ fn tsc_frequency(bi: &BootInfo, phys: &Phys) -> u64 {
 /// none or its tables lie outside the memory the kernel can reach.
 pub(super) fn acpi_table<'a>(bi: &BootInfo, phys: &'a Phys, sig: &[u8; 4]) -> Option<&'a [u8]> {
     let limit = bi.phys_map_len;
-    let table = |p: u64, len: u64| {
+    let inside = |p: u64, len: u64| p != 0 && p.checked_add(len).is_some_and(|e| e <= limit);
+    // The shared walker (`kernel_core::acpi::find_table`, the one the
+    // tests check), reading only inside the physical map.
+    let mut read = |p: u64, buf: &mut [u8]| {
+        if !inside(p, buf.len() as u64) {
+            return false;
+        }
         // SAFETY: the range is checked to be inside the physical map; ACPI
         // tables are firmware memory nothing writes.
-        (p != 0 && p.checked_add(len)? <= limit).then(|| unsafe { phys.bytes(p, len) })
+        buf.copy_from_slice(unsafe { phys.bytes(p, buf.len() as u64) });
+        true
     };
-    let u32_at = |b: &[u8], o: usize| Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?));
-    let u64_at = |b: &[u8], o: usize| Some(u64::from_le_bytes(b.get(o..o + 8)?.try_into().ok()?));
-    let rsdp = table(bi.rsdp, 36)?;
-    let xsdt_addr = u64_at(rsdp, 24)?;
-    let len = u32_at(table(xsdt_addr, 36)?, 4)? as u64;
-    let xsdt = table(xsdt_addr, len)?;
-    for i in 0..(len as usize).saturating_sub(36) / 8 {
-        let t = u64_at(xsdt, 36 + i * 8)?;
-        let Some(h) = table(t, 36) else { continue };
-        if &h[..4] == sig {
-            return table(t, u32_at(h, 4)? as u64);
-        }
-    }
-    None
+    let (t, len) = kernel_core::acpi::find_table(&mut read, bi.rsdp, sig)?;
+    // SAFETY: as above, the whole table checked.
+    inside(t, len as u64).then(|| unsafe { phys.bytes(t, len as u64) })
 }
 
 /// The I/O port of the ACPI PM timer, from the FADT.
@@ -1350,6 +1439,20 @@ pub extern "C" fn kmain(info: u64) -> ! {
     // becomes a table of pages with the block's attributes (bits 7 and 12
     // mean different things in the two kinds of entry, so only the common
     // ones are copied).
+    // Where the loader mapped that 2 MiB in pages already (it mixes memory
+    // and device ranges), page 0's entry is cleared in place.
+    if let Some(pde) = kernel_pte(&k.phys, PHYS_MAP_BASE, 1) {
+        // SAFETY: `pde` is the live entry of the physical map's first 2 MiB;
+        // a table it names is the loader's, which the kernel now owns; no
+        // other processor runs yet, and nothing touches physical page 0.
+        unsafe {
+            let v = *pde;
+            if v & PTE_P != 0 && v & PTE_PS == 0 {
+                *k.phys.ptr(v & PTE_ADDR).cast::<u64>() = 0;
+                flush_all();
+            }
+        }
+    }
     if let (Some(pt), Some(pde)) = (table.carve(4096, 4096, 1 << 20, 1 << 32), kernel_pte(&k.phys, PHYS_MAP_BASE, 1)) {
         // SAFETY: `pde` is the live entry of the physical map's first 2 MiB
         // and `pt` a page nobody else has; no other processor runs yet, and
@@ -1377,6 +1480,12 @@ pub extern "C" fn kmain(info: u64) -> ! {
         _ => smp::prepare(&bi, &k.phys, table, root, apic_id),
     };
     k.set_cpu_count(cpus);
+    // They come up while the IOMMU is set up, and are counted (those that
+    // arrived) before the root task is told how many there are.
+    let smp_from = rdtsc();
+    if cpus > 1 {
+        smp::start(hz);
+    }
     // The I/O APIC and local APIC stay with the kernel, and so do the
     // IOMMUs' registers: from here on a device reaches only what a driver
     // maps for it.
@@ -1387,6 +1496,13 @@ pub extern "C" fn kmain(info: u64) -> ! {
         iommu::init(&bi, &k.phys, table, &mut reserved);
     }
     let t_iommu_done = rdtsc();
+    let described = cpus;
+    let cpus = if cpus > 1 { smp::wait(cpus, hz) } else { 1 };
+    let smp_done = rdtsc();
+    if cpus < described {
+        klog!(k, "kernel: {cpus} of the {described} processors the firmware describes started; the others are not used");
+    }
+    k.set_cpu_count(cpus);
     let regions = table.as_slice();
     let usable: u64 = regions.iter().filter(|r| r.kind == 1).map(|r| r.len).sum();
     klog!(k, "silica: {} MiB free, {} processors, clock {} Hz, kernel slide {:#x}", usable >> 20, cpus, hz, bi.kernel_slide);
@@ -1401,9 +1517,19 @@ pub extern "C" fn kmain(info: u64) -> ! {
         );
     }
     if m & 16 != 0 {
+        // Every program could read all of memory: the kernel and the physical
+        // map stay mapped in every address space (no kernel page-table
+        // isolation yet). Not run unless the owner says so, knowing it.
+        if Cmdline(cmdline).get("meltdown") != Some(b"accept") {
+            klog!(
+                k,
+                "ERROR: kernel: this processor is affected by Meltdown and Silica does not isolate kernel page tables: any program could read all of memory. Not started; `meltdown=accept` on the kernel command line runs it anyway"
+            );
+            die();
+        }
         klog!(
             k,
-            "WARNING: kernel: this processor is affected by Meltdown and Silica does not isolate kernel page tables; do not run untrusted code on it"
+            "WARNING: kernel: this processor is affected by Meltdown and Silica does not isolate kernel page tables; the owner accepted that any program can read all of memory (meltdown=accept)"
         );
     }
     if Cmdline(cmdline).get("panic") == Some(b"test") {
@@ -1413,8 +1539,14 @@ pub extern "C" fn kmain(info: u64) -> ! {
         deliberate_null_access(k);
     }
 
+    // Nothing in the archive runs, the root task included, unless the whole
+    // of it is as the image builder wrote it (`ramdisk::check`).
+    if let Err(why) = kernel_core::ramdisk::check(ramdisk, crc32c) {
+        klog!(k, "ERROR: kernel: no root task: the boot archive is refused: {why}");
+        die();
+    }
     let Some(image) = kernel_core::ramdisk::find(ramdisk, "root") else {
-        klog!(k, "ERROR: kernel: no root task: the ramdisk is missing, malformed, or has no entry named \"root\"");
+        klog!(k, "ERROR: kernel: no root task: the boot archive has no entry named \"root\"");
         die();
     };
     // Device memory is handed out as far as the processor's addresses go:
@@ -1442,22 +1574,21 @@ pub extern "C" fn kmain(info: u64) -> ! {
         klog!(k, "ERROR: kernel: cannot start the root task: {e:?}");
         die();
     }
-    let smp_from = rdtsc();
-    smp::start(hz);
     // Where the boot's time went, by this processor's counter: the loader
     // (from its start to the kernel's: mostly the firmware's own exit, which
-    // the loader's line breaks down), the kernel up to starting the other
-    // processors (of which the IOMMU's set-up), and starting them.
+    // the loader's line breaks down), the kernel (of which the IOMMU's
+    // set-up), and the other processors, from waking them to the last one
+    // counted (they come up while the IOMMU is set up).
     let us = |a: u64, b: u64| b.wrapping_sub(a) / (hz / 1_000_000).max(1);
     let now = rdtsc();
     klog!(
         k,
         "kernel: boot: loader {} us, kernel {} us (the IOMMU {} us), {} processors started in {} us",
         us(bi.loader_tsc, entered),
-        us(entered, smp_from),
+        us(entered, now),
         us(t_iommu, t_iommu_done),
         cpus,
-        us(smp_from, now)
+        us(smp_from, smp_done)
     );
     // The screen is the display driver's from here.
     fbcon::release();
@@ -1480,4 +1611,253 @@ fn changed(words: &[kernel_core::hal::Watched]) -> bool {
         let v = unsafe { w.at.read_volatile() };
         v & w.mask != w.seen
     })
+}
+
+/// Continue a CRC32C over `data` with the processor's instruction (SSE4.2,
+/// which `kernel_core::x86` requires): eight bytes an instruction, a boot
+/// archive of a few megabytes in a fraction of a millisecond.
+fn crc32c(state: u32, data: &[u8]) -> u32 {
+    let (words, tail) = data.as_chunks::<8>();
+    let mut c = state as u64;
+    for w in words {
+        // SAFETY: CRC32 only computes on registers.
+        unsafe { asm!("crc32 {c}, {v}", c = inout(reg) c, v = in(reg) u64::from_le_bytes(*w), options(pure, nomem, nostack)) }
+    }
+    let mut c = c as u32;
+    for &b in tail {
+        // SAFETY: as above.
+        unsafe { asm!("crc32 {c:e}, {b}", c = inout(reg) c, b = in(reg_byte) b, options(pure, nomem, nostack)) }
+    }
+    c
+}
+
+/// The timer fired: feed the console what waits, and while something
+/// still does, keep the timer armed for it (the scheduler arms it only for
+/// its own deadlines, and `set_timer` takes the console's into account).
+fn console_tick(k: &kernel_core::Kernel<X86>) {
+    report_nmis(k);
+    serial::drain(k.hal.now());
+    if serial::due() != u64::MAX {
+        k.hal.set_timer(u64::MAX);
+    }
+}
+
+// ---- Machine checks, NMIs, and stopping the machine -----------------------
+
+const MSR_MCG_CAP: u32 = 0x179;
+const MSR_MCG_STATUS: u32 = 0x17A;
+const MSR_MCG_CTL: u32 = 0x17B;
+/// Bank `i`'s control, status and address registers.
+const fn mc_ctl(i: u32) -> u32 {
+    0x400 + 4 * i
+}
+const fn mc_status(i: u32) -> u32 {
+    0x401 + 4 * i
+}
+const fn mc_addr(i: u32) -> u32 {
+    0x402 + 4 * i
+}
+/// MCi_STATUS: valid, uncorrected, processor context corrupt, address valid.
+const MCI_VAL: u64 = 1 << 63;
+const MCI_UC: u64 = 1 << 61;
+const MCI_PCC: u64 = 1 << 57;
+const MCI_ADDRV: u64 = 1 << 58;
+/// MCG_STATUS: the interrupted instruction can be restarted.
+const MCG_RIPV: u64 = 1;
+
+/// Every machine-check bank reports. On the boot processor, errors left
+/// from before (a previous boot's, the firmware's) are said and cleared.
+fn init_mca(first: bool) {
+    let cap = rdmsr(MSR_MCG_CAP);
+    let banks = (cap & 0xFF) as u32;
+    if cap & 1 << 8 != 0 {
+        mc_write(MSR_MCG_CTL, u64::MAX);
+    }
+    for i in 0..banks {
+        let status = rdmsr(mc_status(i));
+        if first && status & MCI_VAL != 0 {
+            klog!(kernel(), "kernel: machine-check bank {i} holds an error from before this boot: status {status:#x}");
+        }
+        mc_write(mc_ctl(i), u64::MAX);
+        mc_write(mc_status(i), 0);
+    }
+}
+
+/// The worst error the banks hold now: (any valid, any uncorrected, any
+/// that corrupted the processor's context), with the first uncorrected
+/// one's status and address. The banks are cleared.
+fn take_machine_check() -> (bool, bool, bool, u64, u64) {
+    let banks = (rdmsr(MSR_MCG_CAP) & 0xFF) as u32;
+    let (mut any, mut uc, mut pcc, mut status, mut addr) = (false, false, false, 0, 0);
+    for i in 0..banks {
+        let s = rdmsr(mc_status(i));
+        if s & MCI_VAL == 0 {
+            continue;
+        }
+        any = true;
+        pcc |= s & MCI_PCC != 0;
+        if s & MCI_UC != 0 && !uc {
+            uc = true;
+            status = s;
+            addr = if s & MCI_ADDRV != 0 { rdmsr(mc_addr(i)) } else { 0 };
+        }
+        mc_write(mc_status(i), 0);
+    }
+    (any, uc, pcc, status, addr)
+}
+
+/// A machine check while a program ran. An error the processor corrected
+/// is said; one that corrupted the processor's context stops the machine;
+/// any other uncorrected error was consumed by the program (its memory, or
+/// what it was computing with), and is its fault: reported to its fault
+/// endpoint like any exception (vector 18, the bank's status), as a page
+/// fault would be, and the machine goes on.
+pub fn machine_check_user(k: &kernel_core::Kernel<X86>) {
+    let mcg = rdmsr(MSR_MCG_STATUS);
+    let (any, uc, pcc, status, addr) = take_machine_check();
+    mc_write(MSR_MCG_STATUS, 0);
+    if pcc || (uc && mcg & MCG_RIPV == 0) {
+        panic!("machine check: the processor's state is lost (bank status {status:#x}, address {addr:#x})");
+    }
+    if uc {
+        k.fault(silica_abi::Fault::Exception, 18, status);
+    } else if any {
+        klog!(k, "kernel: the processor corrected a machine-check error");
+    }
+}
+
+/// A machine check in the kernel: an error the processor corrected is
+/// said; any other stops the machine (the kernel's own state may be what
+/// was lost).
+pub fn machine_check_kernel() {
+    let (any, uc, _, status, addr) = take_machine_check();
+    mc_write(MSR_MCG_STATUS, 0);
+    if uc {
+        panic!("machine check in the kernel (bank status {status:#x}, address {addr:#x})");
+    }
+    if any {
+        NMI_PENDING.fetch_or(2, Ordering::Relaxed);
+    }
+}
+
+/// The machine is stopping (a panic): every other processor halts on the
+/// NMI it is sent.
+static PANICKING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// NMIs taken and not yet said, and corrected machine checks in the kernel
+/// (bit 1), said from a safe place (`report_nmis`): an NMI may arrive while
+/// its processor holds any lock, so it takes none.
+static NMI_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static NMI_REASON: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static NMI_PENDING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// An NMI, from user mode or the kernel. While the machine stops it is
+/// the request to halt; otherwise it is a platform's report (a parity or
+/// channel error, a watchdog), counted with its reason and said later.
+/// Takes no lock and needs no per-processor data.
+pub fn nmi() {
+    if PANICKING.load(Ordering::Acquire) {
+        loop {
+            // SAFETY: stopping this processor for good.
+            unsafe { asm!("cli", "hlt", options(nomem, nostack)) }
+        }
+    }
+    // The legacy NMI status: bit 7 memory parity (SERR#), bit 6 I/O channel check.
+    let reason = serial::inb(0x61) & 0xC0;
+    NMI_REASON.fetch_or(reason as u64, Ordering::Relaxed);
+    NMI_COUNT.fetch_add(1, Ordering::Relaxed);
+    NMI_PENDING.fetch_or(1, Ordering::Relaxed);
+}
+
+/// Say the NMIs and corrected machine checks taken since the last time.
+fn report_nmis(k: &kernel_core::Kernel<X86>) {
+    if NMI_PENDING.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let pending = NMI_PENDING.swap(0, Ordering::Relaxed);
+    if pending & 1 != 0 {
+        let (n, r) = (NMI_COUNT.swap(0, Ordering::Relaxed), NMI_REASON.swap(0, Ordering::Relaxed));
+        klog!(
+            k,
+            "kernel: {n} NMI(s) from the platform{}{}",
+            if r & 0x80 != 0 { "; a memory parity error was reported (SERR#)" } else { "" },
+            if r & 0x40 != 0 { "; an I/O channel check was reported" } else { "" }
+        );
+    }
+    if pending & 2 != 0 {
+        klog!(k, "kernel: the processor corrected a machine-check error in the kernel");
+    }
+}
+
+/// Stop every other processor before this one says why the machine stops:
+/// none goes on in a kernel whose state is no longer known. An NMI reaches
+/// them whatever they are doing; each halts (`nmi`).
+fn stop_others() {
+    if PANICKING.swap(true, Ordering::AcqRel) || !STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: the x2APIC interrupt command register: an NMI to every
+    // processor but this one (destination shorthand 0b11, delivery 0b100).
+    unsafe { wrmsr(0x830, 0xC_0400) };
+}
+
+/// Write a machine-check register.
+fn mc_write(msr: u32, v: u64) {
+    // SAFETY: only the machine-check MSRs, which exist (CPUID's MCE and MCA
+    // were checked before any is used): writing them configures reporting
+    // or clears a recorded error, and touches no memory.
+    unsafe { wrmsr(msr, v) }
+}
+
+/// Whether physical page `pa` is reached through the physical map uncached
+/// (PCD and PWT on its entry, at whatever level the walk ends): the loader
+/// maps device registers so (`map_physical`), and the kernel relies on it
+/// for every register it reaches through the map.
+pub(super) fn mapped_uncached(phys: &Phys, pa: u64) -> bool {
+    let va = PHYS_MAP_BASE + pa;
+    let mut table = cpu::read_cr3() & PTE_ADDR;
+    for l in (0..4).rev() {
+        // SAFETY: page-table pages of the kernel's own tables, reached
+        // through the physical map.
+        let e = unsafe { *phys.ptr(table + (va >> (12 + 9 * l) & 511) * 8).cast::<u64>() };
+        if e & PTE_P == 0 {
+            return false;
+        }
+        if l == 0 || e & PTE_PS != 0 {
+            return e & (1 << 4 | 1 << 3) == 1 << 4 | 1 << 3;
+        }
+        table = e & PTE_ADDR;
+    }
+    false
+}
+
+/// Say so, as an error, if the device registers at `pa` (`what`) would be
+/// reached cached.
+pub(super) fn check_uncached(phys: &Phys, pa: u64, what: &str) {
+    if !mapped_uncached(phys, pa) {
+        klog!(kernel(), "ERROR: kernel: {what} at {pa:#x} is mapped cacheable: its registers would be reached through the cache");
+    }
+}
+
+/// The timestamp counter's frequency measured against the ACPI PM timer at
+/// `port`: the median of three samples of 10 ms (35,795 of its ticks), so
+/// one disturbed sample (a firmware interrupt, a host preempting a virtual
+/// processor) does not become the clock's error for the machine's life.
+/// `None` when the timer does not count: a sample that has taken 2^33 TSC
+/// ticks (seconds at any frequency) is given up.
+fn pm_timer_hz(port: u16) -> Option<u64> {
+    let read = || kernel().hal.port_io(port, 4, false, 0) & 0xFF_FFFF;
+    let mut samples = [0u64; 3];
+    for s in &mut samples {
+        let start = read();
+        let t0 = rdtsc();
+        while read().wrapping_sub(start) & 0xFF_FFFF < 35_795 {
+            if rdtsc().wrapping_sub(t0) > 1 << 33 {
+                klog!(kernel(), "kernel: the ACPI PM timer does not count; the timestamp counter is not measured against it");
+                return None;
+            }
+        }
+        *s = (rdtsc() - t0) * 100;
+    }
+    samples.sort_unstable();
+    Some(samples[1])
 }

@@ -6,12 +6,12 @@
 //! becomes an object; the zeroing is done in pieces and remembered, so an
 //! interrupt can preempt a large `Retype` without repeating finished work.
 
-use crate::cap::{Cap, FLAG_IO, FLAG_KEPT};
+use crate::cap::{Cap, FLAG_IO, FLAG_ISOLATED, FLAG_KEPT};
 use crate::hal::Hal;
 use crate::kernel::{Exit, Kernel};
 use crate::mem::Paddr;
 use crate::vm::AsHeader;
-use silica_abi::{ASPACE_IO, ASPACE_MIN_BITS, Error, ObjectType, PAGE_BITS, RETYPE_MAX, Rights};
+use silica_abi::{ASPACE_IO, ASPACE_ISOLATED, ASPACE_MIN_BITS, Error, ObjectType, PAGE_BITS, RETYPE_MAX, Rights};
 
 /// Bytes zeroed between checks for a pending interrupt.
 const ZERO_CHUNK: u64 = 1 << 18;
@@ -37,6 +37,12 @@ impl<H: Hal> Kernel<H> {
         // An address space for devices: one more page than the smallest,
         // for the table it starts with, and only where an IOMMU exists.
         let io = ty == ObjectType::AddressSpace && bits & ASPACE_IO != 0;
+        // Isolated against speculation (`ASPACE_ISOLATED`): threads run in
+        // it, so never one for devices.
+        let isolated = ty == ObjectType::AddressSpace && bits & ASPACE_ISOLATED != 0;
+        if isolated && io {
+            return Err(Error::BadArg);
+        }
         if io && self.hal.io_top() == 0 {
             return Err(Error::Unsupported);
         }
@@ -96,6 +102,11 @@ impl<H: Hal> Kernel<H> {
                         self.init_io_space(obj);
                     } else {
                         self.hal.init_root(&self.phys, obj + (1 << PAGE_BITS));
+                        if isolated {
+                            cap.flags |= FLAG_ISOLATED;
+                            // Before any thread can run in it: switches look from now on.
+                            self.isolating.store(true, core::sync::atomic::Ordering::Release);
+                        }
                     }
                 }
                 _ => {}

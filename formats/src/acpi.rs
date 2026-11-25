@@ -273,6 +273,59 @@ pub fn power(fadt: &[u8]) -> Option<Power> {
     Some(p)
 }
 
+/// The ITS DeviceID of the PCI function with requester ID `rid` in segment
+/// `segment`, as the firmware's I/O Remapping Table (`iort`, the whole
+/// table) maps it: through the root complex node of that segment and, where
+/// one is between, an SMMU node, to an ITS group. `None` when the table maps
+/// that function to no ITS: the device cannot raise message interrupts, and
+/// no other device's identity is assumed for it.
+pub fn iort_its_device(iort: &[u8], segment: u32, rid: u32) -> Option<u32> {
+    let count = u32_at(iort, 36)? as usize;
+    let first = u32_at(iort, 40)? as usize;
+    // The node at `at`: (type, its ID mappings' offset and count).
+    let node = |at: usize| -> Option<(u8, usize, usize)> {
+        let len = u16::from_le_bytes(iort.get(at + 1..at + 3)?.try_into().ok()?) as usize;
+        if len < 16 || at.checked_add(len)? > iort.len() {
+            return None;
+        }
+        Some((iort[at], u32_at(iort, at + 12)? as usize, u32_at(iort, at + 8)? as usize))
+    };
+    // The root complex node of the segment (type 2, segment at 28).
+    let mut at = first;
+    let mut rc = None;
+    for _ in 0..count.min(1024) {
+        let (ty, _, _) = node(at)?;
+        if ty == 2 && u32_at(iort, at + 28) == Some(segment) {
+            rc = Some(at);
+            break;
+        }
+        at = at.checked_add(u16::from_le_bytes(iort.get(at + 1..at + 3)?.try_into().ok()?) as usize)?;
+    }
+    let (mut at, mut id) = (rc?, rid);
+    // An ID mapping: input base, number of IDs (less one), output base,
+    // output node, flags (bit 0: a single mapping, for the node itself).
+    for _ in 0..4 {
+        let (_, maps, n) = node(at)?;
+        let mut next = None;
+        for i in 0..n.min(4096) {
+            let m = at.checked_add(maps)?.checked_add(i * 20)?;
+            let (base, ids, out, to, flags) =
+                (u32_at(iort, m)?, u32_at(iort, m + 4)?, u32_at(iort, m + 8)?, u32_at(iort, m + 12)? as usize, u32_at(iort, m + 16)?);
+            if flags & 1 == 0 && id >= base && id - base <= ids {
+                next = Some((to, out.checked_add(id - base)?));
+                break;
+            }
+        }
+        let (to, out) = next?;
+        match node(to)?.0 {
+            0 => return Some(out),         // an ITS group
+            3 | 4 => (at, id) = (to, out), // an SMMU: on through its mappings
+            _ => return None,
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,5 +475,85 @@ mod tests {
         assert_eq!(find_table(&mut read, 0x100, b"MCFG"), None);
         assert_eq!(dsdt(&mut read, 0x100), Some((0x600, d.len() as u32)));
         assert_eq!(find_table(&mut read, 0x101, b"SPCR"), None);
+    }
+}
+
+#[cfg(test)]
+mod iort_tests {
+    use super::iort_its_device;
+
+    /// An IORT: (offset, bytes) nodes appended after the 48-byte header.
+    fn iort(nodes: &[std::vec::Vec<u8>]) -> std::vec::Vec<u8> {
+        let mut t = std::vec![0u8; 48];
+        t[..4].copy_from_slice(b"IORT");
+        t[36..40].copy_from_slice(&(nodes.len() as u32).to_le_bytes());
+        t[40..44].copy_from_slice(&48u32.to_le_bytes());
+        for n in nodes {
+            t.extend_from_slice(n);
+        }
+        let len = t.len() as u32;
+        t[4..8].copy_from_slice(&len.to_le_bytes());
+        t
+    }
+
+    /// A node of type `ty`, `data` bytes of its own from 16, then mappings
+    /// (input base, count less one, output base, output node, flags).
+    fn node(ty: u8, data: &[u8], maps: &[(u32, u32, u32, u32, u32)]) -> std::vec::Vec<u8> {
+        let maps_at = 16 + data.len();
+        let len = maps_at + 20 * maps.len();
+        let mut n = std::vec![0u8; 16];
+        n[0] = ty;
+        n[1..3].copy_from_slice(&(len as u16).to_le_bytes());
+        n[8..12].copy_from_slice(&(maps.len() as u32).to_le_bytes());
+        n[12..16].copy_from_slice(&(maps_at as u32).to_le_bytes());
+        n.extend_from_slice(data);
+        for m in maps {
+            for v in [m.0, m.1, m.2, m.3, m.4] {
+                n.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        n
+    }
+
+    fn rc_data(segment: u32) -> std::vec::Vec<u8> {
+        let mut d = std::vec![0u8; 20];
+        d[12..16].copy_from_slice(&segment.to_le_bytes()); // at 28 in the node
+        d
+    }
+
+    #[test]
+    fn a_requester_id_is_mapped_through_the_root_complex_and_an_smmu() {
+        // ITS group at 48 (20 bytes: one ITS), SMMUv3 after it, root complex last.
+        let its = node(0, &[1, 0, 0, 0], &[]);
+        let its_at = 48u32;
+        let smmu_at = its_at + its.len() as u32;
+        let smmu = node(4, &[0; 52], &[(0x1_0000, 0xFFFF, 0x20_0000, its_at, 0)]);
+        let rc_at = smmu_at + smmu.len() as u32;
+        // Segment 0: requester IDs 0 to 0xFF through the SMMU (offset by
+        // 0x1_0000), 0x100 up directly to the ITS (offset by 0x4000).
+        let rc = node(2, &rc_data(0), &[(0, 0xFF, 0x1_0000, smmu_at, 0), (0x100, 0xFEFF, 0x4100, its_at, 0)]);
+        let _ = rc_at;
+        let t = iort(&[its, smmu, rc]);
+        assert_eq!(iort_its_device(&t, 0, 0x18), Some(0x20_0018), "through the SMMU");
+        assert_eq!(iort_its_device(&t, 0, 0x100), Some(0x4100), "directly");
+        assert_eq!(iort_its_device(&t, 0, 0x1_0000), None, "a requester ID the table does not map");
+        assert_eq!(iort_its_device(&t, 1, 0x18), None, "a segment with no root complex node");
+    }
+
+    #[test]
+    fn a_malformed_table_maps_nothing() {
+        let its = node(0, &[1, 0, 0, 0], &[]);
+        let rc = node(2, &rc_data(0), &[(0, 0xFFFF, 0, 48, 0)]);
+        let good = iort(&[its.clone(), rc.clone()]);
+        assert_eq!(iort_its_device(&good, 0, 7), Some(7));
+        for cut in 0..good.len() {
+            let _ = iort_its_device(&good[..cut], 0, 7); // never a panic
+        }
+        // A mapping pointing outside the table, and a node that loops.
+        let bad = iort(&[its, node(2, &rc_data(0), &[(0, 0xFFFF, 0, 0xFFFF_FFF0, 0)])]);
+        assert_eq!(iort_its_device(&bad, 0, 7), None);
+        let rc_at = 48 + 20;
+        let looping = iort(&[node(0, &[1, 0, 0, 0], &[]), node(4, &[0; 52], &[(0, 0xFFFF, 0, rc_at as u32, 0)])]);
+        assert_eq!(iort_its_device(&looping, 0, 7), None);
     }
 }

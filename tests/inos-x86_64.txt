@@ -3,6 +3,8 @@
 # A test that names none runs twice: on one processor and on four.
 # "quiet" marks a test that judges a time (a scheduling latency): the
 # harness runs it with nothing beside it, where the others run at once.
+# "mce" and "nmi": the harness injects a machine check on processor 1, or an
+# NMI to every processor, once the test says it is ready (`inos_machine`).
 # "progress" marks a test that says how far it got every ten seconds and
 # fails when it stops getting anywhere: the harness ends it after a minute
 # of silence rather than at a total time.
@@ -34,3 +36,6 @@ smp_timeouts smp=8 progress
 entropy
 console
 sched quiet
+machine_check smp=2 mce
+nmi smp=2 nmi
+isolated

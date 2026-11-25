@@ -7,14 +7,13 @@
 //! begins in real mode in a page below 1 MiB (`TRAMPOLINE`), gets to long
 //! mode on a throw-away page table, jumps to `ap_entry` in the kernel,
 //! finds its stack by its APIC identifier and joins the scheduler. The boot
-//! processor does not wait for them: a thread placed on a processor that is
-//! not up yet runs when it arrives.
+//! processor closes admission before giving userspace its processor count.
 
 use super::cpu::{self, Tables, cpuid, rdtsc, wrmsr};
 use super::{PTE_ADDR, PTE_P, PTE_W};
 use core::arch::global_asm;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_core::boot::BootInfo;
 use kernel_core::boot::RegionTable;
 use kernel_core::mem::Phys;
@@ -115,9 +114,29 @@ unsafe extern "C" {
     static ap_entry: u8;
 }
 
-extern "C" fn ap_main(index: usize) -> ! {
+/// The secondaries that arrived (`kernel_core::smp::Admission`).
+static ADMISSION: kernel_core::smp::Admission = kernel_core::smp::Admission::new();
+
+/// A secondary, in its slot `slot` (its stacks and tables), arrives: it
+/// takes the next index, or stops for good if the boot processor has
+/// already closed the count (said by `wait`).
+extern "C" fn ap_main(slot: usize) -> ! {
+    // A processor whose counter disagrees is not admitted (said by `wait`).
+    if !tsc_agrees() {
+        TSC_REJECTED.fetch_add(1, Ordering::Relaxed);
+        loop {
+            // SAFETY: stopping this processor, touching nothing.
+            unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) }
+        }
+    }
+    let Some(index) = ADMISSION.admit() else {
+        loop {
+            // SAFETY: stopping this processor, touching nothing.
+            unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) }
+        }
+    };
     // SAFETY: the slot was filled for this processor before it was started.
-    let slot = unsafe { (*SLOTS.0.get())[index - 1] };
+    let slot = unsafe { (*SLOTS.0.get())[slot - 1] };
     // SAFETY: this processor's own tables and stacks, on its first and only pass here.
     unsafe { cpu::init(slot.tables as *mut Tables, index, slot.apic_id as u32, (slot.stack_base, slot.stack_top), slot.ist_top) };
     super::init_processor(false);
@@ -142,11 +161,13 @@ fn madt_processors(bi: &BootInfo, phys: &Phys, out: &mut [u32; MAX_CPUS]) -> usi
         // Type 0: local APIC (8-bit identifier). Type 9: local x2APIC.
         // Flags bit 0: enabled; bit 1: can be enabled later.
         match ty {
-            0 if len >= 8 && u32_at(4) & 3 != 0 => {
+            // Enabled processors only: one the firmware lists as online
+            // capable but not enabled (a hot-plug slot) is not there.
+            0 if len >= 8 && u32_at(4) & 1 != 0 => {
                 out[n] = e[3] as u32;
                 n += 1;
             }
-            9 if len >= 16 && u32_at(8) & 3 != 0 => {
+            9 if len >= 16 && u32_at(8) & 1 != 0 => {
                 out[n] = u32_at(4);
                 n += 1;
             }
@@ -252,6 +273,11 @@ pub fn start(tsc_hz: u64) {
     if page == 0 {
         return;
     }
+    TSC_HZ.store(tsc_hz, Ordering::Relaxed);
+    if cpuid(7, 0)[1] & 1 << 1 != 0 {
+        BSP_ADJUST.store(cpu::rdmsr(MSR_TSC_ADJUST), Ordering::Relaxed);
+        HAS_ADJUST.store(true, Ordering::Release);
+    }
     // On hardware a processor needs 10 ms between INIT and STARTUP and
     // 200 us between the two STARTUPs; a hypervisor's virtual processors need none.
     let wait = |us: u64| {
@@ -272,3 +298,70 @@ pub fn start(tsc_hz: u64) {
         wrmsr(0x830, 0xC_4600 | page >> 12);
     }
 }
+
+/// Wait for the `expected - 1` secondaries `start` woke, then close the
+/// count: the number of processors the machine has, the boot one included,
+/// which is what the root task is told. Waits while they keep arriving: a
+/// second with none arriving ends it (on hardware each takes well under a
+/// millisecond; an emulated machine of many processors takes longer, but
+/// steadily).
+pub fn wait(expected: usize, tsc_hz: u64) -> usize {
+    let mut last = (ADMISSION.arrived(), rdtsc());
+    while ADMISSION.arrived() + TSC_REJECTED.load(Ordering::Relaxed) + 1 < expected {
+        // What an arriving processor compares its counter with (`ap_main`).
+        BSP_TSC.store(ordered_tsc(), Ordering::Release);
+        let now = (ADMISSION.arrived(), rdtsc());
+        if now.0 != last.0 {
+            last = now;
+        } else if now.1.wrapping_sub(last.1) > tsc_hz {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let n = ADMISSION.close();
+    let rejected = TSC_REJECTED.load(Ordering::Relaxed);
+    if rejected != 0 {
+        kernel_core::klog!(
+            super::kernel(),
+            "ERROR: kernel: could not verify timestamp synchronization on {rejected} processor(s); they are not used"
+        );
+    }
+    n
+}
+
+const MSR_TSC_ADJUST: u32 = 0x3B;
+/// The counter's frequency, the boot processor's IA32_TSC_ADJUST (where
+/// processors have it), and the counter it publishes while it waits for
+/// the others (0: not yet waiting).
+static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+static HAS_ADJUST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static BSP_ADJUST: AtomicU64 = AtomicU64::new(0);
+static BSP_TSC: AtomicU64 = AtomicU64::new(0);
+
+/// The timestamp counter, read after everything before it (LFENCE).
+fn ordered_tsc() -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: the fences keep the counter read between the shared-memory
+    // operations that bracket it. The compiler must preserve that order too.
+    unsafe { core::arch::asm!("lfence", "rdtsc", "lfence", out("eax") lo, out("edx") hi, options(nostack, preserves_flags)) };
+    (hi as u64) << 32 | lo as u64
+}
+
+/// Whether this processor's timestamp counter agrees with the boot
+/// processor's: the kernel's clock is one counter read on whichever
+/// processor asks, so counters that differ make time run backwards for a
+/// thread that moves. First this processor's IA32_TSC_ADJUST is made the
+/// boot processor's (firmware may leave them different; Linux does the
+/// same), then its counter is compared with the one the boot processor
+/// publishes as it waits. A fresh remote sample must fit between two reads
+/// of the local counter at most 50 us apart.
+fn tsc_agrees() -> bool {
+    if HAS_ADJUST.load(Ordering::Acquire) {
+        // SAFETY: IA32_TSC_ADJUST exists on this processor as on the boot
+        // processor (the same model); writing it moves this counter only.
+        unsafe { wrmsr(MSR_TSC_ADJUST, BSP_ADJUST.load(Ordering::Relaxed)) };
+    }
+    kernel_core::x86::counters_agree(ordered_tsc, || BSP_TSC.load(Ordering::Acquire), TSC_HZ.load(Ordering::Relaxed))
+}
+/// Processors whose counters could not be verified before the deadline.
+static TSC_REJECTED: AtomicUsize = AtomicUsize::new(0);

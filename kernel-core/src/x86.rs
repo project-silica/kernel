@@ -69,3 +69,65 @@ pub fn check(cpuid: impl Fn(u32, u32) -> Leaf) -> Verdict {
     }
     Verdict { missing, tsc_trusted: missing.is_none() && !invariant && hypervisor }
 }
+
+/// What to do with an IOMMU unit (a DMAR hardware unit definition) at
+/// register base `base` of PCI segment `segment`, `driven` units of
+/// segment 0 being driven already, at most `max`, with the physical map
+/// reaching `limit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnitUse {
+    /// Drive it: its devices are confined.
+    Drive,
+    /// A unit of another segment: started with an empty root table, so its
+    /// devices reach nothing (the kernel does not drive other segments).
+    Block,
+    /// A unit of segment 0 that cannot be driven (registers out of reach or
+    /// misaligned, or one too many): its devices would reach memory
+    /// whatever their drivers attach them to, so the machine must confine
+    /// none and say so.
+    Undriven,
+    /// A unit of another segment out of reach: that segment's devices are
+    /// not confined (and the kernel attaches none of them).
+    Unreachable,
+}
+
+/// Decide [`UnitUse`] for one unit.
+pub fn unit_use(base: u64, segment: u64, limit: u64, driven: usize, max: usize) -> UnitUse {
+    let fits = base != 0 && base.is_multiple_of(4096) && base.checked_add(4096).is_some_and(|e| e <= limit);
+    match (segment, fits) {
+        (0, true) if driven < max => UnitUse::Drive,
+        (0, _) => UnitUse::Undriven,
+        (_, true) => UnitUse::Block,
+        (_, false) => UnitUse::Unreachable,
+    }
+}
+
+/// Compare a remote timestamp sampled between two local counter reads.
+/// Waiting for two distinct publications excludes a timestamp that was
+/// already sampled, but not yet published, at the first local read.
+/// A long scheduling delay makes the sample inconclusive.
+pub fn counters_agree(mut local: impl FnMut() -> u64, mut published: impl FnMut() -> u64, hz: u64) -> bool {
+    let start = local();
+    loop {
+        let before = local();
+        let mut sample = published();
+        for _ in 0..2 {
+            let previous = sample;
+            while sample == previous {
+                if local().wrapping_sub(start) >= hz {
+                    return false;
+                }
+                core::hint::spin_loop();
+                sample = published();
+            }
+        }
+        let after = local();
+        let elapsed = after.wrapping_sub(before);
+        if elapsed <= hz / 20_000 && sample.wrapping_sub(before) <= elapsed {
+            return true;
+        }
+        if after.wrapping_sub(start) >= hz {
+            return false;
+        }
+    }
+}

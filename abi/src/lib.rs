@@ -326,6 +326,16 @@ pub const IRQ_MSI: u64 = 4;
 /// for devices. Frames are mapped in it for the devices attached to it
 /// (`DeviceAttach`) to reach by DMA; no thread can run in it.
 pub const ASPACE_IO: u64 = 1 << 8;
+/// `Retype` of an AddressSpace, added to the size in bits: an address space
+/// isolated from the others against speculative execution. Whenever a
+/// processor switches into or out of it, the indirect branch predictors are
+/// flushed (IBPB, or the firmware's equivalent) and the return stack
+/// refilled, and while it runs the processor's sibling thread cannot steer
+/// its branches (STIBP) nor its loads bypass earlier stores (SSBD). For
+/// programs that hold secrets (keys, credentials); it costs every switch
+/// into and out of them a few microseconds, and others nothing. Not with
+/// [`ASPACE_IO`].
+pub const ASPACE_ISOLATED: u64 = 1 << 9;
 /// `Console`: more of the same text follows this piece (bit 63 of `a1`).
 pub const CONSOLE_MORE: u64 = 1 << 63;
 
@@ -389,7 +399,7 @@ impl ObjectType {
             Self::Untyped if (SLOT_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => Ok(bits as u8),
             Self::Frame if (PAGE_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => Ok(bits as u8),
             Self::CapSpace if (1..=32).contains(&bits) => Ok(bits as u8 + SLOT_BITS),
-            Self::AddressSpace if (ASPACE_MIN_BITS as u64..=30).contains(&(bits & !ASPACE_IO)) => Ok(bits as u8),
+            Self::AddressSpace if (ASPACE_MIN_BITS as u64..=30).contains(&(bits & !(ASPACE_IO | ASPACE_ISOLATED))) => Ok(bits as u8),
             Self::Thread => Ok(THREAD_BITS),
             Self::Endpoint | Self::Notification => Ok(ENDPOINT_BITS),
             Self::SchedContext => Ok(SCHED_BITS),

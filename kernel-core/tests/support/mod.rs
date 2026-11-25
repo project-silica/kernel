@@ -164,6 +164,12 @@ impl Hal for TestHal {
         self.irq_log.borrow_mut().push(format!("message {line} cpu{cpu} from {source:#x}"));
         Some((0xFEE0_0000 | (cpu as u64) << 12, 0x30 + line as u64))
     }
+    fn msi_release(&self, line: usize) {
+        self.irq_log.borrow_mut().push(format!("release {line}"));
+    }
+    fn isolate(&self, entering: bool) {
+        self.irq_log.borrow_mut().push(format!("isolate {entering}"));
+    }
     fn init_root(&self, phys: &Phys, root: Paddr) {
         for (c, loaded) in self.roots.iter().enumerate() {
             assert_ne!(loaded.get(), root, "a root is built in memory processor {c} still runs on");

@@ -123,6 +123,10 @@ pub trait Hal {
     fn msi_route(&self, _line: usize, _cpu: usize, _source: u64) -> Option<(u64, u64)> {
         None
     }
+    /// Message line `line` is unbound: no device may raise it any more, and
+    /// whatever the machine kept for routing it (an interrupt remapping
+    /// entry, an ITS mapping and its device's table) is given back.
+    fn msi_release(&self, _line: usize) {}
 
     /// Fill a new root table with the kernel's half of the address space.
     fn init_root(&self, phys: &Phys, root: Paddr);
@@ -133,6 +137,16 @@ pub trait Hal {
     /// state (when not 0), load `to`'s, and switch to address-space root
     /// `root` (0: kernel mappings only).
     fn switch_thread(&self, phys: &Phys, from: Paddr, to: Paddr, root: Paddr);
+    /// This processor is switching between address spaces of which one, at
+    /// least, is isolated against speculative execution (`ASPACE_ISOLATED`;
+    /// `entering`: the one it switches to is): nothing the previous one
+    /// trained in the branch predictors or the return stack may steer the
+    /// next, and while an isolated one runs its sibling thread may not steer
+    /// it nor its loads bypass earlier stores. Called before
+    /// [`Hal::switch_thread`].
+    fn isolate(&self, entering: bool) {
+        let _ = entering;
+    }
     /// Leave address-space root `root` if this processor has it loaded,
     /// for the kernel's mappings only (what `switch_thread` loads for root 0).
     fn leave_aspace(&self, root: Paddr);

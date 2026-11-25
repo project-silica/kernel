@@ -166,6 +166,55 @@ impl Tables<'_> {
             off += HUGE;
         }
     }
+    /// Map `[0, top)` at `virt`: what the firmware's memory map (`ram`: of a
+    /// range, whether it is memory throughout, `Some(true)`, none of it,
+    /// `Some(false)`, or a mix) says is memory as ordinary write-back
+    /// memory, and the rest (device registers, reserved ranges, holes)
+    /// uncached, in 2 MiB pages where a block is all one or the other and 4
+    /// KiB pages where it is mixed. Device registers the kernel reaches
+    /// through this map (the I/O APIC, the IOMMUs) are then uncached
+    /// whatever the firmware's memory-type ranges say. The framebuffer
+    /// (`fb`: base and length) is write-combining: the kernel's console
+    /// writes it a pixel at a time, which uncached would take seconds a
+    /// screen.
+    #[cfg(target_arch = "x86_64")]
+    fn map_physical(&self, virt: u64, top: u64, fb: (u64, u64), ram: impl Fn(u64, u64) -> Option<bool>) {
+        let in_fb = |a: u64| fb.1 != 0 && a >= fb.0 && a - fb.0 < fb.1;
+        let touches_fb = |a: u64, len: u64| fb.1 != 0 && a < fb.0.saturating_add(fb.1) && fb.0 < a + len;
+        let mut at = 0;
+        while at < top {
+            let v = virt + at;
+            let pdpt = self.next(self.entry(self.root_for(v), v >> 39 & 511));
+            let pd = self.next(self.entry(pdpt, v >> 30 & 511));
+            // The first 2 MiB in pages, page 0 left out: physical page 0 is
+            // never an object, so a null object address faults (the kernel
+            // relies on it).
+            match if at == 0 || touches_fb(at, HUGE) { None } else { ram(at, HUGE) } {
+                // SAFETY: as in `next`.
+                Some(true) => unsafe { *self.entry(pd, v >> 21 & 511) = arch::block(at, true, true) },
+                // SAFETY: as in `next`.
+                Some(false) => unsafe { *self.entry(pd, v >> 21 & 511) = arch::block_device(at) },
+                None => {
+                    let pt = self.next(self.entry(pd, v >> 21 & 511));
+                    for p in (0..HUGE).step_by(PAGE as usize) {
+                        if at + p == 0 {
+                            continue;
+                        }
+                        let e = if in_fb(at + p) {
+                            arch::page_framebuffer(at + p)
+                        } else if ram(at + p, PAGE) == Some(true) {
+                            arch::page(at + p, true, true)
+                        } else {
+                            arch::page_device(at + p)
+                        };
+                        // SAFETY: as in `next`.
+                        unsafe { *self.entry(pt, (v + p) >> 12 & 511) = e };
+                    }
+                }
+            }
+            at += HUGE;
+        }
+    }
     /// Map one 4 KiB page.
     fn map_page(&self, virt: u64, phys: u64, write: bool, exec: bool) {
         let pdpt = self.next(self.entry(self.root_for(virt), virt >> 39 & 511));
@@ -380,6 +429,27 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     // keeps running after the switch; the kernel removes the alias and makes
     // the rest non-executable.
     if arch::MAP_ALL {
+        #[cfg(target_arch = "x86_64")]
+        tables.map_physical(PHYS_MAP_BASE, top, (fb.0, fb.3 as u64 * fb.2 as u64 * 4), |at, len| {
+            // How much of `[at, at + len)` the firmware calls memory (any
+            // region but device, port and reserved ranges; a hole is none).
+            let mut covered = 0;
+            for i in 0..size / dsize {
+                // SAFETY: as above: descriptors the firmware wrote.
+                let d = unsafe { &*((map as usize + i * dsize) as *const efi::MemoryDescriptor) };
+                if kind_of(d.ty) == RegionKind::Firmware {
+                    continue;
+                }
+                let (s, e) = (d.phys.max(at), d.phys.saturating_add(d.pages.saturating_mul(PAGE)).min(at + len));
+                covered += e.saturating_sub(s);
+            }
+            match covered {
+                0 => Some(false),
+                c if c >= len => Some(true),
+                _ => None,
+            }
+        });
+        #[cfg(not(target_arch = "x86_64"))]
         tables.map_huge(PHYS_MAP_BASE, 0, top, true, true);
     } else {
         for i in 0..size / dsize {

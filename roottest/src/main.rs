@@ -1885,10 +1885,90 @@ fn t_entropy() -> T {
     Ok(())
 }
 
+/// A machine check consumed by a program is its fault, not the machine's:
+/// a thread spins on processor 1, the harness injects an uncorrected but
+/// recoverable machine check there once this says it is ready (`qemu.sh
+/// --on`, QEMU's `mce`), and the thread is stopped (it has no fault
+/// endpoint), while the machine, this thread included, goes on.
+#[cfg(target_arch = "x86_64")]
+fn t_machine_check() -> T {
+    let t = foreign_thread_on(1, stub(&raw const stub_spin, &raw const stub_spin_end), 0);
+    sleep_ms(50);
+    println!("MACHINE CHECK READY");
+    let end = CLOCK.now() + 20_000_000_000;
+    while inspect_thread(t).map(|i| i.state) == Ok(THREAD_RUNNABLE) {
+        if CLOCK.now() > end {
+            return Err("the thread that consumed the machine check was never stopped");
+        }
+        sleep_ms(10);
+    }
+    // SAFETY: the thread is stopped and used by nothing else.
+    let _ = unsafe { cap_delete(t) };
+    Ok(())
+}
+
+/// An NMI from the platform (QEMU's `nmi`, to every processor, sent by the
+/// harness once this says it is ready) is said and survived, wherever it
+/// lands: in user mode, the kernel or the idle wait.
+#[cfg(target_arch = "x86_64")]
+fn t_nmi() -> T {
+    let t = foreign_thread_on(1, stub(&raw const stub_spin, &raw const stub_spin_end), 0);
+    println!("NMI READY");
+    // Calls and sleeps across the NMIs' arrival, on both processors.
+    for _ in 0..200 {
+        sleep_ms(5);
+        let _ = inspect_thread(t).map_err(|_| "the spinning thread is gone")?;
+    }
+    // SAFETY: as above.
+    let _ = unsafe { cap_delete(t) };
+    Ok(())
+}
+
+/// An address space isolated against speculation (`ASPACE_ISOLATED`): a
+/// thread in one shares this processor with the root task's sleeps, so the
+/// kernel switches into and out of it again and again (the predictor
+/// barrier, the return-stack fill and the control bits, on the hardware
+/// this runs on); it runs, and so does everything else.
+fn t_isolated() -> T {
+    let s = slot();
+    retype_isolated_space(Cap(UNTYPED.load(SeqCst)), 16, SPACE, s).map_err(|_| "cannot make an isolated address space")?;
+    let frame = new(ObjectType::Frame, 12);
+    let at = region(1 << 12);
+    let code = stub(&raw const stub_spin, &raw const stub_spin_end);
+    map(ASPACE, frame, at, RW).map_err(|_| "map")?;
+    // SAFETY: one page mapped read-write at `at`; the code fits in it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, code.len());
+        arch::sync_code(at, code.len());
+        unmap(frame).map_err(|_| "unmap")?;
+    }
+    map(Cap(s), frame, 0x10_0000, Rights(5)).map_err(|_| "map code in the isolated space")?;
+    let t = new(ObjectType::Thread, 0);
+    thread_configure(t, SPACE, Cap(s), Cap::NONE, Cap::NONE).map_err(|_| "configure")?;
+    // SAFETY: the code runs at any address without a stack.
+    unsafe { thread_start(t, 0x10_0000, 0, 0, true) }.map_err(|_| "start")?;
+    for _ in 0..100 {
+        sleep_ms(2);
+    }
+    if inspect_thread(t).map(|i| i.state) != Ok(THREAD_RUNNABLE) {
+        return Err("the thread in the isolated address space stopped");
+    }
+    // SAFETY: used by nothing else.
+    unsafe {
+        let _ = cap_delete(t);
+        let _ = cap_delete(Cap(s));
+    }
+    Ok(())
+}
 const TESTS: &[(&str, fn() -> T)] = &[
     ("entropy", t_entropy),
     ("sched", t_sched),
     ("console", t_console),
+    ("isolated", t_isolated),
+    #[cfg(target_arch = "x86_64")]
+    ("machine_check", t_machine_check),
+    #[cfg(target_arch = "x86_64")]
+    ("nmi", t_nmi),
     ("syscall", t_syscall),
     ("fault_page", t_fault_page),
     ("fault_instruction", t_fault_instruction),

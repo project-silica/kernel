@@ -117,6 +117,11 @@ pub struct Cpu {
     pub(crate) loaded: Cell<Paddr>,
     /// The address-space root that is loaded.
     pub(crate) loaded_root: Cell<Paddr>,
+    /// `FLAG_ISOLATED` while the last address space it ran is isolated
+    /// against speculation (`ASPACE_ISOLATED`), else 0. Kept when the root
+    /// is forgotten (`forget_root`): the next switch, whatever it loads,
+    /// still leaves the isolated space's predictions behind.
+    pub(crate) isolated: Cell<u8>,
     pub(crate) rq_head: Cell<Paddr>,
     pub(crate) rq_tail: Cell<Paddr>,
     /// Threads with deadlines, soonest first.
@@ -187,6 +192,7 @@ impl Cpu {
             cur: Cell::new(0),
             loaded: Cell::new(0),
             loaded_root: Cell::new(0),
+            isolated: Cell::new(0),
             rq_head: Cell::new(0),
             rq_tail: Cell::new(0),
             timers: Cell::new(0),
@@ -210,6 +216,18 @@ impl Cpu {
             leave: crate::lock::Leave::new(),
         }
     }
+
+    /// Whether it has address-space root `root` loaded.
+    pub(crate) fn runs_on(&self, root: Paddr) -> bool {
+        self.loaded_root.get() == root
+    }
+
+    /// It no longer has a root loaded that it may keep using (the root was
+    /// destroyed, or its translations flushed): the next switch loads one.
+    /// Whether the last one was isolated is kept (`isolated`).
+    pub(crate) fn forget_root(&self) {
+        self.loaded_root.set(0);
+    }
 }
 
 impl<H: Hal> Kernel<H> {
@@ -225,13 +243,23 @@ impl<H: Hal> Kernel<H> {
 
     /// Number of processors the machine has (set once at boot).
     pub fn cpu_count(&self) -> usize {
-        self.ncpu.get()
+        self.ncpu()
     }
 
-    /// Tell the kernel how many processors there are. Called once by the
-    /// boot processor before any other processor enters the kernel.
+    /// Tell the kernel how many processors there are. Called by the boot
+    /// processor during boot only: with what the firmware describes before
+    /// the others start, and with how many arrived before the root task
+    /// starts (`Admission`), so a secondary may read either while it waits
+    /// for work; both are counts of processors whose state is initialised.
     pub fn set_cpu_count(&self, n: usize) {
-        self.ncpu.set(n.clamp(1, MAX_CPUS));
+        self.ncpu.store(n.clamp(1, MAX_CPUS), core::sync::atomic::Ordering::Release);
+    }
+
+    /// The number of processors, as last set (`set_cpu_count`). A plain
+    /// load on every architecture: as cheap as the field it was.
+    #[inline(always)]
+    pub(crate) fn ncpu(&self) -> usize {
+        self.ncpu.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn unlock(&self, cpu: usize) {
@@ -293,7 +321,7 @@ impl<H: Hal> Kernel<H> {
     fn catch_up(&self, me: &Cpu) {
         if me.flush.replace(false) {
             self.hal.tlb_reset();
-            me.loaded_root.set(0);
+            me.forget_root();
             me.dirty.set(true);
         }
     }
@@ -308,7 +336,7 @@ impl<H: Hal> Kernel<H> {
     /// everything it looked at before.
     pub(crate) fn go_global(&self) {
         let me = self.me();
-        crate::lock::go_global(&me.lock, self.cpus.iter(self.ncpu.get()).map(|c| &c.lock), || self.answer_leave(me));
+        crate::lock::go_global(&me.lock, self.cpus.iter(self.ncpu()).map(|c| &c.lock), || self.answer_leave(me));
         self.global.set(true);
         self.globals.set(self.globals.get() + 1);
         self.catch_up(me);
@@ -353,21 +381,63 @@ impl<H: Hal> Kernel<H> {
     /// (a statistic for tests and the debug console).
     /// Only for tests: call it while no processor is in the kernel.
     pub fn pair_entries(&self) -> u64 {
-        self.cpus.iter(self.ncpu.get()).map(|c| c.pairs.get()).sum()
+        self.cpus.iter(self.ncpu()).map(|c| c.pairs.get()).sum()
     }
 
     /// Back to holding only this processor's lock.
     pub(crate) fn go_local(&self) {
         let cpu = self.hal.cpu();
         self.global.set(false);
-        crate::lock::go_local(cpu, self.cpus.iter(self.ncpu.get()).map(|c| &c.lock));
+        crate::lock::go_local(cpu, self.cpus.iter(self.ncpu()).map(|c| &c.lock));
     }
 
     /// Every processor other than this one, with its index. Only for code
     /// holding all locks.
     pub(crate) fn others(&self) -> impl Iterator<Item = (usize, &Cpu)> {
         let me = self.hal.cpu();
-        debug_assert!(self.global.get() || self.ncpu.get() == 1);
-        self.cpus.iter(self.ncpu.get()).enumerate().filter(move |(i, _)| *i != me)
+        debug_assert!(self.global.get() || self.ncpu() == 1);
+        self.cpus.iter(self.ncpu()).enumerate().filter(move |(i, _)| *i != me)
+    }
+}
+
+/// Which processors joined the machine at boot. The firmware's table says
+/// which processors exist; a processor counts once it has arrived. Each
+/// secondary takes the next index as it arrives ([`Admission::admit`]), so
+/// the indices are contiguous whichever processors never start, and the
+/// boot processor closes the count ([`Admission::close`]) before the root
+/// task is told how many there are: no thread is ever placed on a
+/// processor that is not running. One that arrives after the count is
+/// closed is turned away and stays stopped.
+pub struct Admission(core::sync::atomic::AtomicU64);
+
+const CLOSED: u64 = 1 << 63;
+
+impl Admission {
+    /// No secondary has arrived.
+    pub const fn new() -> Admission {
+        Admission(core::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// A secondary processor arriving: its index (from 1), or `None` once
+    /// the count is closed (it must stop, touching nothing shared).
+    pub fn admit(&self) -> Option<usize> {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire};
+        self.0.try_update(AcqRel, Acquire, |v| (v & CLOSED == 0).then_some(v + 1)).ok().map(|v| v as usize + 1)
+    }
+
+    /// How many secondaries have arrived so far.
+    pub fn arrived(&self) -> usize {
+        (self.0.load(core::sync::atomic::Ordering::Acquire) & !CLOSED) as usize
+    }
+
+    /// Admit no more: the number of processors, the boot one included.
+    pub fn close(&self) -> usize {
+        (self.0.fetch_or(CLOSED, core::sync::atomic::Ordering::AcqRel) & !CLOSED) as usize + 1
+    }
+}
+
+impl Default for Admission {
+    fn default() -> Admission {
+        Admission::new()
     }
 }

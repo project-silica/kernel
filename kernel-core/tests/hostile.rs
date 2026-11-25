@@ -327,14 +327,16 @@ fn a_mapping_too_large_for_one_call_is_refused() {
 #[test]
 fn page_tables_are_given_back_when_their_mappings_go() {
     for (bits, io) in [(14u64, false), (20, false), (22, false), (20, true)] {
-        let m = Machine::new(64);
+        let m = Machine::new(if cfg!(miri) { 16 } else { 64 });
         let (ut, _) = m.big_untyped();
         m.retype(ut, T::AddressSpace, 18 | if io { silica_abi::ASPACE_IO } else { 0 }, FREE + 10, 1);
         m.retype(ut, T::Frame, bits, FREE, 1);
         let space = m.cap(FREE + 10).unwrap().obj;
         let step = 1u64 << bits.max(21);
         let mut at: u64 = if io { 0x40_0000 } else { 0x80_0000_0000 };
-        for cycle in 0..5000u64 {
+        // Under Miri (which checks the memory safety of the same path) a few
+        // hundred: past the 120 that ran a 2^20 frame's space out before.
+        for cycle in 0..if cfg!(miri) { 300u64 } else { 5000 } {
             let r = m.sys(S::Map, [FREE + 10, FREE, at, 3, 0, 0]);
             assert_eq!(r.status, 0, "2^{bits} (io {io}): {:?} after {cycle} cycles", Error::result(r.status));
             assert!(m.k.translate(space, at).is_some() || io);
@@ -360,4 +362,113 @@ fn the_boot_secret_is_in_no_frame_the_root_task_lends() {
     assert!(!info.windows(8).any(|w| secret.chunks(8).any(|c| c == w)), "the RootInfo frame holds the boot secret");
     let words: Vec<u64> = secret.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
     assert_eq!(m.start_args[1..5], words[..], "the root thread does not start with the boot secret");
+}
+
+/// A level-triggered driver acknowledges its line after every interrupt:
+/// that takes its own processor's lock, never every processor's (each
+/// acknowledgement made every other processor's kernel entries wait).
+#[test]
+fn acknowledging_an_interrupt_takes_only_its_processors_lock() {
+    let m = Machine::with_cpus(16, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.ok(S::IrqBind, [SLOT_IRQS, 5, FREE, IRQ_LEVEL, 0, 0]);
+    for _ in 0..10 {
+        m.irq(5);
+        m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+        let before = m.k.global_entries();
+        m.ok(S::IrqAck, [SLOT_IRQS, 5, 0, 0, 0, 0]);
+        assert_eq!(m.k.global_entries(), before, "an acknowledgement took every lock");
+    }
+    assert_eq!(m.k.hal.irq_log.borrow().last().map(String::as_str), Some("unmask 5"));
+    // A line not bound: nothing to let interrupt.
+    assert_eq!(m.err(S::IrqAck, [SLOT_IRQS, 300, 0, 0, 0, 0]), Error::BadArg);
+}
+
+/// Processors that never start are not counted, and indices stay
+/// contiguous: secondaries take indices as they arrive, the count is closed
+/// before the root task is told it, and a latecomer is turned away (it
+/// would otherwise be a processor nothing knows of, or one counted that
+/// never runs the threads placed on it).
+#[test]
+fn processors_are_counted_as_they_arrive_and_latecomers_are_turned_away() {
+    use kernel_core::smp::Admission;
+    let a = std::sync::Arc::new(Admission::new());
+    // Seven of the firmware's eight secondaries arrive, from many threads.
+    let got: Vec<usize> = (0..7)
+        .map(|_| {
+            let a = a.clone();
+            std::thread::spawn(move || a.admit().unwrap())
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect();
+    let mut sorted = got.clone();
+    sorted.sort();
+    assert_eq!(sorted, (1..=7).collect::<Vec<_>>(), "indices are not 1 to 7");
+    assert_eq!(a.arrived(), 7);
+    assert_eq!(a.close(), 8, "the boot processor and the seven that came");
+    assert_eq!(a.admit(), None, "a latecomer was admitted after the count was closed");
+    assert_eq!(a.close(), 8);
+}
+
+/// Unbinding a message line takes it from the device: the machine's routing
+/// for it (an interrupt remapping entry, an ITS mapping and its device's
+/// translation table) is given back, so a device whose driver let it go
+/// raises nothing, and the machine's routing slots do not run out.
+#[test]
+fn unbinding_a_message_line_releases_its_routing() {
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, SLOT_DEVICES, 15, 0x18 | 0x19 << 32, 0]);
+    m.ok(S::IrqBind, [SLOT_IRQS, 70, FREE, IRQ_MSI, FREE + 1, 0x18]);
+    m.ok(S::IrqBind, [SLOT_IRQS, 70, 0, 0, 0, 0]);
+    assert_eq!(m.k.hal.irq_log.borrow().last().map(String::as_str), Some("release 70"));
+    // A line never bound has nothing to release.
+    m.ok(S::IrqBind, [SLOT_IRQS, 71, 0, 0, 0, 0]);
+    assert_eq!(m.k.hal.irq_log.borrow().iter().filter(|l| l.as_str() == "release 71").count(), 0);
+}
+
+/// An address space made isolated (`ASPACE_ISOLATED`) has the processor's
+/// branch predictors flushed whenever a processor switches into or out of
+/// it; switches between ordinary address spaces do not pay for that.
+#[test]
+fn switching_into_and_out_of_an_isolated_address_space_flushes_predictors() {
+    use silica_abi::ASPACE_ISOLATED;
+    let m = Machine::new(64);
+    let (ut, _) = m.big_untyped();
+    let in_space = |slot: u64, bits: u64| {
+        m.retype(ut, T::AddressSpace, bits, slot + 1, 1);
+        m.retype(ut, T::Thread, 0, slot, 1);
+        m.ok(S::ThreadConfigure, [slot, SLOT_CAPSPACE, slot + 1, 0, 0, 0]);
+        m.ok(S::ThreadStart, [slot, 0x40_0000, 0, 0, 1, 0]);
+        m.cap(slot).unwrap().obj
+    };
+    assert_eq!(
+        m.err(S::Retype, [ut, T::AddressSpace as u64, 16 | ASPACE_ISOLATED | silica_abi::ASPACE_IO, SLOT_CAPSPACE, FREE + 9, 1]),
+        Error::BadArg
+    );
+    let plain = in_space(FREE, 16);
+    let isolations = || m.k.hal.irq_log.borrow().iter().filter(|l| l.starts_with("isolate")).cloned().collect::<Vec<_>>();
+    m.sys_as(plain, S::Yield, [0; 6]);
+    m.sys(S::Yield, [0; 6]);
+    assert!(isolations().is_empty(), "ordinary switches paid for isolation: {:?}", isolations());
+    let secret = in_space(FREE + 2, 16 | ASPACE_ISOLATED);
+    m.sys_as(secret, S::Yield, [0; 6]);
+    m.sys(S::Yield, [0; 6]);
+    assert_eq!(isolations(), ["isolate true", "isolate false"], "into and out of the isolated space");
+    // An isolated space destroyed while it is loaded (its only thread
+    // deletes the space and then itself): whatever runs next still finds
+    // the predictors flushed, though the root it left is gone. (The first
+    // isolated thread goes first, so only ordinary threads run beside it.)
+    m.ok(S::CapDelete, [FREE + 2, 0, 0, 0, 0, 0]);
+    let doomed = in_space(FREE + 4, 16 | ASPACE_ISOLATED);
+    m.sys_as(doomed, S::CapDelete, [FREE + 5, 0, 0, 0, 0, 0]);
+    let before = isolations().len();
+    assert_eq!(isolations()[before - 1], "isolate true");
+    m.sys_as(doomed, S::CapDelete, [FREE + 4, 0, 0, 0, 0, 0]);
+    m.sys(S::Yield, [0; 6]);
+    assert_eq!(isolations()[before..], ["isolate false"], "leaving a destroyed isolated space did not flush");
 }

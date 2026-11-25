@@ -29,6 +29,11 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     if let Some((at, _)) = acpi::dsdt(&mut read, rsdp) {
         assert!(at >= BASE);
     }
+    // The input as an IORT: a requester ID through its root complex (and
+    // any SMMU) to an ITS DeviceID, or nothing.
+    for (segment, rid) in [(0, 0), (0, 0x0008), (0, 0xFFFF), (1, 0x0100), (u32::MAX, u32::MAX)] {
+        let _ = acpi::iort_its_device(data, segment, rid);
+    }
     // The input as an AML table (a DSDT or SSDT).
     for hid in [&b"ARMH0011"[..], b"PNP0A08", b"A"] {
         for r in acpi::devices(data, hid).take(256) {

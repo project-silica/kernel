@@ -235,3 +235,106 @@ impl fmt::Display for Count {
         if self.0 == 0 { Ok(()) } else { write!(f, "{})", self.0) }
     }
 }
+
+/// The bytes a console has been given and not yet sent: the architecture's
+/// console writes into it and feeds the device only as fast as the device
+/// takes them, never waiting on it (a 16550 at 115,200 baud takes a byte
+/// every 87 us: a whole line, waited for with interrupts off, held a
+/// processor for 19 ms). Every use is under the console's own lock; the
+/// atomics only make it shareable.
+///
+/// A writer that finds no room for a piece drops the whole piece and it is
+/// counted; the next piece that fits is preceded by a line saying how many
+/// bytes were not written, so a reader knows the console lost something.
+pub struct TxRing<const N: usize> {
+    buf: [AtomicU8; N],
+    /// Bytes ever put and ever taken: `head - tail` are waiting.
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    dropped: AtomicU64,
+}
+
+impl<const N: usize> TxRing<N> {
+    /// An empty ring.
+    pub const fn new() -> Self {
+        TxRing { buf: [const { AtomicU8::new(0) }; N], head: AtomicUsize::new(0), tail: AtomicUsize::new(0), dropped: AtomicU64::new(0) }
+    }
+
+    fn room(&self) -> usize {
+        N - (self.head.load(Ordering::Relaxed) - self.tail.load(Ordering::Relaxed))
+    }
+
+    fn push(&self, bytes: &[u8]) {
+        let mut h = self.head.load(Ordering::Relaxed);
+        for &b in bytes {
+            self.buf[h % N].store(b, Ordering::Relaxed);
+            h += 1;
+        }
+        self.head.store(h, Ordering::Relaxed);
+    }
+
+    /// Queue `bytes` whole, or drop them whole and count them.
+    pub fn put(&self, bytes: &[u8]) {
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        if dropped != 0 {
+            let mut note = [0u8; 64];
+            let n = note_dropped(&mut note, dropped);
+            if self.room() < n + bytes.len() {
+                self.dropped.store(dropped + bytes.len() as u64, Ordering::Relaxed);
+                return;
+            }
+            self.push(&note[..n]);
+            self.dropped.store(0, Ordering::Relaxed);
+        }
+        if self.room() < bytes.len() {
+            self.dropped.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            return;
+        }
+        self.push(bytes);
+    }
+
+    /// Whether anything waits to be sent.
+    pub fn pending(&self) -> bool {
+        self.head.load(Ordering::Relaxed) != self.tail.load(Ordering::Relaxed)
+    }
+
+    /// The next byte to send, taken.
+    pub fn take(&self) -> Option<u8> {
+        let t = self.tail.load(Ordering::Relaxed);
+        if t == self.head.load(Ordering::Relaxed) {
+            return None;
+        }
+        let b = self.buf[t % N].load(Ordering::Relaxed);
+        self.tail.store(t + 1, Ordering::Relaxed);
+        Some(b)
+    }
+}
+
+impl<const N: usize> Default for TxRing<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// "\r\n[console: N bytes not written]\r\n" into `out`; its length.
+fn note_dropped(out: &mut [u8; 64], n: u64) -> usize {
+    let mut len = 0;
+    let mut put = |b: &[u8]| {
+        out[len..len + b.len()].copy_from_slice(b);
+        len += b.len();
+    };
+    put(b"\r\n[console: ");
+    let mut digits = [0u8; 20];
+    let (mut v, mut i) = (n, digits.len());
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    put(&digits[i..]);
+    put(b" bytes not written]\r\n");
+    len
+}

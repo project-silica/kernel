@@ -23,9 +23,9 @@ use silica_abi::NONBLOCK;
 pub use silica_abi::Syscall;
 pub use silica_abi::root;
 pub use silica_abi::{
-    ASPACE_IO, Error, FAULT_FETCH, FAULT_LABEL, FAULT_MAP, FAULT_PRESENT, FAULT_RESUME, FAULT_WRITE, Fault, IRQ_ACTIVE_LOW, IRQ_LEVEL,
-    IRQ_LINES, IRQ_MSI, KEEP, LARGE_BITS, LISTEN_SHIFT, MsgInfo, ObjectType, PAGE_BITS, Rights, SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT,
-    SCHED_FAIR, SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
+    ASPACE_IO, ASPACE_ISOLATED, Error, FAULT_FETCH, FAULT_LABEL, FAULT_MAP, FAULT_PRESENT, FAULT_RESUME, FAULT_WRITE, Fault,
+    IRQ_ACTIVE_LOW, IRQ_LEVEL, IRQ_LINES, IRQ_MSI, KEEP, LARGE_BITS, LISTEN_SHIFT, MsgInfo, ObjectType, PAGE_BITS, Rights, SCHED_DEADLINE,
+    SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
 };
 
 /// Platform API level (`spec/CI_RELEASE.md` section 7).
@@ -438,6 +438,13 @@ pub fn irq_quiet(lines: Cap, line: u32, frame: Cap, offset: u64, bits: u32) -> R
 /// confine DMA.
 pub fn retype_io_space(untyped: Cap, bits: u8, space: Cap, slot: u64) -> Result<()> {
     sys(Syscall::Retype, [untyped.0, ObjectType::AddressSpace as u64, bits as u64 | ASPACE_IO, space.0, slot, 1]).map(|_| ())
+}
+
+/// Make an address space of `2^bits` bytes isolated against speculative
+/// execution (`ASPACE_ISOLATED`): for a program that holds secrets. Every
+/// switch into or out of it flushes the processor's branch predictors.
+pub fn retype_isolated_space(untyped: Cap, bits: u8, space: Cap, slot: u64) -> Result<()> {
+    sys(Syscall::Retype, [untyped.0, ObjectType::AddressSpace as u64, bits as u64 | ASPACE_ISOLATED, space.0, slot, 1]).map(|_| ())
 }
 
 /// From now on the device with identity `device` (covered by `devices`)

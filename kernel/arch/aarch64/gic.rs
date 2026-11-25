@@ -68,12 +68,25 @@ pub fn my_affinity() -> u64 {
     affinity(m)
 }
 
-fn wait_rwp(gicd: u64) {
-    for _ in 0..1_000_000 {
-        if rd32(gicd) & 1 << 31 == 0 {
-            return;
+/// Wait until `done`, which a working GIC makes true within microseconds,
+/// for at most 100 ms by the counter: whether it came.
+fn wait_until(done: impl Fn() -> bool) -> bool {
+    let (t0, limit) = (super::counter(), super::counter_frequency() / 10);
+    while !done() {
+        if super::counter().wrapping_sub(t0) > limit {
+            return false;
         }
         core::hint::spin_loop();
+    }
+    true
+}
+
+/// A distributor register write has taken effect (GICD_CTLR.RWP clear).
+/// A distributor that never says so cannot be relied on for anything: the
+/// machine stops, saying why.
+fn wait_rwp(gicd: u64) {
+    if !wait_until(|| rd32(gicd) & 1 << 31 == 0) {
+        panic!("the GIC distributor did not complete a register write within 100 ms (GICD_CTLR.RWP stays set)");
     }
 }
 
@@ -100,20 +113,31 @@ pub fn init_distributor(gicd: u64) {
     // of a two-state GIC, bit 0 in a one-state GIC: both are set).
     wr32(gicd, 1 << 4 | 1 << 1 | 1);
     wait_rwp(gicd);
+    // In either view (one security state, DS set; or the non-secure view of
+    // two) bit 4 is affinity routing, which everything here relies on: a
+    // GIC whose secure side kept it off routes nothing as the kernel
+    // programs it, and says so now instead of never interrupting.
+    if rd32(gicd) & 1 << 4 == 0 {
+        panic!(
+            "the GIC distributor did not enable affinity routing (GICD_CTLR {:#x}; with two security states the firmware must enable it)",
+            rd32(gicd)
+        );
+    }
 }
 
-/// Wake this processor's redistributor, enable its kick and timer, and turn
-/// on its CPU interface. `gicr` is the redistributor's virtual address.
+/// Wake redistributor `gicr` (clear ProcessorSleep and wait for
+/// ChildrenAsleep to clear): whether it woke. A processor whose
+/// redistributor does not wake takes no interrupt and must not be used.
+pub fn wake(gicr: u64) -> bool {
+    wr32(gicr + 0x14, rd32(gicr + 0x14) & !(1 << 1));
+    wait_until(|| rd32(gicr + 0x14) & 1 << 2 == 0)
+}
+
+/// Enable this processor's kick and timer at its redistributor (woken
+/// already: `wake`) and turn on its CPU interface. `gicr` is the
+/// redistributor's virtual address.
 pub fn init_processor(cpu: usize, gicr: u64) {
     GICR[cpu].store(gicr, Ordering::Relaxed);
-    // GICR_WAKER: clear ProcessorSleep, wait for ChildrenAsleep to clear.
-    wr32(gicr + 0x14, rd32(gicr + 0x14) & !(1 << 1));
-    for _ in 0..1_000_000 {
-        if rd32(gicr + 0x14) & 1 << 2 == 0 {
-            break;
-        }
-        core::hint::spin_loop();
-    }
     let sgi = gicr + 0x1_0000;
     wr32(sgi + 0x080, u32::MAX); // IGROUPR0: Group 1
     wr32(sgi + 0x180, u32::MAX); // ICENABLER0: all off
