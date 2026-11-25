@@ -54,7 +54,7 @@ pub struct Thread {
     /// Links in the queue the thread is on: an endpoint's or a
     /// notification's list, the deadline run queue (a list), or the fair
     /// run queue (a tree, `order.rs`: `qprev` and `qnext` its left and
-    /// right child, `rq_up` its parent, `rq_meta` its height and place).
+    /// right child, `rq_up` its parent, `rq_meta` its height).
     pub(crate) qnext: Cell<Paddr>,
     pub(crate) qprev: Cell<Paddr>,
     pub(crate) rq_up: Cell<Paddr>,
@@ -661,9 +661,10 @@ impl<H: Hal> Kernel<H> {
                 let th = self.thread(cur);
                 let tail = me.rq_tail.get();
                 if me.yielded.replace(false) && tail != 0 && (th.sc.get() == 0 || self.dl_of(cur).is_none()) {
-                    // A yield: behind every fair thread waiting.
+                    // A yield: behind every fair thread waiting (a fair
+                    // thread, so straight into the fair queue, as its last).
                     th.vr.set(th.vr.get().max(self.thread(tail).vr.get()));
-                    self.enqueue(me, cur);
+                    crate::order::push_last(&crate::sched::RunQueue(self, me), cur);
                 } else {
                     self.enqueue(me, cur);
                 }

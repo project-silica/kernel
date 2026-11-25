@@ -567,16 +567,21 @@ impl<H: Hal> Kernel<H> {
                 Ok(Exit::Done)
             }
             Syscall::Unmap => {
+                // One lookup: a frame's own mapping, or a range of a space.
                 let s = self.cslot(t, a[0])?;
-                if self.slot(s).cap().is_some_and(|c| c.ty == ObjectType::AddressSpace) {
-                    let (_, space) = self.ccap(t, a[0], ObjectType::AddressSpace, Rights::WRITE)?;
-                    let end = a[1].checked_add(a[2]).ok_or(Error::BadArg)?;
-                    let n = self.unmap_range(space.obj, a[1], end);
-                    self.thread(t).regs[H::ARG[0]].set(n);
-                    return Ok(Exit::Done);
+                let cap = self.slot(s).cap().ok_or(Error::BadCap)?;
+                match cap.ty {
+                    ObjectType::Frame => self.unmap_slot(s),
+                    ObjectType::AddressSpace => {
+                        if !cap.rights.has(Rights::WRITE) {
+                            return Err(Error::NoRights);
+                        }
+                        let end = a[1].checked_add(a[2]).ok_or(Error::BadArg)?;
+                        let n = self.unmap_range(cap.obj, a[1], end);
+                        self.thread(t).regs[H::ARG[0]].set(n);
+                    }
+                    _ => return Err(Error::WrongType),
                 }
-                let (fs, _) = self.ccap(t, a[0], ObjectType::Frame, Rights::NONE)?;
-                self.unmap_slot(fs);
                 Ok(Exit::Done)
             }
             Syscall::ThreadConfigure => {

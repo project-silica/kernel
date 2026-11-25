@@ -7,17 +7,20 @@
 //! any program could make that walk as long as it liked on the processor
 //! every service shares (the 2026-11-24 audit). An AVL tree bounds it to
 //! the logarithm of the number of threads, and keeps the operations the
-//! scheduler needs at the cost they had: the first and last threads are
-//! kept, not searched for.
+//! scheduler does on every switch at about the cost the list had: the
+//! first and last threads are kept, not searched for; a thread that goes
+//! last (a yield, a preempted thread) or first, and taking the first, are
+//! attached and detached where they are without a walk from the top; and
+//! rebalancing stops at the first subtree whose height did not change,
+//! which for those is almost always the first.
 //!
 //! The tree is threaded through two links each thread already has for the
 //! queue concerned (its left and right child), a parent link, and a word
-//! holding the node's height (its low 8 bits) and its place among equal
-//! keys (the rest). Equal keys keep the order they were inserted in, or a
-//! thread inserted `first` goes before every equal one already there: the
-//! sequence number of a root's insertions grows from the middle of the
-//! range, and of its `first` insertions shrinks from there (2^55 of each,
-//! a century at ten million a second).
+//! holding the node's height. Equal keys keep the order they were inserted
+//! in, or a thread inserted `first` goes before every equal one already
+//! there: an insertion goes right of an equal key, or left with `first`,
+//! and rotations keep the order of the nodes, so no sequence number is
+//! kept or compared.
 //!
 //! Everything here runs under the lock of the processor whose tree it is.
 
@@ -28,19 +31,13 @@ use core::cell::Cell;
 pub struct Root {
     /// The root node (0: empty).
     pub(crate) top: Cell<Paddr>,
-    /// The next sequence numbers for an insertion after equals (counting
-    /// up) and before them (counting down).
-    hi: Cell<u64>,
-    lo: Cell<u64>,
 }
-
-const MIDDLE: u64 = 1 << 55;
 
 impl Root {
     ctor! {
         /// An empty tree.
         pub fn new() -> Root {
-            Root { top: Cell::new(0), hi: Cell::new(MIDDLE), lo: Cell::new(MIDDLE - 1) }
+            Root { top: Cell::new(0) }
         }
     }
 }
@@ -56,7 +53,7 @@ pub(crate) struct Node<'a> {
     pub left: &'a Cell<Paddr>,
     pub right: &'a Cell<Paddr>,
     pub up: &'a Cell<Paddr>,
-    /// Height in the low 8 bits, sequence number above.
+    /// The height of the subtree under the node (a leaf's is 1).
     pub meta: &'a Cell<u64>,
 }
 
@@ -70,28 +67,20 @@ pub(crate) trait Tree {
     fn last(&self) -> &Cell<Paddr>;
 }
 
+#[inline(always)]
 fn height<T: Tree>(tr: &T, t: Paddr) -> u64 {
-    if t == 0 { 0 } else { tr.node(t).meta.get() & 0xFF }
+    if t == 0 { 0 } else { tr.node(t).meta.get() }
 }
 
-fn seq<T: Tree>(tr: &T, t: Paddr) -> u64 {
-    tr.node(t).meta.get() >> 8
-}
-
-/// Whether `a` comes before `b`.
-fn before<T: Tree>(tr: &T, a: Paddr, b: Paddr) -> bool {
-    let (ka, kb) = (tr.key(a), tr.key(b));
-    ka < kb || (ka == kb && seq(tr, a) < seq(tr, b))
-}
-
-fn fix_height<T: Tree>(tr: &T, t: Paddr) -> u64 {
-    let n = tr.node(t);
-    let h = 1 + height(tr, n.left.get()).max(height(tr, n.right.get()));
-    n.meta.set((n.meta.get() & !0xFF) | h);
-    h
+/// Whether `t`, being inserted (`first`: before equals), goes before `at`.
+#[inline(always)]
+fn goes_before<T: Tree>(tr: &T, t: Paddr, at: Paddr, first: bool) -> bool {
+    let (k, ka) = (tr.key(t), tr.key(at));
+    if first { k <= ka } else { k < ka }
 }
 
 /// Put `new` where `old` hangs from `parent` (0: the root).
+#[inline(always)]
 fn replace_child<T: Tree>(tr: &T, parent: Paddr, old: Paddr, new: Paddr) {
     if parent == 0 {
         tr.root().top.set(new);
@@ -102,6 +91,13 @@ fn replace_child<T: Tree>(tr: &T, parent: Paddr, old: Paddr, new: Paddr) {
     if new != 0 {
         tr.node(new).up.set(parent);
     }
+}
+
+fn set_height<T: Tree>(tr: &T, t: Paddr) -> u64 {
+    let n = tr.node(t);
+    let h = 1 + height(tr, n.left.get()).max(height(tr, n.right.get()));
+    n.meta.set(h);
+    h
 }
 
 /// Rotate `x` down to the left (its right child takes its place); returns
@@ -118,8 +114,8 @@ fn rotate_left<T: Tree>(tr: &T, x: Paddr) -> Paddr {
     }
     ny.left.set(x);
     nx.up.set(y);
-    fix_height(tr, x);
-    fix_height(tr, y);
+    set_height(tr, x);
+    set_height(tr, y);
     y
 }
 
@@ -136,33 +132,46 @@ fn rotate_right<T: Tree>(tr: &T, x: Paddr) -> Paddr {
     }
     ny.right.set(x);
     nx.up.set(y);
-    fix_height(tr, x);
-    fix_height(tr, y);
+    set_height(tr, x);
+    set_height(tr, y);
     y
 }
 
-/// Restore the balance from `t` up to the root.
+/// Bring the subtree at `t` back into balance if a side is two taller;
+/// returns the node now in its place, its height set.
+fn balance<T: Tree>(tr: &T, t: Paddr) -> Paddr {
+    let n = tr.node(t);
+    let (l, r) = (n.left.get(), n.right.get());
+    let (hl, hr) = (height(tr, l), height(tr, r));
+    if hl > hr + 1 {
+        let nl = tr.node(l);
+        if height(tr, nl.left.get()) < height(tr, nl.right.get()) {
+            rotate_left(tr, l);
+        }
+        rotate_right(tr, t)
+    } else if hr > hl + 1 {
+        let nr = tr.node(r);
+        if height(tr, nr.right.get()) < height(tr, nr.left.get()) {
+            rotate_right(tr, r);
+        }
+        rotate_left(tr, t)
+    } else {
+        n.meta.set(1 + hl.max(hr));
+        t
+    }
+}
+
+/// Restore heights and balance from `t` up, after a change below it, as
+/// far as a subtree's height changed: above the first one whose height is
+/// what it was, nothing did.
 fn rebalance<T: Tree>(tr: &T, mut t: Paddr) {
     while t != 0 {
-        let n = tr.node(t);
-        let (l, r) = (n.left.get(), n.right.get());
-        let (hl, hr) = (height(tr, l), height(tr, r));
-        if hl > hr + 1 {
-            let nl = tr.node(l);
-            if height(tr, nl.left.get()) < height(tr, nl.right.get()) {
-                rotate_left(tr, l);
-            }
-            t = rotate_right(tr, t);
-        } else if hr > hl + 1 {
-            let nr = tr.node(r);
-            if height(tr, nr.right.get()) < height(tr, nr.left.get()) {
-                rotate_right(tr, r);
-            }
-            t = rotate_left(tr, t);
-        } else {
-            fix_height(tr, t);
+        let before = tr.node(t).meta.get();
+        let s = balance(tr, t);
+        if tr.node(s).meta.get() == before {
+            return;
         }
-        t = tr.node(t).up.get();
+        t = tr.node(s).up.get();
     }
 }
 
@@ -204,60 +213,95 @@ fn prev<T: Tree>(tr: &T, t: Paddr) -> Paddr {
 
 /// Insert `t` (in no tree), after every node of an equal key or, with
 /// `first`, before them.
+#[inline]
 pub(crate) fn insert<T: Tree>(tr: &T, t: Paddr, first: bool) {
-    let root = tr.root();
-    let s = if first {
-        let s = root.lo.get();
-        root.lo.set(s - 1);
-        s
-    } else {
-        let s = root.hi.get();
-        root.hi.set(s + 1);
-        s
-    };
     let n = tr.node(t);
     n.left.set(0);
     n.right.set(0);
-    n.meta.set(s << 8 | 1);
-    let mut at = root.top.get();
-    if at == 0 {
+    n.meta.set(1);
+    let last = tr.last().get();
+    if last == 0 {
         n.up.set(0);
-        root.top.set(t);
+        tr.root().top.set(t);
         tr.first().set(t);
         tr.last().set(t);
         return;
     }
-    // The usual cases, a new last or first, without a walk from the top.
+    // The usual cases, a new last or a new first: the last node has no
+    // right child and the first no left one, so it hangs there.
+    let parent = if !goes_before(tr, t, last, first) {
+        tr.node(last).right.set(t);
+        tr.last().set(t);
+        last
+    } else if goes_before(tr, t, tr.first().get(), first) {
+        let head = tr.first().get();
+        tr.node(head).left.set(t);
+        tr.first().set(t);
+        head
+    } else {
+        insert_inside(tr, t, first)
+    };
+    n.up.set(parent);
+    grown_under(tr, parent);
+}
+
+/// Insert `t` (in no tree), whose key is no less than every key in the
+/// tree, last: what a yield does, without comparing.
+#[inline]
+pub(crate) fn push_last<T: Tree>(tr: &T, t: Paddr) {
+    let n = tr.node(t);
+    n.left.set(0);
+    n.right.set(0);
+    n.meta.set(1);
     let last = tr.last().get();
-    let head = tr.first().get();
-    if !before(tr, t, last) {
-        at = last;
-    } else if before(tr, t, head) {
-        at = head;
+    tr.last().set(t);
+    n.up.set(last);
+    if last == 0 {
+        tr.root().top.set(t);
+        tr.first().set(t);
+        return;
     }
+    debug_assert!(tr.key(t) >= tr.key(last));
+    tr.node(last).right.set(t);
+    grown_under(tr, last);
+}
+
+/// A leaf was just hung under `parent`. A parent that had a child already
+/// is no taller now. A leaf is now two tall and still balanced (one child,
+/// a leaf): what is above it may have grown.
+#[inline(always)]
+fn grown_under<T: Tree>(tr: &T, parent: Paddr) {
+    let p = tr.node(parent);
+    if p.meta.get() == 1 {
+        p.meta.set(2);
+        let above = p.up.get();
+        if above != 0 {
+            rebalance(tr, above);
+        }
+    }
+}
+
+/// Hang `t` where it goes among the nodes, neither first nor last; returns
+/// its parent.
+#[inline(never)]
+fn insert_inside<T: Tree>(tr: &T, t: Paddr, first: bool) -> Paddr {
+    let mut at = tr.root().top.get();
     loop {
         let a = tr.node(at);
-        let link = if before(tr, t, at) { a.left } else { a.right };
+        let link = if goes_before(tr, t, at, first) { a.left } else { a.right };
         if link.get() == 0 {
             link.set(t);
-            n.up.set(at);
-            break;
+            return at;
         }
         at = link.get();
     }
-    if before(tr, t, head) {
-        tr.first().set(t);
-    }
-    if !before(tr, t, last) {
-        tr.last().set(t);
-    }
-    rebalance(tr, n.up.get());
 }
 
 /// Take `t` (in the tree) out of it.
 pub(crate) fn remove<T: Tree>(tr: &T, t: Paddr) {
     if tr.first().get() == t {
-        tr.first().set(next(tr, t));
+        pop(tr);
+        return;
     }
     if tr.last().get() == t {
         tr.last().set(prev(tr, t));
@@ -288,7 +332,7 @@ pub(crate) fn remove<T: Tree>(tr: &T, t: Paddr) {
         ns.left.set(l);
         tr.node(l).up.set(s);
         replace_child(tr, up, t, s);
-        ns.meta.set((ns.meta.get() & !0xFF) | (n.meta.get() & 0xFF));
+        ns.meta.set(n.meta.get());
     }
     n.left.set(0);
     n.right.set(0);
@@ -297,10 +341,31 @@ pub(crate) fn remove<T: Tree>(tr: &T, t: Paddr) {
 }
 
 /// Take the first node out and return it (0: the tree is empty).
+#[inline]
 pub(crate) fn pop<T: Tree>(tr: &T) -> Paddr {
     let t = tr.first().get();
-    if t != 0 {
-        remove(tr, t);
+    if t == 0 {
+        return 0;
+    }
+    // The first node has no left child: its right subtree, if any, takes
+    // its place, and the next is the leftmost there, or its parent.
+    let n = tr.node(t);
+    let (r, up) = (n.right.get(), n.up.get());
+    replace_child(tr, up, t, r);
+    let mut f = if r != 0 { r } else { up };
+    if r != 0 {
+        while tr.node(f).left.get() != 0 {
+            f = tr.node(f).left.get();
+        }
+    }
+    tr.first().set(f);
+    if f == 0 {
+        tr.last().set(0);
+    }
+    n.right.set(0);
+    n.up.set(0);
+    if up != 0 {
+        rebalance(tr, up);
     }
     t
 }
@@ -321,7 +386,7 @@ pub(crate) fn check<T: Tree>(tr: &T, most: usize) -> Result<usize, &'static str>
             return Err("an ordered tree's parent link is wrong");
         }
         let (l, r) = (node.left.get(), node.right.get());
-        if (l != 0 && !before(tr, l, t)) || (r != 0 && !before(tr, t, r)) {
+        if (l != 0 && tr.key(l) > tr.key(t)) || (r != 0 && tr.key(t) > tr.key(r)) {
             return Err("an ordered tree is out of order");
         }
         let (hl, hr) = (walk(tr, l, t, n, most)?, walk(tr, r, t, n, most)?);
@@ -329,7 +394,7 @@ pub(crate) fn check<T: Tree>(tr: &T, most: usize) -> Result<usize, &'static str>
             return Err("an ordered tree is out of balance");
         }
         let h = 1 + hl.max(hr);
-        if node.meta.get() & 0xFF != h {
+        if node.meta.get() != h {
             return Err("an ordered tree's height is wrong");
         }
         Ok(h)
@@ -346,6 +411,16 @@ pub(crate) fn check<T: Tree>(tr: &T, most: usize) -> Result<usize, &'static str>
     }
     if tr.first().get() != f || tr.last().get() != l {
         return Err("an ordered tree's first or last node is wrong");
+    }
+    // The in-order walk is in order: a child's key against its parent's
+    // does not say it for nodes further apart.
+    let (mut t, mut last) = (f, 0);
+    while t != 0 {
+        if tr.key(t) < last {
+            return Err("an ordered tree is out of order");
+        }
+        last = tr.key(t);
+        t = next(tr, t);
     }
     Ok(n)
 }
