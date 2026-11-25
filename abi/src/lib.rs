@@ -75,7 +75,11 @@ pub enum Syscall {
     /// The capability keeps its place in the derivation tree.
     CapMove = 7,
     /// `a0` slot. Deletes the capability and every capability derived from
-    /// it; an object is destroyed with its last capability.
+    /// it; an object is destroyed with its last capability. A large CapSpace
+    /// is emptied in pieces between pending interrupts (the call is made
+    /// again until it is done, invisibly to the caller); what is left when
+    /// its caller is stopped is finished by the next system call that takes
+    /// every lock, before any memory can be reused.
     CapDelete = 8,
     /// `a0` slot. Deletes every capability derived from this one.
     CapRevoke = 9,
@@ -87,8 +91,13 @@ pub enum Syscall {
     Map = 10,
     /// `a0` frame. Removes this capability's mapping.
     Unmap = 11,
-    /// `a0` thread, `a1` CapSpace, `a2` address space, `a3` fault endpoint,
-    /// `a4` IPC buffer frame. [`KEEP`] leaves a field unchanged, 0 clears it.
+    /// `a0` thread (write), `a1` CapSpace, `a2` address space, `a3` fault
+    /// endpoint, `a4` IPC buffer frame. [`KEEP`] leaves a field unchanged, 0
+    /// clears it. Each capability must carry the use the thread makes of
+    /// it: read and write on the CapSpace, the address space and the IPC
+    /// buffer (running in them is full use of their slots and mappings),
+    /// write on the fault endpoint (faults are sent through it); `NoRights`
+    /// otherwise, with nothing changed.
     ThreadConfigure = 12,
     /// `a0` thread, `a1` instruction pointer, `a2` stack pointer, `a3`
     /// first argument, `a4` not 0: make the thread runnable.
@@ -117,11 +126,14 @@ pub enum Syscall {
     /// the identity of the one device allowed to raise the line (enforced
     /// where the machine remaps interrupts). `BadArg` for a line that is a
     /// wire, `Unsupported` where the machine has no message interrupts.
+    ///
+    /// A bind that fails changes nothing: the line keeps its binding.
     IrqBind = 16,
     /// `a0` interrupt-line capability, `a1` line. The device has been dealt
     /// with: let the line interrupt again.
     IrqAck = 17,
-    /// Look at kernel state through a capability, changing nothing.
+    /// Look at kernel state through a capability (which needs its read
+    /// right: `NoRights` without it), changing nothing.
     /// `a0` a CapSpace and `a1` a slot index: what that slot holds. Returns
     /// `a0` object type (0: empty), `a1` rights, `a2` size in bits, `a3` the
     /// object's identity (equal for capabilities to one object), `a4` badge,
@@ -176,6 +188,15 @@ pub enum Syscall {
     /// processor's reservations would take more than 90% of it. `InUse` to
     /// change the class, or a deadline context's processor, while threads
     /// are bound to it.
+    ///
+    /// Processor time is authority, as memory is: `a5` is a processor-time
+    /// capability (write; [`root::SLOT_SCHED`] or one narrowed from it to
+    /// a range of processors), or 0 for none. Without one a context may be
+    /// configured fair with at most [`SCHED_DEFAULT_WEIGHT`]: memory buys a
+    /// share no better than a thread without a context has. A greater
+    /// weight needs one covering every processor (a fair thread runs
+    /// wherever it is moved); a reservation, one covering `a4`. `NoRights`
+    /// otherwise, `WrongType` for a capability that is not processor time.
     SchedConfigure = 21,
     /// `a0` device-identity capability, `a1` a device's identity (its PCI
     /// segment, bus, device and function: `segment << 16 | bus << 8 |
@@ -188,7 +209,9 @@ pub enum Syscall {
     /// (`RootInfo::dma_top` is 0) or for a device its IOMMU does not cover;
     /// `NoMemory` when the kernel's device tables are full.
     DeviceAttach = 22,
-    /// Signal the notification `a3` as `Send` does, then `Recv` with
+    /// Signal the notification `a3` (OR the capability's badge into its
+    /// word, as `Send` does; a call parked on it is not answered: a signal
+    /// carries no message, and accumulates for whoever answers), then `Recv` with
     /// `a0..a2` as `Recv` takes them: the wake-up a thread gives its peer
     /// and its own wait for the answer, in one kernel entry, so a peer on
     /// the same processor runs at once. A signal that cannot be made (not a
@@ -303,6 +326,16 @@ pub const IRQ_MSI: u64 = 4;
 /// for devices. Frames are mapped in it for the devices attached to it
 /// (`DeviceAttach`) to reach by DMA; no thread can run in it.
 pub const ASPACE_IO: u64 = 1 << 8;
+/// `Retype` of an AddressSpace, added to the size in bits: an address space
+/// isolated from the others against speculative execution. Whenever a
+/// processor switches into or out of it, the indirect branch predictors are
+/// flushed (IBPB, or the firmware's equivalent) and the return stack
+/// refilled, and while it runs the processor's sibling thread cannot steer
+/// its branches (STIBP) nor its loads bypass earlier stores (SSBD). For
+/// programs that hold secrets (keys, credentials); it costs every switch
+/// into and out of them a few microseconds, and others nothing. Not with
+/// [`ASPACE_IO`].
+pub const ASPACE_ISOLATED: u64 = 1 << 9;
 /// `Console`: more of the same text follows this piece (bit 63 of `a1`).
 pub const CONSOLE_MORE: u64 = 1 << 63;
 
@@ -366,7 +399,7 @@ impl ObjectType {
             Self::Untyped if (SLOT_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => Ok(bits as u8),
             Self::Frame if (PAGE_BITS as u64..=UNTYPED_MAX_BITS as u64).contains(&bits) => Ok(bits as u8),
             Self::CapSpace if (1..=32).contains(&bits) => Ok(bits as u8 + SLOT_BITS),
-            Self::AddressSpace if (ASPACE_MIN_BITS as u64..=30).contains(&(bits & !ASPACE_IO)) => Ok(bits as u8),
+            Self::AddressSpace if (ASPACE_MIN_BITS as u64..=30).contains(&(bits & !(ASPACE_IO | ASPACE_ISOLATED))) => Ok(bits as u8),
             Self::Thread => Ok(THREAD_BITS),
             Self::Endpoint | Self::Notification => Ok(ENDPOINT_BITS),
             Self::SchedContext => Ok(SCHED_BITS),
@@ -421,6 +454,12 @@ pub const ASPACE_MIN_BITS: u8 = 13;
 pub const UNTYPED_MAX_BITS: u8 = 47;
 /// Most objects one `Retype` creates.
 pub const RETYPE_MAX: u64 = 256;
+/// Most page-table entries one `Map` of a frame writes (and its `Unmap`
+/// clears): a frame that would need more, because only small pages are
+/// available where it is mapped (128 MiB in 4 KiB pages; 64 GiB in 2 MiB
+/// pages), is refused with `BadArg`. The bound is what keeps one mapping
+/// from holding the machine.
+pub const MAP_MAX_ENTRIES: u64 = 1 << 15;
 
 /// What a capability lets its holder do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -390,7 +390,11 @@ extern "C" fn trap_user(vector: u64, err: u64) {
             k.fault(Fault::Page, cr2, access);
         }
         6 => k.fault(Fault::Instruction, 0, 0),
-        2 | 8 | 18 => panic!("fatal exception {vector} (error {err:#x}) in user mode"),
+        // The platform's NMI, or the request to stop (`super::nmi`).
+        2 => super::nmi(),
+        // A machine check consumed by the program: its fault (`super::machine_check_user`).
+        18 => super::machine_check_user(k),
+        8 => panic!("double fault (error {err:#x}) in user mode"),
         32.. => super::irq(vector, true),
         v => k.fault(Fault::Exception, v, err),
     }
@@ -410,6 +414,13 @@ pub struct KernelFrame {
 }
 
 extern "C" fn trap_kernel(f: &KernelFrame) {
+    // NMIs and machine checks come in through `paranoid_common`, with the
+    // kernel's GS base whatever they interrupted.
+    match f.vector {
+        2 => return super::nmi(),
+        18 => return super::machine_check_kernel(),
+        _ => {}
+    }
     if f.vector >= 32 {
         // Only the idle wait takes interrupts in kernel mode, and it does
         // not hold the processor's lock.
@@ -610,8 +621,67 @@ trap_common:
     add rsp, 16
     iretq
 
+// NMI, double fault and machine check (on their own stack): from user mode
+// the ordinary entry; in the kernel they may arrive where GS is still the
+// user's (between `syscall` and its `swapgs`, or after the `swapgs` on the
+// way out), so the GS base itself says whose it is: a kernel address (bit
+// 63 set) is the kernel's, else it is swapped in now and back on the way
+// out. Ordinary interrupts never arrive there and keep the cheaper path.
+paranoid_common:
+    cld
+    test byte ptr [rsp + 24], 3
+    jnz trap_common
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
+    mov ecx, 0xC0000101
+    rdmsr
+    xor r12d, r12d
+    test edx, edx
+    js 3f
+    swapgs
+    mov r12d, 1
+3:
+    lfence
+    mov rdi, rsp
+    call {trap_kernel}
+    test r12d, r12d
+    jz 4f
+    swapgs
+4:
+    pop rax
+    pop rbx
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+    add rsp, 16
+    iretq
+
 // One 16-byte stub per vector: push a zero where the processor pushes no
-// error code, push the vector, join the common path.
+// error code, push the vector, join the common path (NMI, double fault and
+// machine check: the paranoid one).
 .macro TRAP_STUB n
     .align 16
     .if (\n == 8) || (\n >= 10 && \n <= 14) || (\n == 17) || (\n == 21) || (\n == 29) || (\n == 30)
@@ -619,7 +689,11 @@ trap_common:
     push 0
     .endif
     push \n
+    .if (\n == 2) || (\n == 8) || (\n == 18)
+    jmp paranoid_common
+    .else
     jmp trap_common
+    .endif
 .endm
 .align 16
 .global trap_stubs

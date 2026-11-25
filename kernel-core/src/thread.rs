@@ -557,7 +557,7 @@ impl<H: Hal> Kernel<H> {
             // and the deadlines are looked at afresh.
             let th = self.thread(t);
             if !global
-                && self.ncpu.get() > 1
+                && self.ncpu() > 1
                 && matches!(th.state.get(), SENDING | RECEIVING)
                 && self.queue(th.blocked_on.get()).owner.get() != self.hal.cpu() as u64 + 1
             {
@@ -706,11 +706,30 @@ impl<H: Hal> Kernel<H> {
         let cur = me.cur.get();
         let root = self.thread(cur).aspace.cap().map_or(0, |c| c.obj + 4096);
         if me.loaded.get() != cur || me.loaded_root.get() != root {
+            // Into or out of an address space isolated against speculation:
+            // looked at, out of line, once the machine has one.
+            if self.isolating.load(core::sync::atomic::Ordering::Relaxed) {
+                self.isolate(me, cur, root);
+            }
             self.hal.switch_thread(&self.phys, me.loaded.get(), cur, root);
             me.loaded.set(cur);
             me.loaded_root.set(root);
         }
         me.dirty.set(false);
+    }
+
+    /// This processor is about to run `cur` in address space `root`: if
+    /// that is a change of root into or out of an address space isolated
+    /// against speculation, nothing either side trained may steer the other
+    /// (`Hal::isolate`).
+    #[cold]
+    #[inline(never)]
+    fn isolate(&self, me: &Cpu, cur: Paddr, root: Paddr) {
+        let flags = self.thread(cur).aspace.cap().map_or(0, |c| c.flags) & crate::cap::FLAG_ISOLATED;
+        if me.loaded_root.get() != root && flags | me.isolated.get() != 0 {
+            self.hal.isolate(flags != 0);
+            me.isolated.set(flags);
+        }
     }
 
     /// Nothing to run: wait for work, or until `until`, with this

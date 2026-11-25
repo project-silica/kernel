@@ -46,7 +46,10 @@ pub fn timestamp() -> u64 {
 
 // Process entry: the kernel (for the root task) or the process manager
 // starts a program here with its start-up argument in the first argument
-// register and a stack. `silica_main` is the program's entry function.
+// register and a stack. `silica_main` is the program's entry function:
+// the kernel's argument registers are the C convention's except the
+// fourth (r10 for rcx), copied across so the root task's entry gets the
+// four words of the boot secret after the record (`root::secret`).
 #[cfg(target_os = "silica")]
 core::arch::global_asm!(
     ".section .text._start, \"ax\"",
@@ -54,6 +57,7 @@ core::arch::global_asm!(
     "_start:",
     "xor ebp, ebp",
     "and rsp, -16",
+    "mov rcx, r10",
     "call silica_main",
     "ud2",
 );

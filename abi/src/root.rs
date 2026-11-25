@@ -3,6 +3,11 @@
 //! The kernel creates one thread from the ramdisk entry named `root` and
 //! gives it every capability there is. Its CapSpace is laid out as below, and
 //! its first argument register holds the address of a read-only [`RootInfo`].
+//! The next four hold the boot secret ([`secret`]): every source of
+//! randomness the loader found, hashed together, so it is unpredictable if
+//! any one of them is. It is in registers, not in a frame, so that no frame
+//! the root task hands on carries it: the root task keeps it in its own
+//! memory and derives what others need from it.
 
 /// Slot of the root thread's own Thread capability.
 pub const SLOT_THREAD: u64 = 1;
@@ -25,6 +30,11 @@ pub const SLOT_POWER: u64 = 9;
 /// PCI segment, bus, device and function (`Syscall::DeviceAttach`,
 /// `Syscall::IrqBind` with `IRQ_MSI`).
 pub const SLOT_DEVICES: u64 = 10;
+/// Slot of the processor-time capability: every processor of the machine,
+/// by index (`Syscall::SchedConfigure`: a weight above the default, or a
+/// deadline reservation, on the processors it covers). Narrowed by
+/// `CapCopy` as any range is.
+pub const SLOT_SCHED: u64 = 11;
 /// Slot of the Untyped the root task's own objects were made from; what is
 /// left of it is the root task's to use.
 pub const SLOT_BOOT_UNTYPED: u64 = 7;
@@ -100,15 +110,15 @@ pub struct RootInfo {
     /// Wall-clock time from the firmware, in seconds since 1970, and the
     /// monotonic nanoseconds at which it was read (both 0 when unknown).
     pub wall_clock: [u64; 2],
-    /// A 32-byte secret for the root task: every source of randomness the
-    /// loader found, hashed together (BLAKE2s), so it is unpredictable if
-    /// any one of them is. Independent of the kernel's own (its address
-    /// slide): knowing one says nothing about the other.
-    pub entropy: [u8; 32],
-    /// Which sources went into `entropy` ([`ENTROPY_FIRMWARE`],
+    /// Which sources went into the boot secret ([`ENTROPY_FIRMWARE`],
     /// [`ENTROPY_CPU`]); timing jitter always does, and is never counted.
-    /// 0: no source the loader trusts was present, and `entropy` must not
+    /// 0: no source the loader trusts was present, and the secret must not
     /// be used for keys until something better (a device) is mixed in.
+    ///
+    /// The secret itself is not here: this record describes the machine
+    /// and is lent on (to whoever manages its devices), so it holds nothing
+    /// secret. The root thread starts with it in its second to fifth
+    /// argument registers ([`secret`]).
     pub entropy_sources: u64,
     /// Number of processors. Threads start on the processor that created
     /// them and can be moved to any index below this.
@@ -129,4 +139,16 @@ pub struct RootInfo {
     pub cmdline: [u8; 256],
     /// The Untyped capabilities, in slot order from `SLOT_FIRST_UNTYPED`.
     pub untyped: [UntypedDesc; MAX_UNTYPED],
+}
+
+/// The boot secret from the root thread's start registers: the second to
+/// fifth argument registers (`a1` to `a4`), little-endian, in order. 32
+/// bytes, independent of the kernel's own randomness (its address slide):
+/// knowing one says nothing about the other.
+pub fn secret(words: [u64; 4]) -> [u8; 32] {
+    let mut s = [0u8; 32];
+    for (i, w) in words.iter().enumerate() {
+        s[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    s
 }

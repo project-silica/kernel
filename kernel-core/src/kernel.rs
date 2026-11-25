@@ -26,7 +26,12 @@ pub struct Kernel<H: Hal> {
     /// Physical memory.
     pub phys: Phys,
     pub(crate) cpus: crate::smp::CpuTable,
-    pub(crate) ncpu: Cell<usize>,
+    pub(crate) ncpu: core::sync::atomic::AtomicUsize,
+    /// An address space isolated against speculation (`ASPACE_ISOLATED`)
+    /// has been made since boot: only then does a switch look at whether it
+    /// enters or leaves one (`Kernel::isolate`), so a machine without one
+    /// pays a load and a branch for it.
+    pub(crate) isolating: core::sync::atomic::AtomicBool,
     /// This processor holds every lock (see `smp.rs`).
     pub(crate) global: Cell<bool>,
     /// Held, with the holder's own processor lock, while mapping.
@@ -34,12 +39,16 @@ pub struct Kernel<H: Hal> {
     pub(crate) globals: Cell<u64>,
     /// Objects waiting to be emptied (only used holding every lock).
     pub(crate) reap: Cell<u64>,
+    /// The CapSpace being emptied, part done (0: none; `cap::drain_reap`).
+    pub(crate) reaping: Cell<u64>,
     /// The notification and badge each interrupt line signals (changed
     /// only by a holder of every lock).
     pub(crate) irqs: [(Cell<Paddr>, Cell<u64>); silica_abi::IRQ_LINES as usize],
     /// Watched lines (`watch.rs`), and how many entries are in use.
     pub(crate) watches: [crate::watch::LineWatch; silica_abi::IRQ_WATCHES],
     pub(crate) nwatches: Cell<usize>,
+    /// How often programs may make the kernel write a console line.
+    pub(crate) log_rate: crate::log::Rate,
 }
 
 impl<H: Hal> Kernel<H> {
@@ -50,14 +59,17 @@ impl<H: Hal> Kernel<H> {
             hal,
             phys,
             cpus: crate::smp::CpuTable::new(),
-            ncpu: Cell::new(1),
+            ncpu: core::sync::atomic::AtomicUsize::new(1),
+            isolating: core::sync::atomic::AtomicBool::new(false),
             global: Cell::new(false),
             structure: crate::lock::Lock::new(),
             globals: Cell::new(0),
             reap: Cell::new(0),
+            reaping: Cell::new(0),
             irqs: [const { (Cell::new(0), Cell::new(0)) }; silica_abi::IRQ_LINES as usize],
             watches: [const { crate::watch::LineWatch::new() }; silica_abi::IRQ_WATCHES],
             nwatches: Cell::new(0),
+            log_rate: crate::log::Rate::new(),
         }
     }
 
@@ -200,7 +212,7 @@ impl<H: Hal> Kernel<H> {
     /// Whether syscall `s` can run holding only the locks this entry holds:
     /// this processor's, and after [`Kernel::go_pair`] one other's.
     fn is_local(&self, s: Syscall, t: Paddr, a: &[u64; 6]) -> bool {
-        if self.ncpu.get() == 1 {
+        if self.ncpu() == 1 {
             return true;
         }
         let h = self.held();
@@ -209,8 +221,10 @@ impl<H: Hal> Kernel<H> {
             None => true, // BadCap, reported without touching anything
         };
         match s {
-            // `Map` takes the structure lock itself.
-            Syscall::Yield | Syscall::PortIo | Syscall::Map | Syscall::Console | Syscall::PowerOff => true,
+            // `Map` takes the structure lock itself. `IrqAck` reads the
+            // line's binding (changed only holding every lock) and unmasks
+            // it under the interrupt controller's own lock.
+            Syscall::Yield | Syscall::PortIo | Syscall::Map | Syscall::Console | Syscall::PowerOff | Syscall::IrqAck => true,
             // Passing capabilities changes capability slots.
             Syscall::Call | Syscall::Send => MsgInfo(a[1]).caps() == 0 && queue(a[0] & !NONBLOCK),
             Syscall::Recv => queue(crate::ipc::recv_slot(a[0])) && self.park_is_local(h, t, a[2]) && self.listen_is_local(h, t, a[0]),
@@ -285,7 +299,10 @@ impl<H: Hal> Kernel<H> {
     #[inline(never)]
     fn signal_recv(&self, t: Paddr, a: &[u64; 6]) -> Result<Exit, Error> {
         let (_, n) = self.ccap(t, a[3], ObjectType::Notification, Rights::WRITE)?;
-        self.notify(t, n.obj, n.badge.max(1))?;
+        // A signal, never a message: a call parked on the notification is
+        // not answered by it (this call's registers hold a deadline, not a
+        // message), and the bits accumulate for whoever answers it.
+        self.signal(n.obj, n.badge.max(1));
         let r = self.recv_any(t, a[0], a[1], a[2]);
         if r == Ok(Exit::Preempted) {
             // The signal is made; what runs again is the receive alone.
@@ -420,6 +437,12 @@ impl<H: Hal> Kernel<H> {
 
     fn dispatch(&self, s: Syscall, t: Paddr, a: [u64; 6]) -> Result<Exit, Error> {
         let grant = |cap: &Cap| if cap.rights.has(Rights::GRANT) { IPC_GRANT } else { 0 };
+        // Emptying left over from an earlier entry (a large CapSpace,
+        // `drain_reap`) is finished before any system call that holds every
+        // lock does anything: its memory is reused only once it is done.
+        if self.reap_pending() && (self.ncpu() == 1 || self.global.get()) && !self.finish_reap() {
+            return Ok(Exit::Preempted);
+        }
         match s {
             Syscall::Call => {
                 let (slot, ep) = self.ccap(t, a[0], ObjectType::Endpoint, Rights::WRITE)?;
@@ -519,7 +542,9 @@ impl<H: Hal> Kernel<H> {
                     return Ok(Exit::Preempted);
                 }
                 self.delete(s);
-                Ok(Exit::Done)
+                // Made again until what it destroyed is emptied: the
+                // deleter pays for it, not the next caller.
+                Ok(if self.reap_pending() { Exit::Preempted } else { Exit::Done })
             }
             Syscall::CapRevoke => {
                 let s = self.cslot(t, a[0])?;
@@ -542,6 +567,13 @@ impl<H: Hal> Kernel<H> {
             Syscall::ThreadConfigure => {
                 let (_, th) = self.ccap(t, a[0], ObjectType::Thread, Rights::WRITE)?;
                 let want = [ObjectType::CapSpace, ObjectType::AddressSpace, ObjectType::Endpoint, ObjectType::Frame];
+                // What the thread does with each is a use of it the
+                // capability must allow: running in a CapSpace or an
+                // address space is full use of its slots or mappings (read
+                // and write), a fault is sent through the endpoint, the IPC
+                // buffer is read and written.
+                let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
+                let need = [rw, rw, Rights::WRITE, rw];
                 // Validate everything before changing anything.
                 let mut src = [0; 4];
                 for i in 0..4 {
@@ -549,8 +581,8 @@ impl<H: Hal> Kernel<H> {
                     if arg == KEEP || arg == 0 {
                         continue;
                     }
-                    let (s, cap) = self.ccap(t, arg, want[i], Rights::NONE)?;
-                    if i == 3 && (cap.bits != PAGE_BITS || cap.flags & FLAG_DEVICE != 0 || !cap.rights.has(Rights(3))) {
+                    let (s, cap) = self.ccap(t, arg, want[i], need[i])?;
+                    if i == 3 && (cap.bits != PAGE_BITS || cap.flags & FLAG_DEVICE != 0) {
                         return Err(Error::BadArg);
                     }
                     // No thread runs in an address space made for devices.
@@ -591,6 +623,7 @@ impl<H: Hal> Kernel<H> {
                     return Err(Error::BadArg);
                 }
                 self.cancel(th.obj, false);
+                self.fresh_extended_state(th.obj);
                 let r = &self.thread(th.obj).regs;
                 for c in r.iter() {
                     c.set(0);
@@ -625,7 +658,7 @@ impl<H: Hal> Kernel<H> {
                         // Move the thread to processor `a2`, doing what it
                         // was doing. A deadline reservation is on one
                         // processor: unbind it first.
-                        if a[2] >= self.ncpu.get() as u64 {
+                        if a[2] >= self.ncpu() as u64 {
                             return Err(Error::BadArg);
                         }
                         if self.dl_of(th.obj).is_some() {
@@ -670,17 +703,12 @@ impl<H: Hal> Kernel<H> {
                     let (_, n) = self.ccap(t, a[2], ObjectType::Notification, Rights::WRITE)?;
                     (n.obj, n.badge.max(1))
                 };
-                // Whatever the line signalled before no longer hears from it,
-                // and its news is no longer known.
-                self.unwatch_line(line);
-                let old = self.irqs[line].0.replace(0);
-                self.hal.irq_mask(line, true);
-                if old != 0 {
-                    let q = self.queue(old);
-                    q.bound.set(q.bound.get() - 1);
-                }
+                // Everything is checked, and the line routed anew (which
+                // changes nothing when it fails), before the old binding is
+                // touched: a bind that fails leaves the line as it was.
+                let msi = line >= self.hal.msi_first();
                 if to != 0 {
-                    if line >= self.hal.msi_first() {
+                    if msi {
                         // A message, raised by one device.
                         if a[3] != silica_abi::IRQ_MSI {
                             return Err(Error::BadArg);
@@ -700,6 +728,22 @@ impl<H: Hal> Kernel<H> {
                     ) {
                         return Err(Error::Unsupported);
                     }
+                }
+                // Whatever the line signalled before no longer hears from it,
+                // and its news is no longer known.
+                self.unwatch_line(line);
+                let old = self.irqs[line].0.replace(0);
+                if old != 0 {
+                    let q = self.queue(old);
+                    q.bound.set(q.bound.get() - 1);
+                }
+                if to == 0 {
+                    self.hal.irq_mask(line, true);
+                    // A message line unbound: no device may raise it.
+                    if msi && old != 0 {
+                        self.hal.msi_release(line);
+                    }
+                } else {
                     self.irqs[line].0.set(to);
                     self.irqs[line].1.set(badge);
                     let q = self.queue(to);
@@ -769,6 +813,10 @@ impl<H: Hal> Kernel<H> {
             Syscall::Inspect => {
                 let slot = self.cslot(t, a[0])?;
                 let cap = self.slot(slot).cap().ok_or(Error::BadCap)?;
+                // Looking is a use: it needs the read right.
+                if !cap.rights.has(Rights::READ) {
+                    return Err(Error::NoRights);
+                }
                 let r = &self.thread(t).regs;
                 let thread = |obj: Paddr| {
                     let th = self.thread(obj);
@@ -822,7 +870,18 @@ impl<H: Hal> Kernel<H> {
             }
             Syscall::SchedConfigure => {
                 let (_, sc) = self.ccap(t, a[0], ObjectType::SchedContext, Rights::WRITE)?;
-                self.sched_configure(sc.obj, a[1], a[2], a[3], a[4])?;
+                // The processors whose time the caller may give out (a5: a
+                // processor-time capability; 0: none, its own share only).
+                let time = if a[5] == 0 {
+                    0..0
+                } else {
+                    let (_, hw) = self.ccap(t, a[5], ObjectType::Hw, Rights::WRITE)?;
+                    if hw.flags & crate::cap::FLAG_SCHED == 0 {
+                        return Err(Error::WrongType);
+                    }
+                    hw.obj..hw.badge
+                };
+                self.sched_configure(sc.obj, a[1], a[2], a[3], a[4], time)?;
                 // Its threads' processors look at their queues again.
                 let mut b = self.sched(sc.obj).threads.get();
                 while b != 0 {
@@ -910,6 +969,36 @@ impl<H: Hal> Kernel<H> {
                 Ok(Exit::Done)
             }
         }
+    }
+
+    /// Finish emptying what an earlier entry left (`drain_reap`); false
+    /// when an interrupt stops it again. Holding every lock.
+    #[cold]
+    #[inline(never)]
+    fn finish_reap(&self) -> bool {
+        self.drain_reap()
+    }
+
+    /// `ThreadStart`: thread `t` starts a new program, and none of the
+    /// previous one's vector and x87 state goes with the thread object. That
+    /// state may still be live in a processor's registers (the thread was
+    /// running, or that processor went idle with it loaded); that processor
+    /// forgets it is loaded, so it is never saved over the initial image put
+    /// in the save area now. Out of line: in line, the dispatch around it
+    /// cost the page fault 32 instructions (`bench.sh --only insns`). The
+    /// caller holds every lock.
+    #[cold]
+    #[inline(never)]
+    fn fresh_extended_state(&self, t: Paddr) {
+        for cpu in self.cpus.iter(self.ncpu()) {
+            if cpu.loaded.get() == t {
+                cpu.loaded.set(0);
+                cpu.dirty.set(true);
+            }
+        }
+        let fpu = t + crate::thread::FPU_OFFSET as u64;
+        self.phys.zero(fpu, (1 << silica_abi::THREAD_BITS) - crate::thread::FPU_OFFSET as u64);
+        self.hal.init_thread(&self.phys, t);
     }
 
     /// The device identity `id`, which the device-identity capability at
@@ -1068,7 +1157,7 @@ impl<H: Hal> Kernel<H> {
     /// deadline queue only threads bound to deadline contexts. For tests and
     /// fuzzing.
     pub fn check_runqueues(&self) -> Result<(), &'static str> {
-        for (i, cpu) in self.cpus.iter(self.ncpu.get()).enumerate() {
+        for (i, cpu) in self.cpus.iter(self.ncpu()).enumerate() {
             for (head, tail, dl) in [(&cpu.rq_head, &cpu.rq_tail, false), (&cpu.dl_head, &cpu.dl_tail, true)] {
                 let (mut t, mut prev, mut last, mut n) = (head.get(), 0, 0, 0usize);
                 while t != 0 {
@@ -1104,7 +1193,7 @@ impl<H: Hal> Kernel<H> {
     /// ways, in deadline order, ending, and holding only threads of that
     /// processor that have a deadline. For tests and fuzzing.
     pub fn check_timers(&self) -> Result<(), &'static str> {
-        for (i, cpu) in self.cpus.iter(self.ncpu.get()).enumerate() {
+        for (i, cpu) in self.cpus.iter(self.ncpu()).enumerate() {
             let (mut t, mut prev, mut last, mut n) = (cpu.timers.get(), 0, 0, 0usize);
             while t != 0 {
                 let th = self.thread(t);

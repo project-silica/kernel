@@ -1,4 +1,5 @@
 target	edges
 acpi	186
 elf	259
+ramdisk	308
 syscalls	1764

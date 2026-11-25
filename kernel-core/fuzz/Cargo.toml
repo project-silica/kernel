@@ -36,6 +36,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ramdisk"
+path = "fuzz_targets/ramdisk.rs"
+test = false
+doc = false
+bench = false
+
 # Not part of the kernel workspace: cargo-fuzz builds it on its own.
 [workspace]
 

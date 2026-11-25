@@ -321,3 +321,9 @@ pub unsafe fn handover(root: u64, low_root: u64, entry: u64, info: u64) -> ! {
         )
     }
 }
+
+/// The first feature Silica requires that this processor lacks: the
+/// kernel checks each processor's own (`arch/aarch64/cpu.rs`).
+pub fn unsupported() -> Option<&'static str> {
+    None
+}

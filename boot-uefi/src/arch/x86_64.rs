@@ -161,3 +161,36 @@ pub unsafe fn handover(root: u64, _low_root: u64, entry: u64, info: u64) -> ! {
         )
     }
 }
+
+/// The first feature Silica requires that this processor lacks
+/// (`kernel_core::x86`), checked before EFER.NXE is set and before tables
+/// with the NX bit are built: without NX either faults with nothing said.
+pub fn unsupported() -> Option<&'static str> {
+    kernel_core::x86::check(|leaf, sub| {
+        // SAFETY: CPUID only reads identification registers.
+        #[allow(unused_unsafe)]
+        let r = unsafe { core::arch::x86_64::__cpuid_count(leaf, sub) };
+        [r.eax, r.ebx, r.ecx, r.edx]
+    })
+    .missing
+}
+
+/// Page-level cache disable and write-through: with the PAT as reset (and as
+/// the kernel leaves it), PCD and PWT together select uncached (UC).
+const PCD: u64 = 1 << 4;
+const PWT: u64 = 1 << 3;
+/// A 2 MiB mapping of device memory: uncached, whatever the firmware's
+/// memory-type ranges say (they need not cover a device at all).
+pub fn block_device(phys: u64) -> u64 {
+    block(phys, true, false) | PCD | PWT
+}
+/// A 4 KiB mapping of device memory.
+pub fn page_device(phys: u64) -> u64 {
+    page(phys, true, false) | PCD | PWT
+}
+/// A 4 KiB mapping of a framebuffer: PWT alone, which the kernel's PAT
+/// makes write-combining (the reset PAT's write-through until then; either
+/// is coherent for a buffer the processor only writes).
+pub fn page_framebuffer(phys: u64) -> u64 {
+    page(phys, true, false) | PWT
+}

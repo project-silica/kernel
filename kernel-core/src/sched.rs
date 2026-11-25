@@ -386,14 +386,23 @@ impl<H: Hal> Kernel<H> {
         at
     }
 
-    /// `SchedConfigure` on the context at `s`.
-    pub(crate) fn sched_configure(&self, s: Paddr, class: u64, a: u64, b: u64, cpu: u64) -> Result<(), Error> {
+    /// `SchedConfigure` on the context at `s`, by a caller with authority
+    /// over the time of processors `time` (empty: none). Processor time is
+    /// a capability like any other resource: memory alone buys a context
+    /// that shares no better than a thread without one (the default weight,
+    /// or less); more weight needs authority over every processor (a fair
+    /// thread runs wherever it is moved), a reservation authority over its
+    /// processor.
+    pub(crate) fn sched_configure(&self, s: Paddr, class: u64, a: u64, b: u64, cpu: u64, time: core::ops::Range<u64>) -> Result<(), Error> {
         let sc = self.sched(s);
         let bound = sc.threads.get() != 0;
         match class {
             SCHED_FAIR => {
                 if !(1..=SCHED_MAX_WEIGHT).contains(&a) {
                     return Err(Error::BadArg);
+                }
+                if a > SCHED_DEFAULT_WEIGHT && !(time.start == 0 && time.end >= self.ncpu() as u64) {
+                    return Err(Error::NoRights);
                 }
                 if bound && sc.class.get() != SCHED_FAIR {
                     return Err(Error::InUse);
@@ -404,8 +413,11 @@ impl<H: Hal> Kernel<H> {
                 Ok(())
             }
             SCHED_DEADLINE => {
-                if a == 0 || b < MIN_PERIOD || a > b || cpu >= self.ncpu.get() as u64 {
+                if a == 0 || b < MIN_PERIOD || a > b || cpu >= self.ncpu() as u64 {
                     return Err(Error::BadArg);
+                }
+                if !time.contains(&cpu) {
+                    return Err(Error::NoRights);
                 }
                 if bound && (sc.class.get() != SCHED_DEADLINE || sc.cpu.get() != cpu + 1) {
                     return Err(Error::InUse);

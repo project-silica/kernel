@@ -20,6 +20,10 @@ use crate::mem::{KObj, Paddr};
 use crate::smp::Word;
 use silica_abi::{Error, ObjectType, Rights, SLOT_BITS};
 
+/// Slots a CapSpace being emptied gives up between looks for a pending
+/// interrupt (`drain_reap`).
+const REAP_STEP: u64 = 256;
+
 /// Capability flag: device memory, mapped with device attributes
 /// (uncached; on Arm also no unaligned access). Always also [`FLAG_KEPT`].
 pub const FLAG_DEVICE: u8 = 1;
@@ -35,9 +39,20 @@ pub const FLAG_POWER: u8 = 16;
 /// firmware tables, the ramdisk). It is never zeroed, so it becomes only
 /// frames and smaller Untyped, never kernel objects.
 pub const FLAG_KEPT: u8 = 32;
+/// AddressSpace flag: isolated against speculative execution
+/// (`ASPACE_ISOLATED`): switching into or out of it flushes the branch
+/// predictors (`Hal::isolate`). On the capability, which the scheduler
+/// reads anyway on a switch, so other address spaces pay nothing to look.
+/// (Bit 1 means a port range on a Hw capability; an AddressSpace is never one.)
+pub const FLAG_ISOLATED: u8 = 2;
 /// AddressSpace flag: an address space for devices (`ASPACE_IO`). Its
 /// tables are the IOMMU's, and no thread runs in it.
 pub const FLAG_IO: u8 = 64;
+/// Hw capability flag: a range of processors, by index: the authority to
+/// give threads more than the default share of them (`SchedConfigure`).
+/// (Bit 0 means device memory on a Frame or Untyped; a Hw capability is
+/// never memory.)
+pub const FLAG_SCHED: u8 = 1;
 /// Hw capability flag: a range of device identities (PCI segment, bus,
 /// device, function), the authority to say what those devices reach by DMA
 /// and which message interrupts they raise.
@@ -203,7 +218,7 @@ impl<H: Hal> Kernel<H> {
             // It may be a running thread's own, on any processor: each
             // looks again at what it should have loaded.
             self.me().dirty.set(true);
-            if self.ncpu.get() > 1 {
+            if self.ncpu() > 1 {
                 for (i, cpu) in self.others() {
                     cpu.dirty.set(true);
                     self.hal.kick(i, true);
@@ -309,11 +324,38 @@ impl<H: Hal> Kernel<H> {
         }
     }
 
-    fn drain_reap(&self) {
+    /// Empty what is waiting to be emptied. A CapSpace has up to 2^32
+    /// slots, and this runs holding every lock: it stops when an interrupt
+    /// is pending, every [`REAP_STEP`] slots, and goes on where it stopped
+    /// the next time (the CapSpace being emptied and the next slot are kept
+    /// in `reaping`, its slot 0). Returns whether nothing is left. What is
+    /// left is unreachable (no capability names it) but its memory is not
+    /// free: every system call that could reuse memory takes every lock and
+    /// finishes this first ([`Kernel::reap_pending`]).
+    pub(crate) fn drain_reap(&self) -> bool {
         loop {
+            let e = self.reaping.get();
+            if e != 0 {
+                // A CapSpace part emptied: its size in slot 0's badge, the
+                // next slot in its aux.
+                let s0 = self.slot(e);
+                let n = 1u64 << s0.badge.get();
+                let mut i = s0.aux.get().max(1);
+                while i < n {
+                    self.delete_shallow(e + (i << SLOT_BITS));
+                    i += 1;
+                    if i.is_multiple_of(REAP_STEP) && i < n && self.hal.irq_pending() {
+                        s0.aux.set(i);
+                        return false;
+                    }
+                }
+                s0.wipe();
+                self.reaping.set(0);
+                continue;
+            }
             let e = self.reap.get();
             if e == 0 {
-                return;
+                return true;
             }
             if e & 1 == 1 {
                 let t = e & !1;
@@ -322,15 +364,23 @@ impl<H: Hal> Kernel<H> {
                     self.delete_shallow(s);
                 }
             } else {
+                // Off the list before it is emptied: what it holds may put
+                // more on the list.
                 let s0 = self.slot(e);
                 self.reap.set(s0.next.get());
-                let bits = s0.badge.get();
-                s0.wipe();
-                for i in 1..1u64 << bits {
-                    self.delete_shallow(e + (i << SLOT_BITS));
-                }
+                s0.next.set(0);
+                s0.aux.set(1);
+                self.reaping.set(e);
             }
         }
+    }
+
+    /// Whether emptying is left over from an earlier entry: the caller
+    /// (holding every lock) finishes it before anything that could reuse
+    /// memory, and is made again when it cannot yet.
+    #[inline(always)]
+    pub(crate) fn reap_pending(&self) -> bool {
+        self.reaping.get() != 0 || self.reap.get() != 0
     }
 
     /// Delete the capability in `s` and everything derived from it.
@@ -342,6 +392,8 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// Delete the capability in slot `s` (no effect on an empty slot).
+    /// What that leaves to empty (a large CapSpace) may be left for later
+    /// ([`Kernel::drain_reap`]).
     pub(crate) fn delete(&self, s: Paddr) {
         self.delete_shallow(s);
         self.drain_reap();
@@ -352,8 +404,7 @@ impl<H: Hal> Kernel<H> {
     pub(crate) fn revoke(&self, s: Paddr) -> bool {
         while self.has_children(s) {
             self.clear_slot(self.slot(s).next.get());
-            self.drain_reap();
-            if self.hal.irq_pending() && self.has_children(s) {
+            if !self.drain_reap() || (self.hal.irq_pending() && self.has_children(s)) {
                 return false;
             }
         }

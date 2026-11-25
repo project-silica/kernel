@@ -23,6 +23,8 @@ use silica_formats::acpi;
 const PORTS: Cap = Cap(SLOT_PORTS);
 const SPACE: Cap = Cap(SLOT_CAPSPACE);
 const ASPACE: Cap = Cap(SLOT_ASPACE);
+/// The machine's processor time (a weight above the default, a reservation).
+const TIME: Cap = Cap(SLOT_SCHED);
 const RW: Rights = Rights(3);
 
 struct Serial;
@@ -893,7 +895,8 @@ fn t_inspect() -> T {
 // ---- more than one processor ---------------------------------------------
 
 static CPUS: AtomicU64 = AtomicU64::new(1);
-/// `RootInfo::entropy` as four words, and `entropy_sources`.
+/// The boot secret as four words (the start registers), and
+/// `RootInfo::entropy_sources`.
 static ENTROPY: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// The root task's start-up record, for tests that read the firmware's tables.
 static INFO: AtomicU64 = AtomicU64::new(0);
@@ -1790,7 +1793,13 @@ fn t_sched() -> T {
     let cpu = cpus - 1;
     // 1. Weights 1024 and 3072 share the processor about 1:3.
     let heavy = new(ObjectType::SchedContext, 0);
-    sched_fair(heavy, 3072).map_err(|_| "cannot configure a fair context")?;
+    // Without processor time, memory buys no more than the default share.
+    if sched_fair(heavy, 3072, Cap::NONE) != Err(Error::NoRights)
+        || sched_deadline(heavy, 1_000_000, 10_000_000, cpu, Cap::NONE) != Err(Error::NoRights)
+    {
+        return Err("a scheduling context was given more than the default share without processor time");
+    }
+    sched_fair(heavy, 3072, TIME).map_err(|_| "cannot configure a fair context")?;
     let c = spin_on(cpu, &[(0, Cap::NONE), (1, heavy)], 300)?;
     let ratio = c[1] as f64 / c[0].max(1) as f64;
     println!("sched: weights 1024 and 3072 counted {} and {} (ratio {:.2})", c[0], c[1], ratio);
@@ -1799,7 +1808,7 @@ fn t_sched() -> T {
     }
     // 2. A 2 ms in 10 ms reservation beside three fair spinners gets a fifth.
     let dl = new(ObjectType::SchedContext, 0);
-    sched_deadline(dl, 2_000_000, 10_000_000, cpu).map_err(|_| "cannot reserve 20% of a processor")?;
+    sched_deadline(dl, 2_000_000, 10_000_000, cpu, TIME).map_err(|_| "cannot reserve 20% of a processor")?;
     let c = spin_on(cpu, &[(0, Cap::NONE), (1, Cap::NONE), (2, Cap::NONE), (3, dl)], 400)?;
     let total: u64 = c[..4].iter().sum();
     let share = c[3] as f64 / total.max(1) as f64;
@@ -1812,7 +1821,7 @@ fn t_sched() -> T {
     }
     // 3. More than 90% of a processor is not promised.
     let more = new(ObjectType::SchedContext, 0);
-    if sched_deadline(more, 8_000_000, 10_000_000, cpu) != Err(Error::Overload) {
+    if sched_deadline(more, 8_000_000, 10_000_000, cpu, TIME) != Err(Error::Overload) {
         return Err("a reservation that would take the processor past 90% was accepted");
     }
     // SAFETY: nothing is bound to them any more.
@@ -1820,7 +1829,7 @@ fn t_sched() -> T {
         let _ = cap_delete(dl);
         let _ = cap_delete(heavy);
     }
-    sched_deadline(more, 8_000_000, 10_000_000, cpu).map_err(|_| "a reservation's share was not given back when it was destroyed")?;
+    sched_deadline(more, 8_000_000, 10_000_000, cpu, TIME).map_err(|_| "a reservation's share was not given back when it was destroyed")?;
     // SAFETY: nothing is bound to it.
     let _ = unsafe { cap_delete(more) };
     // 4. A thread waking from 1 ms sleeps beside two spinners runs promptly.
@@ -1865,13 +1874,101 @@ fn t_entropy() -> T {
     if w.iter().all(|&x| x == w[0]) {
         return Err("the root task's secret is a repeated word");
     }
+    // The record is lent on to whoever manages the devices: no word of the
+    // secret may be in it.
+    // SAFETY: INFO is the kernel's read-only record, a whole page mapped
+    // for the root task's life.
+    let page = unsafe { core::slice::from_raw_parts(INFO.load(SeqCst) as *const u64, 512) };
+    if page.iter().any(|x| w.contains(x)) {
+        return Err("the start-up record, which is lent on, holds the boot secret");
+    }
     Ok(())
 }
 
+/// A machine check consumed by a program is its fault, not the machine's:
+/// a thread spins on processor 1, the harness injects an uncorrected but
+/// recoverable machine check there once this says it is ready (`qemu.sh
+/// --on`, QEMU's `mce`), and the thread is stopped (it has no fault
+/// endpoint), while the machine, this thread included, goes on.
+#[cfg(target_arch = "x86_64")]
+fn t_machine_check() -> T {
+    let t = foreign_thread_on(1, stub(&raw const stub_spin, &raw const stub_spin_end), 0);
+    sleep_ms(50);
+    println!("MACHINE CHECK READY");
+    let end = CLOCK.now() + 20_000_000_000;
+    while inspect_thread(t).map(|i| i.state) == Ok(THREAD_RUNNABLE) {
+        if CLOCK.now() > end {
+            return Err("the thread that consumed the machine check was never stopped");
+        }
+        sleep_ms(10);
+    }
+    // SAFETY: the thread is stopped and used by nothing else.
+    let _ = unsafe { cap_delete(t) };
+    Ok(())
+}
+
+/// An NMI from the platform (QEMU's `nmi`, to every processor, sent by the
+/// harness once this says it is ready) is said and survived, wherever it
+/// lands: in user mode, the kernel or the idle wait.
+#[cfg(target_arch = "x86_64")]
+fn t_nmi() -> T {
+    let t = foreign_thread_on(1, stub(&raw const stub_spin, &raw const stub_spin_end), 0);
+    println!("NMI READY");
+    // Calls and sleeps across the NMIs' arrival, on both processors.
+    for _ in 0..200 {
+        sleep_ms(5);
+        let _ = inspect_thread(t).map_err(|_| "the spinning thread is gone")?;
+    }
+    // SAFETY: as above.
+    let _ = unsafe { cap_delete(t) };
+    Ok(())
+}
+
+/// An address space isolated against speculation (`ASPACE_ISOLATED`): a
+/// thread in one shares this processor with the root task's sleeps, so the
+/// kernel switches into and out of it again and again (the predictor
+/// barrier, the return-stack fill and the control bits, on the hardware
+/// this runs on); it runs, and so does everything else.
+fn t_isolated() -> T {
+    let s = slot();
+    retype_isolated_space(Cap(UNTYPED.load(SeqCst)), 16, SPACE, s).map_err(|_| "cannot make an isolated address space")?;
+    let frame = new(ObjectType::Frame, 12);
+    let at = region(1 << 12);
+    let code = stub(&raw const stub_spin, &raw const stub_spin_end);
+    map(ASPACE, frame, at, RW).map_err(|_| "map")?;
+    // SAFETY: one page mapped read-write at `at`; the code fits in it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, code.len());
+        arch::sync_code(at, code.len());
+        unmap(frame).map_err(|_| "unmap")?;
+    }
+    map(Cap(s), frame, 0x10_0000, Rights(5)).map_err(|_| "map code in the isolated space")?;
+    let t = new(ObjectType::Thread, 0);
+    thread_configure(t, SPACE, Cap(s), Cap::NONE, Cap::NONE).map_err(|_| "configure")?;
+    // SAFETY: the code runs at any address without a stack.
+    unsafe { thread_start(t, 0x10_0000, 0, 0, true) }.map_err(|_| "start")?;
+    for _ in 0..100 {
+        sleep_ms(2);
+    }
+    if inspect_thread(t).map(|i| i.state) != Ok(THREAD_RUNNABLE) {
+        return Err("the thread in the isolated address space stopped");
+    }
+    // SAFETY: used by nothing else.
+    unsafe {
+        let _ = cap_delete(t);
+        let _ = cap_delete(Cap(s));
+    }
+    Ok(())
+}
 const TESTS: &[(&str, fn() -> T)] = &[
     ("entropy", t_entropy),
     ("sched", t_sched),
     ("console", t_console),
+    ("isolated", t_isolated),
+    #[cfg(target_arch = "x86_64")]
+    ("machine_check", t_machine_check),
+    #[cfg(target_arch = "x86_64")]
+    ("nmi", t_nmi),
     ("syscall", t_syscall),
     ("fault_page", t_fault_page),
     ("fault_instruction", t_fault_instruction),
@@ -1902,7 +1999,7 @@ const TESTS: &[(&str, fn() -> T)] = &[
 /// Program entry, called by libsys's `_start`.
 // SAFETY: the one definition of the symbol `_start` calls.
 #[unsafe(no_mangle)]
-extern "C" fn silica_main(info: &'static RootInfo) -> ! {
+extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3: u64) -> ! {
     if info.magic != ROOT_MAGIC {
         exit(false);
     }
@@ -1911,8 +2008,9 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     }
     NEXT_SLOT.store(info.first_free_slot, SeqCst);
     CPUS.store(info.cpus, SeqCst);
-    for (i, w) in info.entropy.as_chunks::<8>().0.iter().enumerate() {
-        ENTROPY[i].store(u64::from_le_bytes(*w), SeqCst);
+    // The boot secret: in the start registers, nowhere else (`root::secret`).
+    for (i, w) in [s0, s1, s2, s3].into_iter().enumerate() {
+        ENTROPY[i].store(w, SeqCst);
     }
     ENTROPY[4].store(info.entropy_sources, SeqCst);
     INFO.store(info as *const RootInfo as u64, SeqCst);

@@ -87,6 +87,18 @@ impl Model {
             for i in 0..(1u64 << c.bits) / step {
                 sp.leaves.remove(&(level, v + i * step));
             }
+            // A table with nothing below it goes back to the pool.
+            loop {
+                let empty = sp.tables.iter().copied().find(|&(l, i)| {
+                    let shift = 12 + 9 * l as u64;
+                    !sp.leaves.keys().any(|&(lev, va)| lev < l && va >> shift == i)
+                        && !sp.tables.iter().any(|&(l2, j)| l2 < l && (j << (12 + 9 * l2 as u64)) >> shift == i)
+                });
+                match empty {
+                    Some(t) => drop(sp.tables.remove(&t)),
+                    None => break,
+                }
+            }
         }
     }
     /// Delete a capability: its descendants first, then the object if this
@@ -324,13 +336,16 @@ impl Model {
             S::ThreadConfigure => {
                 let (_, th) = self.typed(a[0], T::Thread, 2)?;
                 let want = [T::CapSpace, T::AddressSpace, T::Endpoint, T::Frame];
+                // Read and write to run in a CapSpace or an address space
+                // or use an IPC buffer; write to send faults to an endpoint.
+                let need = [3, 3, 2, 3];
                 let mut src = [None; 4];
                 for i in 0..4 {
                     if a[i + 1] == KEEP || a[i + 1] == 0 {
                         continue;
                     }
-                    let (s, cap) = self.typed(a[i + 1], want[i], 0)?;
-                    if i == 3 && (cap.bits != 12 || cap.rights & 3 != 3) {
+                    let (s, cap) = self.typed(a[i + 1], want[i], need[i])?;
+                    if i == 3 && cap.bits != 12 {
                         return Err(Error::BadArg);
                     }
                     src[i] = Some(s);

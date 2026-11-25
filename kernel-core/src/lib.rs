@@ -34,6 +34,7 @@ pub mod thread;
 pub mod untyped;
 pub mod vm;
 pub mod watch;
+pub mod x86;
 
 pub use kernel::Kernel;
 

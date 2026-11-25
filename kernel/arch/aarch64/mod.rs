@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cpu::{PerCpu, percpu};
 use kernel_core::ExitStatus;
 use kernel_core::Kernel;
-use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, Cmdline, PHYS_MAP_BASE, Region, RegionTable};
+use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, Cmdline, PHYS_MAP_BASE, Region, RegionKind, RegionTable};
 use kernel_core::hal::Hal;
 use kernel_core::lock::Presence;
 use kernel_core::mem::{Paddr, Phys};
@@ -73,12 +73,53 @@ static UART: AtomicU64 = AtomicU64::new(0);
 /// The kernel was told a test harness listens for the exit status.
 static HARNESS: AtomicBool = AtomicBool::new(false);
 
+/// The console's lock, its bytes not yet sent (16 KiB), and when it must be
+/// fed again (`u64::MAX`: nothing waits): as on x86_64 (`serial.rs`), the
+/// UART is given what its FIFO takes and never waited for; every processor
+/// arms its timer no later than `CONSOLE_DUE`.
+static CONSOLE_LOCK: kernel_core::lock::Lock = kernel_core::lock::Lock::new();
+static CONSOLE: kernel_core::log::TxRing<16384> = kernel_core::log::TxRing::new();
+static CONSOLE_DUE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// The PL011's transmit FIFO (32 bytes at 115,200 baud: 2.8 ms) takes at
+/// least half its depth again within this long.
+const CONSOLE_DRAIN_NS: u64 = 1_400_000;
+
+/// Give the UART what it takes now (while its transmit FIFO is not full)
+/// and say when to look again. Holding `CONSOLE_LOCK`.
+fn console_feed(now: u64) {
+    let uart = UART.load(Ordering::Relaxed);
+    // SAFETY: `uart` is a PL011-compatible UART mapped as device memory in
+    // the device window: flag register at 0x18 (bit 5: transmit FIFO
+    // full), data register at 0.
+    while CONSOLE.pending() && unsafe { core::ptr::read_volatile((uart + 0x18) as *const u32) } & 0x20 == 0 {
+        if let Some(b) = CONSOLE.take() {
+            // SAFETY: as above.
+            unsafe { core::ptr::write_volatile(uart as *mut u32, b as u32) }
+        }
+    }
+    CONSOLE_DUE.store(if CONSOLE.pending() { now.saturating_add(CONSOLE_DRAIN_NS) } else { u64::MAX }, Ordering::Relaxed);
+}
+
+/// Feed the console if it is due at `now` (a timer interrupt, the idle path).
+fn console_drain(now: u64) {
+    if CONSOLE_DUE.load(Ordering::Relaxed) > now || UART.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    CONSOLE_LOCK.lock();
+    console_feed(now);
+    CONSOLE_LOCK.unlock();
+}
+
+/// The panic and boot path: what the console still holds, then `s`,
+/// waiting for the UART (a bounded number of times per byte). Takes no
+/// lock: the processor may hold it already.
 fn write_bytes(s: &[u8]) {
     let uart = UART.load(Ordering::Relaxed);
     if uart == 0 {
         return;
     }
-    for &b in s {
+    for b in core::iter::from_fn(|| CONSOLE.take()).chain(s.iter().copied()) {
         let mut spins = 0;
         // SAFETY: `uart` is a PL011-compatible UART mapped as device memory
         // in the device window: flag register at 0x18 (bit 5: transmit FIFO
@@ -194,45 +235,83 @@ fn map_device(phys: u64) -> Option<u64> {
     }
 }
 
-fn acpi8(p: u64) -> [u8; 8] {
-    // SAFETY: ACPI tables are in RAM the physical map covers; callers stay
-    // inside the lengths the tables give.
-    unsafe { core::ptr::read_unaligned((PHYS_MAP_BASE + p) as *const [u8; 8]) }
-}
-fn acpi64(p: u64) -> u64 {
-    u64::from_le_bytes(acpi8(p))
-}
-fn acpi32(p: u64) -> u32 {
-    acpi64(p) as u32
+/// The loader's table of memory regions (address, entries), recorded first
+/// thing at boot: what the physical map covers, for reading firmware tables.
+static BOOT_REGIONS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Whether `[p, p + len)` lies in memory the physical map covers: every page
+/// of it in a region the loader mapped (anything but device and reserved
+/// ranges, which are holes in the map; reading one would fault).
+fn mapped(p: u64, len: u64) -> bool {
+    let (at, n) = (BOOT_REGIONS[0].load(Ordering::Relaxed), BOOT_REGIONS[1].load(Ordering::Relaxed));
+    if at == 0 {
+        return false;
+    }
+    // SAFETY: the loader's region table, in loader memory the physical map
+    // covers, read-only for the kernel's life.
+    let regions = unsafe { core::slice::from_raw_parts((PHYS_MAP_BASE + at) as *const Region, n as usize) };
+    let Some(end) = p.checked_add(len) else { return false };
+    let mut page = p & !0xFFF;
+    while page < end {
+        let held = regions.iter().any(|r| r.kind != RegionKind::Firmware as u32 && r.base <= page && page < r.base.saturating_add(r.len));
+        if !held {
+            return false;
+        }
+        page += 0x1000;
+    }
+    true
 }
 
-/// The physical address and length of the ACPI table with signature `sig`.
-fn acpi_table(rsdp: u64, sig: &[u8; 4]) -> Option<(u64, u64)> {
-    if rsdp == 0 || acpi8(rsdp) != *b"RSD PTR " {
-        return None;
+/// Read physical memory for the shared ACPI walker: false where the map
+/// does not reach.
+fn phys_read(p: u64, buf: &mut [u8]) -> bool {
+    if !mapped(p, buf.len() as u64) {
+        return false;
     }
-    let xsdt = acpi64(rsdp + 24);
-    if xsdt == 0 || acpi8(xsdt)[..4] != *b"XSDT" {
-        return None;
-    }
-    let len = acpi32(xsdt + 4) as u64;
-    let mut at = xsdt + 36;
-    while at + 8 <= xsdt + len {
-        let t = acpi64(at);
-        at += 8;
-        if t != 0 && acpi8(t)[..4] == *sig {
-            return Some((t, acpi32(t + 4) as u64));
+    // SAFETY: just checked to lie in mapped memory; firmware tables are
+    // memory nothing writes.
+    unsafe { core::ptr::copy_nonoverlapping((PHYS_MAP_BASE + p) as *const u8, buf.as_mut_ptr(), buf.len()) };
+    true
+}
+
+/// The ACPI table with signature `sig`, whole: found by the shared walker
+/// (`kernel_core::acpi::find_table`, the one the tests check), and only
+/// where it lies in mapped memory. `None` otherwise.
+fn acpi_table(rsdp: u64, sig: &[u8; 4]) -> Option<&'static [u8]> {
+    let (t, len) = kernel_core::acpi::find_table(&mut phys_read, rsdp, sig)?;
+    // SAFETY: as in `phys_read`, the whole of it checked.
+    mapped(t, len as u64).then(|| unsafe { core::slice::from_raw_parts((PHYS_MAP_BASE + t) as *const u8, len as usize) })
+}
+
+/// Little-endian fields of a table, `None` past its end.
+fn t32(t: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(t.get(at..at.checked_add(4)?)?.try_into().ok()?))
+}
+fn t64(t: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(t.get(at..at.checked_add(8)?)?.try_into().ok()?))
+}
+
+/// The entries of a MADT (`table`), as (type, bytes): ends at the first
+/// malformed one.
+fn madt_entries(t: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    let mut at = 44usize;
+    core::iter::from_fn(move || {
+        let (kind, n) = (*t.get(at)?, *t.get(at + 1)? as usize);
+        if n < 2 {
+            return None;
         }
-    }
-    None
+        let e = t.get(at..at.checked_add(n)?)?;
+        at += n;
+        Some((kind, e))
+    })
 }
 
 /// The base of the UART the ACPI SPCR table names, if it is a PL011 or an
 /// SBSA generic UART in memory space.
 fn spcr_uart(rsdp: u64) -> Option<u64> {
-    let (t, len) = acpi_table(rsdp, b"SPCR")?;
-    let (kind, space, base) = (acpi8(t + 36)[0], acpi8(t + 40)[0], acpi64(t + 44));
-    (len >= 80 && matches!(kind, 0x03 | 0x0E) && space == 0 && base != 0).then_some(base)
+    let t = acpi_table(rsdp, b"SPCR")?;
+    let (kind, space, base) = (*t.get(36)?, *t.get(40)?, t64(t, 44)?);
+    (t.len() >= 80 && matches!(kind, 0x03 | 0x0E) && space == 0 && base != 0).then_some(base)
 }
 
 /// What the MADT says about the GIC: the distributor, the redistributor
@@ -246,30 +325,24 @@ struct Madt {
 }
 
 fn madt(rsdp: u64) -> Option<Madt> {
-    let (t, len) = acpi_table(rsdp, b"APIC")?;
+    let t = acpi_table(rsdp, b"APIC")?;
     let mut m = Madt { gicd: 0, gicr: (0, 0), its: 0 };
     let me = gic::my_affinity();
-    let mut at = t + 44;
-    while at + 2 <= t + len {
-        let (kind, n) = (acpi8(at)[0], acpi8(at)[1] as u64);
-        if n < 2 {
-            break;
-        }
+    for (kind, e) in madt_entries(t) {
         match kind {
-            0x0C if n >= 24 => m.gicd = acpi64(at + 8),
-            0x0F if n >= 20 && m.its == 0 => m.its = acpi64(at + 8),
-            0x0E if n >= 16 => m.gicr = (acpi64(at + 4), acpi32(at + 12) as u64),
+            0x0C if e.len() >= 24 => m.gicd = t64(e, 8)?,
+            0x0F if e.len() >= 20 && m.its == 0 => m.its = t64(e, 8)?,
+            0x0E if e.len() >= 16 => m.gicr = (t64(e, 4)?, t32(e, 12)? as u64),
             // A GICC entry with its own redistributor, used when there is
             // no redistributor region.
-            0x0B if n >= 76 && m.gicr.0 == 0 && gic::affinity(acpi64(at + 68)) == me => {
-                let r = acpi64(at + 60);
+            0x0B if e.len() >= 76 && m.gicr.0 == 0 && gic::affinity(t64(e, 68)?) == me => {
+                let r = t64(e, 60)?;
                 if r != 0 {
                     m.gicr = (r, 0x2_0000);
                 }
             }
             _ => {}
         }
-        at += n;
     }
     (m.gicd != 0 && m.gicr.0 != 0).then_some(m)
 }
@@ -401,7 +474,7 @@ pub fn kernel() -> &'static Kernel<Arm> {
     &KERNEL.0
 }
 
-fn counter_frequency() -> u64 {
+pub(super) fn counter_frequency() -> u64 {
     let f: u64;
     // SAFETY: reading the counter frequency.
     unsafe { asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) }
@@ -464,7 +537,7 @@ fn tcr() -> u64 {
     v
 }
 
-fn counter() -> u64 {
+pub(super) fn counter() -> u64 {
     let v: u64;
     // SAFETY: reading the virtual count; ISB keeps it in program order.
     unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) }
@@ -625,6 +698,8 @@ impl Hal for Arm {
     }
 
     fn set_timer(&self, deadline: u64) {
+        // No later than the console must be fed again (`CONSOLE_DUE`).
+        let deadline = deadline.min(CONSOLE_DUE.load(Ordering::Relaxed));
         let me = percpu();
         if deadline == u64::MAX {
             me.deadline.set(u64::MAX);
@@ -660,6 +735,10 @@ impl Hal for Arm {
     }
 
     fn idle(&self, until: u64, words: Option<&[kernel_core::hal::Watched]>) -> bool {
+        // An idle processor feeds the console first, and wakes no later
+        // than when it must be fed again.
+        console_drain(self.now());
+        let until = until.min(CONSOLE_DUE.load(Ordering::Relaxed));
         // Watch for work first, as on x86 (`IDLE_WATCH_NS`); without `words`
         // the watch already ran (`Hal::idle`).
         if let Some(words) = words
@@ -778,13 +857,29 @@ impl Hal for Arm {
     }
 
     fn console(&self, bytes: &[u8]) {
-        write_bytes(bytes);
+        if UART.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        CONSOLE_LOCK.lock();
+        CONSOLE.put(bytes);
+        console_feed(self.now());
+        CONSOLE_LOCK.unlock();
     }
 
     fn msi_first(&self) -> usize {
         if its::ready() { its::FIRST_LINE } else { usize::MAX }
     }
 
+    fn isolate(&self, _entering: bool) {
+        // Cores with FEAT_CSV2 keep branch predictions apart by context
+        // already; without it the firmware's workaround flushes them.
+        if SPECTRE_WORKAROUND.load(Ordering::Relaxed) {
+            smp::psci(0x8000_8000, 0, 0, 0); // SMCCC_ARCH_WORKAROUND_1
+        }
+    }
+    fn msi_release(&self, line: usize) {
+        its::release(line);
+    }
     fn msi_route(&self, line: usize, cpu: usize, source: u64) -> Option<(u64, u64)> {
         its::route(line, cpu, source)
     }
@@ -865,6 +960,13 @@ fn irq(locked: bool) {
                 unsafe { asm!("msr cntv_ctl_el0, xzr", "isb", options(nostack, preserves_flags)) }
                 percpu().deadline.set(u64::MAX);
                 gic::end(id);
+                // Feed the console, and keep the timer armed while
+                // anything waits there (the scheduler arms it only for its
+                // own deadlines).
+                console_drain(k.hal.now());
+                if CONSOLE_DUE.load(Ordering::Relaxed) != u64::MAX {
+                    k.hal.set_timer(u64::MAX);
+                }
                 if locked {
                     k.on_timer();
                 }
@@ -917,6 +1019,8 @@ extern "C" fn kmain(info: u64) -> ! {
     if bi.magic != BOOT_MAGIC || bi.version != BOOT_VERSION {
         die();
     }
+    BOOT_REGIONS[0].store(bi.regions, Ordering::Relaxed);
+    BOOT_REGIONS[1].store(bi.region_count, Ordering::Relaxed);
     IMAGE[0].store(bi.kernel_virt, Ordering::Relaxed);
     IMAGE[1].store(bi.kernel_phys, Ordering::Relaxed);
     SLIDE.store(bi.kernel_slide, Ordering::Relaxed);
@@ -955,6 +1059,12 @@ extern "C" fn kmain(info: u64) -> ! {
     // SAFETY: once, on the boot processor, with interrupts masked; the
     // per-processor data is a static.
     unsafe { cpu::install(&BOOT_CPU) };
+    if !cpu::has_pan() {
+        let _ = write!(
+            Out,
+            "kernel: this processor has no PAN (Armv8.0): the kernel runs without the guard against touching user memory by accident\r\n"
+        );
+    }
     smp::LOW_ROOT.store(ttbr0(), Ordering::Relaxed);
 
     // The interrupt controller.
@@ -971,6 +1081,9 @@ extern "C" fn kmain(info: u64) -> ! {
         let _ = write!(Out, "ERROR: kernel: no GIC redistributor for the boot processor\r\n");
         die();
     };
+    if !gic::wake(gicr) {
+        panic!("the boot processor's GIC redistributor did not wake within 100 ms (GICR_WAKER.ChildrenAsleep stays set)");
+    }
     gic::init_processor(0, gicr);
     BOOT_CPU.online.store(true, Ordering::Release);
 
@@ -984,10 +1097,15 @@ extern "C" fn kmain(info: u64) -> ! {
         _ => smp::prepare(bi.rsdp, table, (gicr_region, m.gicr.1)),
     };
     k.set_cpu_count(cpus);
+    if !smp::psci_present() {
+        smp::detect_psci(bi.rsdp);
+    }
+    decide_isolation();
     // Message-signalled interrupts, through the ITS when there is one.
     smp::GICR_PHYS_BASE.store(m.gicr.0, Ordering::Relaxed);
-    let its_ok =
-        m.its != 0 && map_device_range(m.its, 0x2_0000).is_some_and(|its| its::init(its, m.its, cpus, table, |p| PHYS_MAP_BASE + p));
+    let its_ok = m.its != 0
+        && map_device_range(m.its, 0x2_0000)
+            .is_some_and(|its| its::init(its, m.its, cpus, table, acpi_table(bi.rsdp, b"IORT"), |p| PHYS_MAP_BASE + p));
     if m.its != 0 && !its_ok {
         let _ = write!(Out, "kernel: the GIC's ITS cannot be used; devices have no message interrupts\r\n");
     }
@@ -1006,8 +1124,14 @@ extern "C" fn kmain(info: u64) -> ! {
 
     // SAFETY: loader memory, read-only until the root task owns it.
     let ramdisk = unsafe { core::slice::from_raw_parts((PHYS_MAP_BASE + bi.ramdisk) as *const u8, bi.ramdisk_len as usize) };
+    // Nothing in the archive runs, the root task included, unless the whole
+    // of it is as the image builder wrote it (`ramdisk::check`).
+    if let Err(why) = kernel_core::ramdisk::check(ramdisk, crc32c) {
+        let _ = write!(Out, "ERROR: kernel: no root task: the boot archive is refused: {why}\r\n");
+        die();
+    }
     let Some(image) = kernel_core::ramdisk::find(ramdisk, "root") else {
-        let _ = write!(Out, "ERROR: kernel: no root task: the ramdisk is missing, malformed, or has no entry named \"root\"\r\n");
+        let _ = write!(Out, "ERROR: kernel: no root task: the boot archive has no entry named \"root\"\r\n");
         die();
     };
     // Device memory is handed out as far as the processor's physical
@@ -1020,6 +1144,10 @@ extern "C" fn kmain(info: u64) -> ! {
     let top = regions.last().map_or(0, |r| r.base + r.len).max(1 << width);
     let uart = spcr_uart(bi.rsdp).unwrap_or(0) & !0xFFF;
     let reserved = [(m.gicd, m.gicd + 0x1_0000), (m.gicr.0, m.gicr.0 + m.gicr.1), (uart, uart + 0x1000), (m.its, m.its + 0x2_0000)];
+    // The other processors, started and counted (those that arrived)
+    // before the root task is told how many there are.
+    let cpus = if cpus > 1 { smp::launch(cpus, cmdline.get("panic") == Some(b"secondary")) } else { 1 };
+    k.set_cpu_count(cpus);
     let spec = RootSpec {
         regions,
         elf: image,
@@ -1042,7 +1170,6 @@ extern "C" fn kmain(info: u64) -> ! {
         let _ = write!(Out, "ERROR: kernel: cannot start the root task: {e:?}\r\n");
         die();
     }
-    smp::launch(cpus, cmdline.get("panic") == Some(b"secondary"));
     // SAFETY: the vectors, the processor and the root thread are set up and
     // the kernel is entered; this is the first exit to user mode.
     unsafe { cpu::exit_to_user() }
@@ -1071,4 +1198,65 @@ fn changed(words: &[kernel_core::hal::Watched]) -> bool {
         let v = unsafe { w.at.read_volatile() };
         v & w.mask != w.seen
     })
+}
+
+/// Continue a CRC32C over `data`: with the processor's CRC32 instructions
+/// where it has them (ID_AA64ISAR0_EL1.CRC32: every Armv8.1 core, most
+/// Armv8.0 ones), eight bytes an instruction; else the portable code.
+fn crc32c(state: u32, data: &[u8]) -> u32 {
+    let isar0: u64;
+    // SAFETY: reading an identification register has no effect.
+    unsafe { asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack, preserves_flags)) }
+    if isar0 >> 16 & 0xF == 0 {
+        return kernel_core::ramdisk::crc32c_update(state, data);
+    }
+    let (words, tail) = data.as_chunks::<8>();
+    let mut c = state;
+    for w in words {
+        // SAFETY: CRC32CX only computes on registers; the processor has it.
+        unsafe {
+            asm!(".arch_extension crc", "crc32cx {c:w}, {c:w}, {v}", c = inout(reg) c, v = in(reg) u64::from_le_bytes(*w), options(pure, nomem, nostack))
+        }
+    }
+    for &b in tail {
+        // SAFETY: as above.
+        unsafe {
+            asm!(".arch_extension crc", "crc32cb {c:w}, {c:w}, {b:w}", c = inout(reg) c, b = in(reg) b as u32, options(pure, nomem, nostack))
+        }
+    }
+    c
+}
+
+/// Isolating an address space (`Hal::isolate`) calls the firmware's
+/// SMCCC_ARCH_WORKAROUND_1: set at boot on a core without FEAT_CSV2 whose
+/// firmware offers it.
+static SPECTRE_WORKAROUND: AtomicBool = AtomicBool::new(false);
+
+/// What isolating an address space needs on this core, decided once at boot
+/// (after PSCI is known): nothing where the core keeps branch predictions
+/// apart by context (FEAT_CSV2, ID_AA64PFR0_EL1 bits 59:56); the firmware's
+/// workaround where it offers one (SMCCC 1.1, ARCH_FEATURES says 0); else
+/// the boot says isolation against branch-target injection is not there.
+fn decide_isolation() {
+    let pfr0: u64;
+    // SAFETY: reading an identification register.
+    unsafe { asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack, preserves_flags)) }
+    if pfr0 >> 56 & 0xF != 0 || !smp::psci_present() {
+        if pfr0 >> 56 & 0xF == 0 {
+            let _ = write!(
+                Out,
+                "WARNING: kernel: this core lacks FEAT_CSV2 and the firmware has no SMCCC: isolated address spaces are not protected from branch-target injection\r\n"
+            );
+        }
+        return;
+    }
+    let version = smp::psci(0x8000_0000, 0, 0, 0); // SMCCC_VERSION
+    if version >= 0x1_0001 && smp::psci(0x8000_0001, 0x8000_8000, 0, 0) == 0 {
+        SPECTRE_WORKAROUND.store(true, Ordering::Relaxed);
+    } else {
+        let _ = write!(
+            Out,
+            "WARNING: kernel: this core lacks FEAT_CSV2 and the firmware has no workaround: isolated address spaces are not protected from branch-target injection\r\n"
+        );
+    }
 }

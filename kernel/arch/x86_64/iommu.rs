@@ -37,13 +37,14 @@ use super::cpu::percpu;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 use kernel_core::boot::{BootInfo, RegionTable};
+use kernel_core::hal::Hal as _;
 use kernel_core::klog;
 use kernel_core::lock::Lock;
 use kernel_core::mem::{Paddr, Phys};
 use silica_abi::Error;
 
 const PAGE: u64 = 4096;
-const MAX_UNITS: usize = 8;
+const MAX_UNITS: usize = 32;
 /// Buses that can have an attached device at one time.
 const CONTEXT_TABLES: u64 = 64;
 /// Device address spaces that can have devices attached at one time.
@@ -178,13 +179,29 @@ fn word(phys: &Phys, at: u64) -> *mut u64 {
     phys.ptr(at).cast::<u64>()
 }
 
-/// Spin until `done`, which a working unit makes true within microseconds.
-fn wait(what: &str, done: impl Fn() -> bool) {
-    let mut spins = 0u64;
+/// FSTS: the invalidation queue stopped at a descriptor it could not take
+/// (IQE), a completion error (ICE), a device-TLB invalidation timed out
+/// (ITE). Left set by `fault` for the wait that is held up by them.
+const FSTS_QUEUE_ERRORS: u32 = 1 << 4 | 1 << 5 | 1 << 6;
+/// The longest a unit may take to do what it is told: it takes
+/// microseconds; this is a thousand times that and more.
+const ANSWER_NS: u64 = 10_000_000;
+
+/// Spin until `done`, which a working unit `u` makes true within
+/// microseconds. A unit that reports a queue error, or does not answer
+/// within `ANSWER_NS`, has failed: the kernel can no longer say what the
+/// devices behind it reach, so the machine stops, saying which unit and
+/// why (never a wait of minutes, every processor that needs the IOMMU
+/// stuck behind its lock).
+fn wait(phys: &Phys, u: &Unit, what: &str, done: impl Fn() -> bool) {
+    let start = super::kernel().hal.now();
     while !done() {
-        spins += 1;
-        if spins > 1 << 32 {
-            panic!("an IOMMU does not answer ({what})");
+        let status = r32(phys, u.base, FSTS);
+        if status & FSTS_QUEUE_ERRORS != 0 {
+            panic!("the IOMMU at {:#x} reports an invalidation queue error (fault status {status:#x}) during {what}", u.base);
+        }
+        if super::kernel().hal.now().saturating_sub(start) > ANSWER_NS {
+            panic!("the IOMMU at {:#x} did not answer within 10 ms ({what})", u.base);
         }
         core::hint::spin_loop();
     }
@@ -194,7 +211,7 @@ fn wait(what: &str, done: impl Fn() -> bool) {
 /// until its status shows it.
 fn command(phys: &Phys, u: &Unit, bit: u32, what: &str) {
     w32(phys, u.base, GCMD, u.gcmd | bit);
-    wait(what, || r32(phys, u.base, GSTS) & bit != 0);
+    wait(phys, u, what, || r32(phys, u.base, GSTS) & bit != 0);
 }
 
 /// Queue descriptors on every unit, then wait until each has processed them.
@@ -216,7 +233,7 @@ fn invalidate(phys: &Phys, s: &State, descriptors: &[[u64; 2]]) {
         }
         w64(phys, u.base, IQT, tail << 4);
         // SAFETY: as above.
-        wait("a queued invalidation", || unsafe { word(phys, s.status).read_volatile() as u32 } == 1);
+        wait(phys, u, "a queued invalidation", || unsafe { word(phys, s.status).read_volatile() as u32 } == 1);
     }
 }
 
@@ -245,6 +262,9 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
     let s = unsafe { &mut *STATE.0.get() };
     let (mut o, mut other_segments) = (48, [0u64; MAX_UNITS]);
     let mut others = 0;
+    // A unit of segment 0 that cannot be driven: its devices would reach
+    // memory whatever their drivers attach them to.
+    let mut undriven = None;
     while o + 4 <= dmar.len() {
         let field = |at: usize, n: usize| dmar.get(o + at..o + at + n).map(|b| b.iter().rev().fold(0u64, |v, x| v << 8 | *x as u64));
         let (Some(ty), Some(len)) = (field(0, 2), field(2, 2)) else { break };
@@ -252,8 +272,9 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
             break;
         }
         if let (0, Some(segment), Some(base)) = (ty, field(6, 2), field(8, 8)) {
-            let fits = base != 0 && base.is_multiple_of(PAGE) && base + PAGE <= bi.phys_map_len;
-            if fits && segment == 0 && s.n < MAX_UNITS {
+            use kernel_core::x86::{UnitUse, unit_use};
+            let usage = unit_use(base, segment, bi.phys_map_len, s.n, MAX_UNITS);
+            if usage == UnitUse::Drive {
                 s.units[s.n].base = base;
                 s.n += 1;
                 // Its device scopes: an I/O APIC's (type 3) gives the source
@@ -273,16 +294,36 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
                     }
                     at += n as usize;
                 }
-            } else if fits && others < MAX_UNITS {
+            } else if usage == UnitUse::Undriven {
+                undriven = Some(base);
+            } else if usage == UnitUse::Block && others < MAX_UNITS {
                 other_segments[others] = base;
                 others += 1;
             } else {
-                klog!(super::kernel(), "kernel: an IOMMU at {base:#x} is out of reach; its devices are not confined");
+                klog!(
+                    super::kernel(),
+                    "kernel: an IOMMU of segment {segment} at {base:#x} is out of reach; that segment's devices are not confined"
+                );
             }
         }
         o += len as usize;
     }
-    if s.n + others == 0 {
+    // Confinement is promised for every device or for none: with a unit of
+    // segment 0 left undriven, or none at all, the machine says it cannot
+    // confine DMA (`dma_top` 0, every attach `Unsupported`) rather than
+    // attach devices that reach memory anyway.
+    if let Some(base) = undriven {
+        klog!(
+            super::kernel(),
+            "kernel: the IOMMU at {base:#x} cannot be driven (out of reach, or more than {MAX_UNITS} units): no device is confined"
+        );
+        s.n = 0;
+        return;
+    }
+    if s.n == 0 {
+        if others != 0 {
+            klog!(super::kernel(), "kernel: no IOMMU covers segment 0: no device is confined");
+        }
         return;
     }
     // What every unit of segment 0 can do.
@@ -329,6 +370,7 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
     }
     let boot_apic = percpu().apic_id as u64;
     for i in 0..s.n {
+        super::check_uncached(phys, s.units[i].base, "an IOMMU");
         let mut u = s.units[i];
         u.queue = queues + i as u64 * PAGE;
         start(phys, &mut u, s.root, s.status, irt);
@@ -371,7 +413,7 @@ fn start(phys: &Phys, u: &mut Unit, root: u64, status: u64, irt: Option<u64>) {
     u.gcmd = if irt.is_some() { 0 } else { r32(phys, u.base, GSTS) & (GCMD_IRE | GCMD_CFI) };
     w32(phys, u.base, GCMD, u.gcmd);
     let off = GCMD_TE | GCMD_QIE | if irt.is_some() { GCMD_IRE } else { 0 };
-    wait("switching translation off", || r32(phys, u.base, GSTS) & off == 0);
+    wait(phys, u, "switching translation off", || r32(phys, u.base, GSTS) & off == 0);
     w64(phys, u.base, IQT, 0);
     w64(phys, u.base, IQA, u.queue);
     u.gcmd |= GCMD_QIE;
@@ -690,7 +732,29 @@ pub fn fault(phys: &Phys) {
         if status & 1 != 0 && REPORTED.load(Ordering::Relaxed) < FAULT_LINES {
             klog!(super::kernel(), "kernel: the IOMMU's fault records overflowed: refused accesses went unreported");
         }
-        w32(phys, u.base, FSTS, status);
+        // Only the fault records' overflow is cleared here: a queue error
+        // is left for the wait it holds up, which says what failed.
+        w32(phys, u.base, FSTS, status & !FSTS_QUEUE_ERRORS);
     }
+    LOCK.unlock();
+}
+
+/// Remapping entry `line` delivers nothing from now on (its line was
+/// unbound): a device that writes its message is refused, and the entry
+/// is out of every unit's cache when this returns.
+pub fn unremap(phys: &Phys, line: usize) {
+    if !remapping() || line >= IRT_ENTRIES {
+        return;
+    }
+    LOCK.lock();
+    // SAFETY: under `LOCK`.
+    let s = unsafe { &*STATE.0.get() };
+    let at = s.irt + line as u64 * 16;
+    // SAFETY: entry `line` of the kernel's table: not present.
+    unsafe {
+        word(phys, at).write_volatile(0);
+        word(phys, at + 8).write_volatile(0);
+    }
+    invalidate(phys, s, &[[4 | 1 << 4 | (line as u64) << 32, 0]]);
     LOCK.unlock();
 }

@@ -32,3 +32,4 @@ smp_timeouts smp=8 progress
 entropy
 sched quiet
 console
+isolated

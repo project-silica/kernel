@@ -126,6 +126,56 @@ pub fn write_parts<H: Hal>(hal: &H, writer: u64, parts: &[&[u8]]) {
     LINE.unlock();
 }
 
+/// Lines a program can cause (a fault with nobody to tell) allowed in one
+/// [`RATE_WINDOW`]: the console is shared by every processor and slow on a
+/// real serial port, so how often a program can make the kernel write is
+/// bounded, whatever it does.
+const RATE_LINES: u64 = 10;
+const RATE_WINDOW: u64 = 1_000_000_000;
+
+/// The machine's budget of such lines (one per kernel, kept with the line lock
+/// held).
+pub struct Rate {
+    start: AtomicU64,
+    count: AtomicU64,
+    dropped: AtomicU64,
+}
+
+impl Rate {
+    /// A full budget.
+    pub const fn new() -> Rate {
+        Rate { start: AtomicU64::new(0), count: AtomicU64::new(0), dropped: AtomicU64::new(0) }
+    }
+
+    /// Whether a line a program caused may be written at `now`: at most
+    /// ten in a second. `Some(n)` when it may, `n` being how many
+    /// were not written since the last one that was (the line says so).
+    pub fn allow(&self, now: u64) -> Option<u64> {
+        LINE.lock();
+        let start = self.start.load(Ordering::Relaxed);
+        if start == 0 || now.saturating_sub(start) >= RATE_WINDOW {
+            self.start.store(now.max(1), Ordering::Relaxed);
+            self.count.store(0, Ordering::Relaxed);
+        }
+        let n = self.count.load(Ordering::Relaxed);
+        let r = if n < RATE_LINES {
+            self.count.store(n + 1, Ordering::Relaxed);
+            Some(self.dropped.swap(0, Ordering::Relaxed))
+        } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        LINE.unlock();
+        r
+    }
+}
+
+impl Default for Rate {
+    fn default() -> Rate {
+        Rate::new()
+    }
+}
+
 /// One line for the architecture's console, gathered and written with one
 /// call, so that lines from different processors (and the pieces programs
 /// write through their console capability) do not tear one another. A line
@@ -174,4 +224,117 @@ macro_rules! klog {
         let _ = c.write_str("\r\n");
         c.flush();
     }};
+}
+
+/// A count of lines not logged, as the end of a line: nothing for 0, else
+/// the number and a closing parenthesis.
+pub struct Count(pub u64);
+
+impl fmt::Display for Count {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0 == 0 { Ok(()) } else { write!(f, "{})", self.0) }
+    }
+}
+
+/// The bytes a console has been given and not yet sent: the architecture's
+/// console writes into it and feeds the device only as fast as the device
+/// takes them, never waiting on it (a 16550 at 115,200 baud takes a byte
+/// every 87 us: a whole line, waited for with interrupts off, held a
+/// processor for 19 ms). Every use is under the console's own lock; the
+/// atomics only make it shareable.
+///
+/// A writer that finds no room for a piece drops the whole piece and it is
+/// counted; the next piece that fits is preceded by a line saying how many
+/// bytes were not written, so a reader knows the console lost something.
+pub struct TxRing<const N: usize> {
+    buf: [AtomicU8; N],
+    /// Bytes ever put and ever taken: `head - tail` are waiting.
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    dropped: AtomicU64,
+}
+
+impl<const N: usize> TxRing<N> {
+    /// An empty ring.
+    pub const fn new() -> Self {
+        TxRing { buf: [const { AtomicU8::new(0) }; N], head: AtomicUsize::new(0), tail: AtomicUsize::new(0), dropped: AtomicU64::new(0) }
+    }
+
+    fn room(&self) -> usize {
+        N - (self.head.load(Ordering::Relaxed) - self.tail.load(Ordering::Relaxed))
+    }
+
+    fn push(&self, bytes: &[u8]) {
+        let mut h = self.head.load(Ordering::Relaxed);
+        for &b in bytes {
+            self.buf[h % N].store(b, Ordering::Relaxed);
+            h += 1;
+        }
+        self.head.store(h, Ordering::Relaxed);
+    }
+
+    /// Queue `bytes` whole, or drop them whole and count them.
+    pub fn put(&self, bytes: &[u8]) {
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        if dropped != 0 {
+            let mut note = [0u8; 64];
+            let n = note_dropped(&mut note, dropped);
+            if self.room() < n + bytes.len() {
+                self.dropped.store(dropped + bytes.len() as u64, Ordering::Relaxed);
+                return;
+            }
+            self.push(&note[..n]);
+            self.dropped.store(0, Ordering::Relaxed);
+        }
+        if self.room() < bytes.len() {
+            self.dropped.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            return;
+        }
+        self.push(bytes);
+    }
+
+    /// Whether anything waits to be sent.
+    pub fn pending(&self) -> bool {
+        self.head.load(Ordering::Relaxed) != self.tail.load(Ordering::Relaxed)
+    }
+
+    /// The next byte to send, taken.
+    pub fn take(&self) -> Option<u8> {
+        let t = self.tail.load(Ordering::Relaxed);
+        if t == self.head.load(Ordering::Relaxed) {
+            return None;
+        }
+        let b = self.buf[t % N].load(Ordering::Relaxed);
+        self.tail.store(t + 1, Ordering::Relaxed);
+        Some(b)
+    }
+}
+
+impl<const N: usize> Default for TxRing<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// "\r\n[console: N bytes not written]\r\n" into `out`; its length.
+fn note_dropped(out: &mut [u8; 64], n: u64) -> usize {
+    let mut len = 0;
+    let mut put = |b: &[u8]| {
+        out[len..len + b.len()].copy_from_slice(b);
+        len += b.len();
+    };
+    put(b"\r\n[console: ");
+    let mut digits = [0u8; 20];
+    let (mut v, mut i) = (n, digits.len());
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    put(&digits[i..]);
+    put(b" bytes not written]\r\n");
+    len
 }

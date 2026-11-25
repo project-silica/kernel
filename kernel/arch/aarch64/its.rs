@@ -69,6 +69,11 @@ struct State {
     pta: bool,
     /// What each message line is mapped as: the device (u64::MAX: nothing).
     line_device: [u64; LINES],
+    /// The DeviceIDs the device table covers (from 0), and the firmware's
+    /// I/O Remapping Table, which maps a PCI requester ID to its DeviceID
+    /// (none: the identity, for segment 0 only).
+    devices: u64,
+    iort: Option<&'static [u8]>,
 }
 
 struct Racy(UnsafeCell<State>);
@@ -91,6 +96,8 @@ static STATE: Racy = Racy(UnsafeCell::new(State {
     collections: [false; MAX_CPUS],
     pta: false,
     line_device: [u64::MAX; LINES],
+    devices: 0,
+    iort: None,
 }));
 static LOCK: Lock = Lock::new();
 /// Physical address of each processor's redistributor frame (0: unknown).
@@ -135,9 +142,10 @@ pub fn ready() -> bool {
 /// before the root task is given the rest of memory). `base` is its
 /// registers' virtual address and `phys` their physical one. `virt` turns
 /// a physical address of carved memory into the kernel's virtual one.
-pub fn init(base: u64, phys: u64, cpus: usize, table: &mut RegionTable, virt: impl Fn(u64) -> u64) -> bool {
+pub fn init(base: u64, phys: u64, cpus: usize, table: &mut RegionTable, iort: Option<&'static [u8]>, virt: impl Fn(u64) -> u64) -> bool {
     // SAFETY: boot processor, alone.
     let s = unsafe { &mut *STATE.0.get() };
+    s.iort = iort;
     let typer = rd64(base + 0x8);
     let itt_entry = (typer >> 4 & 0xF) + 1;
     let dev_bits = (typer >> 13 & 0x1F) + 1;
@@ -168,7 +176,10 @@ pub fn init(base: u64, phys: u64, cpus: usize, table: &mut RegionTable, virt: im
         let v = rd64(reg);
         let (kind, entry) = (v >> 56 & 7, (v >> 48 & 0x1F) + 1);
         let entries = match kind {
-            1 => 1u64 << dev_bits.min(16),
+            1 => {
+                s.devices = 1u64 << dev_bits.min(16);
+                s.devices
+            }
             4 => cpus.next_power_of_two() as u64,
             _ => continue,
         };
@@ -250,13 +261,57 @@ fn sync(s: &mut State, cpu: usize) {
 /// register's physical address and the event number.
 pub fn route(line: usize, cpu: usize, device: u64) -> Option<(u64, u64)> {
     let n = line.checked_sub(FIRST_LINE).filter(|n| *n < LINES && ready())?;
-    let device = device & 0xFFFF;
     LOCK.lock();
     // SAFETY: under `LOCK`.
     let s = unsafe { &mut *STATE.0.get() };
-    let r = route_locked(s, n, cpu, device);
+    let r = device_id(s, device).and_then(|id| route_locked(s, n, cpu, id));
     LOCK.unlock();
     r
+}
+
+/// The ITS DeviceID of the device with identity `device` (`segment << 16 |
+/// requester ID`): as the firmware's IORT maps it, or the requester ID
+/// itself on a machine without one (segment 0 only). `None` when the table
+/// maps it to no ITS, or to a DeviceID beyond the device table: never cut
+/// to fit, which would make it another device.
+fn device_id(s: &State, device: u64) -> Option<u64> {
+    let (segment, rid) = (u32::try_from(device >> 16).ok()?, (device & 0xFFFF) as u32);
+    let id = match s.iort {
+        Some(t) => kernel_core::acpi::iort_its_device(t, segment, rid)?,
+        None if segment == 0 => rid,
+        None => return None,
+    };
+    (u64::from(id) < s.devices).then_some(u64::from(id))
+}
+
+/// Message line `line` is no longer bound: its mapping goes, and its
+/// device's translation table with its last line.
+pub fn release(line: usize) {
+    let Some(n) = line.checked_sub(FIRST_LINE).filter(|n| *n < LINES && ready()) else { return };
+    LOCK.lock();
+    // SAFETY: under `LOCK`.
+    let s = unsafe { &mut *STATE.0.get() };
+    unmap_line(s, n);
+    LOCK.unlock();
+}
+
+/// Take line `n`'s mapping away (DISCARD), and its device's translation
+/// table when no other line uses it (MAPD, not valid), freeing the slot.
+fn unmap_line(s: &mut State, n: usize) {
+    let old = s.line_device[n];
+    if old == u64::MAX {
+        return;
+    }
+    command(s, [0x0F | old << 32, n as u64, 0, 0]);
+    s.line_device[n] = u64::MAX;
+    // SAFETY: the property table's byte for this LPI, the kernel's memory.
+    unsafe { core::ptr::write_volatile((s.props + n as u64) as *mut u8, PRIORITY) };
+    if !s.line_device.contains(&old)
+        && let Some(slot) = s.itt_owner.iter().position(|o| *o == old)
+    {
+        command(s, [0x08 | old << 32, 0, 0, 0]);
+        s.itt_owner[slot] = u64::MAX;
+    }
 }
 
 fn route_locked(s: &mut State, n: usize, cpu: usize, device: u64) -> Option<(u64, u64)> {
@@ -266,12 +321,9 @@ fn route_locked(s: &mut State, n: usize, cpu: usize, device: u64) -> Option<(u64
         command(s, [0x09, 0, 1 << 63 | rd | cpu as u64, 0]);
         s.collections[cpu] = true;
     }
-    // The line's earlier mapping goes first (DISCARD).
-    let old = s.line_device[n];
-    if old != u64::MAX {
-        command(s, [0x0F | old << 32, n as u64, 0, 0]);
-        s.line_device[n] = u64::MAX;
-    }
+    // The line's earlier mapping goes first, and its device's table with
+    // its last line.
+    unmap_line(s, n);
     // The device's translation table, mapped the first time (MAPD).
     if !s.itt_owner.contains(&device) {
         let slot = s.itt_owner.iter().position(|o| *o == u64::MAX)?;

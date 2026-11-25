@@ -23,9 +23,9 @@ use silica_abi::NONBLOCK;
 pub use silica_abi::Syscall;
 pub use silica_abi::root;
 pub use silica_abi::{
-    ASPACE_IO, Error, FAULT_FETCH, FAULT_LABEL, FAULT_MAP, FAULT_PRESENT, FAULT_RESUME, FAULT_WRITE, Fault, IRQ_ACTIVE_LOW, IRQ_LEVEL,
-    IRQ_LINES, IRQ_MSI, KEEP, LARGE_BITS, LISTEN_SHIFT, MsgInfo, ObjectType, PAGE_BITS, Rights, SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT,
-    SCHED_FAIR, SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
+    ASPACE_IO, ASPACE_ISOLATED, Error, FAULT_FETCH, FAULT_LABEL, FAULT_MAP, FAULT_PRESENT, FAULT_RESUME, FAULT_WRITE, Fault,
+    IRQ_ACTIVE_LOW, IRQ_LEVEL, IRQ_LINES, IRQ_MSI, KEEP, LARGE_BITS, LISTEN_SHIFT, MsgInfo, ObjectType, PAGE_BITS, Rights, SCHED_DEADLINE,
+    SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
 };
 
 /// Platform API level (`spec/CI_RELEASE.md` section 7).
@@ -440,6 +440,13 @@ pub fn retype_io_space(untyped: Cap, bits: u8, space: Cap, slot: u64) -> Result<
     sys(Syscall::Retype, [untyped.0, ObjectType::AddressSpace as u64, bits as u64 | ASPACE_IO, space.0, slot, 1]).map(|_| ())
 }
 
+/// Make an address space of `2^bits` bytes isolated against speculative
+/// execution (`ASPACE_ISOLATED`): for a program that holds secrets. Every
+/// switch into or out of it flushes the processor's branch predictors.
+pub fn retype_isolated_space(untyped: Cap, bits: u8, space: Cap, slot: u64) -> Result<()> {
+    sys(Syscall::Retype, [untyped.0, ObjectType::AddressSpace as u64, bits as u64 | ASPACE_ISOLATED, space.0, slot, 1]).map(|_| ())
+}
+
 /// From now on the device with identity `device` (covered by `devices`)
 /// reaches exactly what is mapped in the device address space `io_space`.
 pub fn device_attach(devices: Cap, device: u32, io_space: Cap) -> Result<()> {
@@ -528,17 +535,21 @@ pub fn inspect_thread(thread: Cap) -> Result<ThreadInfo> {
 
 /// Make `sc` a weighted fair share: threads bound to it share their
 /// processor with others in proportion to `weight` (an unbound thread
-/// weighs [`SCHED_DEFAULT_WEIGHT`]).
-pub fn sched_fair(sc: Cap, weight: u64) -> Result<()> {
-    sys(Syscall::SchedConfigure, [sc.0, SCHED_FAIR, weight, 0, 0, 0]).map(|_| ())
+/// weighs [`SCHED_DEFAULT_WEIGHT`]). A weight above the default needs
+/// `time`, a processor-time capability covering every processor
+/// (`root::SLOT_SCHED` or one narrowed from it; `Cap::NONE`: none, and
+/// `NoRights` for more than the default).
+pub fn sched_fair(sc: Cap, weight: u64, time: Cap) -> Result<()> {
+    sys(Syscall::SchedConfigure, [sc.0, SCHED_FAIR, weight, 0, 0, time.0]).map(|_| ())
 }
 
 /// Make `sc` a reservation of `budget` nanoseconds in every `period` on
 /// processor `cpu`: threads bound to it run first while it lasts, and wait
 /// for the next period once it is spent. `Overload` when the processor's
-/// reservations would take more than 90% of it.
-pub fn sched_deadline(sc: Cap, budget: u64, period: u64, cpu: usize) -> Result<()> {
-    sys(Syscall::SchedConfigure, [sc.0, SCHED_DEADLINE, budget, period, cpu as u64, 0]).map(|_| ())
+/// reservations would take more than 90% of it. Needs `time`, a
+/// processor-time capability covering `cpu` (`NoRights` otherwise).
+pub fn sched_deadline(sc: Cap, budget: u64, period: u64, cpu: usize, time: Cap) -> Result<()> {
+    sys(Syscall::SchedConfigure, [sc.0, SCHED_DEADLINE, budget, period, cpu as u64, time.0]).map(|_| ())
 }
 
 /// Run `thread` on the scheduling context `sc` (`Cap::NONE`: the default

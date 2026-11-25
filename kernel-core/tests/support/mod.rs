@@ -17,6 +17,17 @@ use std::cell::{Cell, RefCell};
 
 /// Physical address of the first byte of the host machine's memory.
 pub const RAM_BASE: u64 = 0x10_0000;
+/// The boot secret the test machines are booted with: no byte repeated,
+/// so a copy of any eight of them is found anywhere it lands.
+pub const BOOT_SECRET: [u8; 32] = {
+    let mut s = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        s[i] = 0xA0 + i as u8;
+        i += 1;
+    }
+    s
+};
 /// Processors a test machine can have.
 pub const TEST_CPUS: usize = 4;
 
@@ -38,6 +49,9 @@ pub struct TestHal {
     pub console: RefCell<Vec<u8>>,
     pub flushes: Cell<u64>,
     pub switches: Cell<u64>,
+    /// The last switch: the thread whose state was saved (0: none) and the
+    /// one loaded.
+    pub last_switch: Cell<(Paddr, Paddr)>,
     pub left: Cell<u64>,
     /// The address-space root each simulated processor has loaded (0: the
     /// kernel's own), as CR3 would hold it. This HAL keeps the kernel in
@@ -150,6 +164,12 @@ impl Hal for TestHal {
         self.irq_log.borrow_mut().push(format!("message {line} cpu{cpu} from {source:#x}"));
         Some((0xFEE0_0000 | (cpu as u64) << 12, 0x30 + line as u64))
     }
+    fn msi_release(&self, line: usize) {
+        self.irq_log.borrow_mut().push(format!("release {line}"));
+    }
+    fn isolate(&self, entering: bool) {
+        self.irq_log.borrow_mut().push(format!("isolate {entering}"));
+    }
     fn init_root(&self, phys: &Phys, root: Paddr) {
         for (c, loaded) in self.roots.iter().enumerate() {
             assert_ne!(loaded.get(), root, "a root is built in memory processor {c} still runs on");
@@ -161,6 +181,7 @@ impl Hal for TestHal {
     }
     fn switch_thread(&self, _phys: &Phys, _from: Paddr, _to: Paddr, root: Paddr) {
         self.switches.set(self.switches.get() + 1);
+        self.last_switch.set((_from, _to));
         self.roots[self.cpu.get()].set(root);
     }
     fn leave_aspace(&self, root: Paddr) {
@@ -385,6 +406,8 @@ pub struct Machine {
     pub cs: Cap,
     pub info: Paddr,
     pub mib: u64,
+    /// The root thread's argument registers as the kernel started it.
+    pub start_args: [u64; 6],
 }
 
 impl Machine {
@@ -411,6 +434,7 @@ impl Machine {
             console: RefCell::new(Vec::new()),
             flushes: Cell::new(0),
             switches: Cell::new(0),
+            last_switch: Cell::new((0, 0)),
             left: Cell::new(0),
             roots: [const { Cell::new(0) }; TEST_CPUS],
             answers: Cell::new(0),
@@ -450,7 +474,7 @@ impl Machine {
             framebuffer: [0; 5],
             clock: [1_000_000_000, 0, 0],
             wall_clock: [0; 2],
-            entropy: [7; 32],
+            entropy: BOOT_SECRET,
             entropy_sources: 0,
             cmdline: b"test=host",
             cpus: cpus as u64,
@@ -458,6 +482,7 @@ impl Machine {
         k.set_cpu_count(cpus);
         k.enter();
         let root = k.boot_root(&spec).expect("root task");
+        let start_args = core::array::from_fn(|i| k.regs(root)[TestHal::ARG[i]].get());
         let tv = k.thread_view(root);
         let cs = k.view(tv.slots[0]).expect("root cspace").cap;
         let asp = k.view(k.slot_addr(&cs, SLOT_ASPACE).unwrap()).unwrap().cap.obj;
@@ -465,7 +490,7 @@ impl Machine {
         k.schedule();
         k.leave();
         assert_eq!(k.current(), root);
-        Machine { k, _ram: ram, root, cs, info, mib }
+        Machine { k, _ram: ram, root, cs, info, mib, start_args }
     }
 
     pub fn info(&self) -> &RootInfo {

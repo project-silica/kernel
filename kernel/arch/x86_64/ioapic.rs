@@ -66,6 +66,7 @@ pub fn init(bi: &BootInfo, phys: &Phys) {
             let u32_at = |i: usize| u32::from_le_bytes([madt[o + i], madt[o + i + 1], madt[o + i + 2], madt[o + i + 3]]);
             let (base, first) = (u32_at(4) as u64, u32_at(8));
             if base != 0 && base + 0x20 <= bi.phys_map_len {
+                super::check_uncached(phys, base, "an I/O APIC");
                 let count = (read(phys, base, 1) >> 16 & 0xFF) + 1;
                 // Every pin masked; written only where it is not already
                 // (the reset state, which firmware mostly leaves). Under a
