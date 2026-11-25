@@ -1539,6 +1539,14 @@ pub extern "C" fn kmain(info: u64) -> ! {
             "WARNING: kernel: this processor is affected by Meltdown and Silica does not isolate kernel page tables; the owner accepted that any program can read all of memory (meltdown=accept)"
         );
     }
+    match kernel_core::boot::entropy_verdict(bi.entropy_sources, Cmdline(cmdline).get("entropy")) {
+        Err(why) => {
+            klog!(k, "{why}");
+            die();
+        }
+        Ok(Some(warning)) => klog!(k, "{warning}"),
+        Ok(None) => {}
+    }
     if Cmdline(cmdline).get("panic") == Some(b"test") {
         deliberate_panic();
     }

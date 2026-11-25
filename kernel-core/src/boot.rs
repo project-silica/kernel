@@ -191,3 +191,36 @@ impl Default for RegionTable {
         RegionTable::new()
     }
 }
+
+/// Whether the machine starts with a boot secret gathered from `sources`
+/// (`RootInfo::entropy_sources`: the loader's trusted sources, the
+/// processor's generator and the firmware's; 0 is timing jitter alone),
+/// when the command line's `entropy=` says `setting`. Every program's seed
+/// and every service's key descends from the boot secret, so without a
+/// trusted source the machine is not started, unless its owner accepts
+/// that (`entropy=accept`): `Err` with the line that says why, or `Ok`
+/// with a warning line to say (or none).
+pub fn entropy_verdict(sources: u64, setting: Option<&[u8]>) -> Result<Option<&'static str>, &'static str> {
+    match (sources, setting) {
+        (0, Some(b"accept")) => Ok(Some(
+            "WARNING: kernel: no source of randomness the loader trusts; the owner accepted that every key and seed on this machine may be guessable (entropy=accept)",
+        )),
+        (0, _) => Err(
+            "ERROR: kernel: the loader found no source of randomness it trusts (the processor's RDSEED or RDRAND, Arm's RNDR, the firmware's generator): every key and seed on this machine would be guessable. Not started; `entropy=accept` on the kernel command line runs it anyway",
+        ),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod entropy {
+    #[test]
+    fn a_boot_with_no_trusted_source_is_refused_unless_the_owner_accepts() {
+        use super::entropy_verdict as v;
+        assert!(v(0, None).is_err());
+        assert!(v(0, Some(b"yes")).is_err());
+        assert!(matches!(v(0, Some(b"accept")), Ok(Some(_))));
+        assert_eq!(v(1, None), Ok(None));
+        assert_eq!(v(3, Some(b"accept")), Ok(None));
+    }
+}

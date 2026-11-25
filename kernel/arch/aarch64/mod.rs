@@ -1144,6 +1144,16 @@ extern "C" fn kmain(info: u64) -> ! {
     let top = regions.last().map_or(0, |r| r.base + r.len).max(1 << width);
     let uart = spcr_uart(bi.rsdp).unwrap_or(0) & !0xFFF;
     let reserved = [(m.gicd, m.gicd + 0x1_0000), (m.gicr.0, m.gicr.0 + m.gicr.1), (uart, uart + 0x1000), (m.its, m.its + 0x2_0000)];
+    match kernel_core::boot::entropy_verdict(bi.entropy_sources, cmdline.get("entropy")) {
+        Err(why) => {
+            let _ = write!(Out, "{why}\r\n");
+            die();
+        }
+        Ok(Some(warning)) => {
+            let _ = write!(Out, "{warning}\r\n");
+        }
+        Ok(None) => {}
+    }
     // The other processors, started and counted (those that arrived)
     // before the root task is told how many there are.
     let cpus = if cpus > 1 { smp::launch(cpus, cmdline.get("panic") == Some(b"secondary")) } else { 1 };
