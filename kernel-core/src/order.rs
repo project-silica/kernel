@@ -419,7 +419,7 @@ mod tests {
             x ^= x << 17;
             x
         };
-        for _ in 0..20_000 {
+        for _ in 0..if cfg!(miri) { 400 } else { 20_000 } {
             let t = (rand() % n as u64) + 1;
             if let Some(i) = model.iter().position(|m| *m == t) {
                 model.remove(i);
@@ -451,7 +451,7 @@ mod tests {
     /// 1.44 log2(n): no insertion walks far.
     #[test]
     fn stays_shallow() {
-        let n = 10_000;
+        let n = if cfg!(miri) { 300 } else { 10_000 };
         let a = arena(n);
         for t in 1..=n as u64 {
             a.keys[t as usize - 1].set(t / 3);
@@ -459,5 +459,6 @@ mod tests {
         }
         assert_eq!(check(&a, n), Ok(n));
         assert!(height(&a, a.root.top.get()) <= 20);
+        assert!(height(&a, a.root.top.get()) as f64 <= 1.45 * (n as f64).log2() + 1.0);
     }
 }

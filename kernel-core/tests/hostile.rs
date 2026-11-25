@@ -539,6 +539,13 @@ fn many_queued_threads_do_not_slow_a_processors_wake_ups_or_timed_waits() {
         m.k.check_timers().unwrap();
         best
     }
+    // Under Miri (which checks the memory safety of the same paths) a few
+    // threads, and no time: its times are not the machine's.
+    if cfg!(miri) {
+        fastest_wake_ns(40);
+        fastest_timed_wait_ns(40);
+        return;
+    }
     let (few, many) = (fastest_wake_ns(10), fastest_wake_ns(1700));
     assert!(many < few * 3, "a wake-up beside 1,700 runnable threads took {many} ns, beside 10 {few} ns");
     let (few, many) = (fastest_timed_wait_ns(10), fastest_timed_wait_ns(600));
