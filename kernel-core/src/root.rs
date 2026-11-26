@@ -136,6 +136,7 @@ impl<H: Hal> Kernel<H> {
         self.boot_retype(us, ObjectType::Thread, 0, &cs, SLOT_THREAD, 1)?;
         self.boot_retype(us, ObjectType::AddressSpace, AS_BITS, &cs, SLOT_ASPACE, 1)?;
         self.boot_retype(us, ObjectType::Frame, PAGE_BITS, &cs, SLOT_IPCBUF, 1)?;
+        self.boot_retype(us, ObjectType::SchedContext, 0, &cs, SLOT_CONTEXT, 1)?;
         let hw = |flags, end| Cap { ty: ObjectType::Hw, rights: Rights::ALL, bits: 0, flags, obj: 0, badge: end };
         if spec.ports {
             self.insert_root(slot(SLOT_PORTS), &hw(FLAG_PORTS, 1 << 16));
@@ -284,6 +285,12 @@ impl<H: Hal> Kernel<H> {
             r[H::ARG[1 + i]].set(u64::from_le_bytes(*w));
         }
         r[H::FLAGS].set(H::FLAGS_INIT);
+        // The first time there is: one fair share of this processor, which
+        // the root task holds like any context it will make for others.
+        let sc = self.slot(slot(SLOT_CONTEXT)).obj.get();
+        let here = self.hal.cpu() as u64;
+        self.sched_configure(sc, silica_abi::SCHED_FAIR, silica_abi::SCHED_DEFAULT_WEIGHT, 0, here, here..here + 1)?;
+        self.sched_bind(t, sc)?;
         self.make_runnable(t);
         self.root_thread.set(t);
         Ok(t)

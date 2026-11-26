@@ -289,8 +289,8 @@ fn an_address_space_is_reused_only_after_every_processor_has_left_it() {
     // A thread in it, moved to processor 1 and running there.
     m.retype(ut, T::Thread, 0, FREE + 2, 1);
     m.ok(S::ThreadConfigure, [FREE + 2, SLOT_CAPSPACE, FREE + 1, 0, 0, 0]);
+    m.move_to(FREE + 2, 1);
     m.ok(S::ThreadStart, [FREE + 2, 0x40_0000, 0, 0, 1, 0]);
-    m.ok(S::ThreadControl, [FREE + 2, 2, 1, 0, 0, 0]);
     m.settle(1);
     assert_eq!(m.k.hal.roots[1].get(), root, "processor 1 runs on the new address space");
     // Processor 0 destroys it, then builds a new one in the same memory.
@@ -453,7 +453,7 @@ fn time_slices_rotate_runnable_threads() {
     m.ok(S::ThreadControl, [FREE, 1, 0, 0, 0, 0]);
     assert_eq!(m.k.thread_view(t).state, RUNNABLE);
     assert_eq!(m.err(S::ThreadControl, [FREE, 9, 0, 0, 0, 0]), Error::BadArg);
-    assert_eq!(m.err(S::ThreadControl, [FREE, 2, 1, 0, 0, 0]), Error::BadArg, "there is no processor 1");
+    assert_eq!(m.err(S::ThreadControl, [FREE, 2, 0, 0, 0, 0]), Error::BadCap, "binding takes a scheduling context");
     assert_eq!(m.err(S::ThreadStart, [FREE, 0xFFFF_8000_0000_0000, 0, 0, 1, 0]), Error::BadArg);
 }
 
@@ -529,6 +529,7 @@ fn thread_configure_validates_before_changing_anything() {
     assert_eq!(m.k.view(m.k.thread_view(t).slots[3]).unwrap().cap.ty, T::Frame);
     m.ok(S::ThreadConfigure, [FREE, 0, KEEP, KEEP, KEEP, 0]);
     assert!(m.k.view(m.k.thread_view(t).slots[0]).is_none());
+    m.move_to(FREE, 0);
     // A thread without a CapSpace gets BadCap for everything.
     m.ok(S::ThreadStart, [FREE, 0x40_0000, 0, 0, 1, 0]);
     let r = m.sys_as(t, S::Send, [FREE, 0, 0, 0, 0, 0]);
@@ -709,7 +710,7 @@ fn two_processors() -> (Machine, u64) {
     m.retype(ut, T::Endpoint, 0, FREE, 1);
     m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 15, 77, 0]);
     let t = m.spawn(ut, FREE + 2);
-    m.ok(S::ThreadControl, [FREE + 2, 2, 1, 0, 0, 0]);
+    m.move_to(FREE + 2, 1);
     assert_eq!(m.k.thread_view(t).state, RUNNABLE, "a moved runnable thread stays runnable");
     assert_eq!(m.k.hal.kicks.borrow().last(), Some(&(1, false)), "the other processor is told it has work");
     m.settle(1);
@@ -730,7 +731,7 @@ fn a_thread_moved_while_it_waits_for_a_reply_is_answered_on_its_new_processor() 
     m.settle(0);
     assert_eq!((m.k.current(), m.arg(m.root, 2)), (m.root, 10));
     // Moved while it waits: still waiting, now on processor 0.
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     let v = m.k.thread_view(t);
     assert_eq!((v.state, v.cpu), (REPLY, 0), "the call survives the move");
     // The answer reaches it there.
@@ -748,7 +749,7 @@ fn a_thread_moved_while_it_waits_to_receive_makes_its_receive_again_there() {
     assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
     let ip = m.k.regs(t)[0].get();
     m.on(0);
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     let v = m.k.thread_view(t);
     assert_eq!((v.state, v.cpu, v.blocked_on), (RUNNABLE, 0, 0), "off the endpoint, runnable on its new processor");
     assert_eq!(m.k.regs(t)[0].get(), ip - 2, "set to make the same system call again");
@@ -773,7 +774,7 @@ fn a_server_stopped_in_reply_recv_after_replying_only_receives_when_it_runs_agai
     assert_eq!((m.k.current(), m.status(m.root), m.arg(m.root, 2)), (m.root, 0, 11));
     // Stopped there (here: moved), the reply is not made again: what runs
     // again is the receive.
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     let r = m.k.regs(t);
     assert_eq!(r[0].get(), ip - 2);
     assert_eq!((r[3].get(), m.arg(t, 0), m.arg(t, 1), m.arg(t, 2)), (S::Recv as u64, FREE, 0, 0));
@@ -792,7 +793,7 @@ fn a_signal_recv_made_again_only_receives() {
     m.ok(S::Recv, [FREE + 3, 1, 0, 0, 0, 0]);
     assert_eq!(m.arg(m.root, 0), 1, "signalled once");
     // Moved while it waits, its call is made again: as a receive alone.
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     let r = m.k.regs(t);
     assert_eq!((r[0].get(), r[3].get(), m.arg(t, 0)), (ip - 2, S::Recv as u64, FREE));
     assert_eq!(m.arg(t, 3), FREE + 3, "the notification is still in its registers");
@@ -845,11 +846,12 @@ fn a_suspended_thread_moved_stays_suspended_and_a_thread_may_move_itself() {
     let (m, t) = two_processors();
     m.on(0);
     m.ok(S::ThreadControl, [FREE + 2, 0, 0, 0, 0, 0]);
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     let v = m.k.thread_view(t);
     assert_eq!((v.state, v.cpu), (INACTIVE, 0));
     // The root moves itself to processor 1 and carries on there.
-    let r = m.raw(S::ThreadControl as u64, [SLOT_THREAD, 2, 1, 0, 0, 0]);
+    let time = m.time_on(1);
+    let r = m.raw(S::ThreadControl as u64, [SLOT_THREAD, 2, time, 0, 0, 0]);
     assert_eq!(r.status, 0);
     assert_ne!(m.k.current(), m.root, "processor 0 no longer runs it");
     let v = m.k.thread_view(m.root);
@@ -890,7 +892,7 @@ fn a_receive_timing_out_on_a_queue_another_processor_owns_takes_every_lock() {
     let (ut, _) = m.big_untyped();
     m.spawn(ut, FREE + 3);
     m.spawn(ut, FREE + 4);
-    m.ok(S::ThreadControl, [FREE + 4, 2, 1, 0, 0, 0]);
+    m.move_to(FREE + 4, 1);
     m.ok(S::ThreadControl, [FREE + 4, 1, 0, 0, 0, 0]);
     m.settle(1);
     assert_eq!(m.k.current(), t);
@@ -928,7 +930,7 @@ fn a_call_is_parked_on_a_notification_last_used_from_a_third_processor() {
     m.retype(ut, T::Notification, 0, FREE + 9, 1);
     let place = |slot: u64, cpu: u64| {
         let t = m.spawn(ut, slot);
-        m.ok(S::ThreadControl, [slot, 2, cpu, 0, 0, 0]);
+        m.move_to(slot, cpu);
         m.ok(S::ThreadControl, [slot, 1, 0, 0, 0, 0]);
         m.settle(cpu as usize);
         assert_eq!(m.k.current(), t);
@@ -972,7 +974,7 @@ fn calls_between_threads_of_one_processor_take_only_that_processors_lock() {
     // A second endpoint served and called on processor 1 only.
     m.retype(ut, T::Endpoint, 0, FREE + 5, 1);
     let c = m.spawn(ut, FREE + 6);
-    m.ok(S::ThreadControl, [FREE + 6, 2, 1, 0, 0, 0]);
+    m.move_to(FREE + 6, 1);
     m.ok(S::ThreadControl, [FREE + 6, 1, 0, 0, 0, 0]);
     m.on(1);
     // The first wait gives the endpoint to processor 1 (a global step).
@@ -1206,7 +1208,7 @@ fn an_interrupt_line_signals_the_notification_it_is_bound_to() {
     assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "unmask 5");
     // A waiter on another processor is woken there.
     let t = m.spawn(ut, FREE + 3);
-    m.ok(S::ThreadControl, [FREE + 3, 2, 1, 0, 0, 0]);
+    m.move_to(FREE + 3, 1);
     m.ok(S::ThreadControl, [FREE + 3, 1, 0, 0, 0, 0]);
     m.settle(1);
     assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
@@ -1234,7 +1236,7 @@ fn an_interrupt_line_follows_the_thread_waiting_on_it() {
     m.retype(ut, T::Notification, 0, FREE, 1);
     // A driver's thread waits on processor 1; the line is bound from 0.
     let t = m.spawn(ut, FREE + 3);
-    m.ok(S::ThreadControl, [FREE + 3, 2, 1, 0, 0, 0]);
+    m.move_to(FREE + 3, 1);
     m.settle(1);
     assert_eq!(m.k.current(), t);
     assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
@@ -1257,7 +1259,7 @@ fn an_interrupt_line_follows_the_thread_waiting_on_it() {
     assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
     // The thread is moved to processor 0 and waits there again.
     m.on(0);
-    m.ok(S::ThreadControl, [FREE + 3, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 3, 0);
     m.ok(S::Yield, [0; 6]);
     assert_eq!(m.k.current(), t);
     assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
@@ -1797,7 +1799,7 @@ fn a_server_loop_replies_receives_and_hears_interrupts_in_one_call() {
     m.settle(1);
     assert!(m.raw(S::Recv as u64, [listening(ep, n), 0, 0, 0, 0, 0]).blocked);
     m.on(0);
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     m.ok(S::Send, [n + 1, 0, 0, 0, 0, 0]);
     let r = m.sys_as(t, S::Recv, [listening(ep, n), 0, 0, 0, 0, 0]);
     assert!(!r.blocked);
@@ -1990,7 +1992,7 @@ fn a_call_with_a_time_limit_ends_at_it() {
     m.on(1);
     assert!(m.raw(S::Call as u64, [within(FREE + 1, 1000), MsgInfo::new(3, 1).0, 10, 0, 0, 0]).blocked);
     m.settle(0);
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     check(&m);
     m.k.hal.now.set(m.k.hal.now.get() + 1_001_000);
     m.on(0);
@@ -2005,7 +2007,7 @@ fn a_call_with_a_time_limit_ends_at_it() {
     let (m, t) = two_processors();
     let (ut, _) = m.big_untyped();
     m.spawn(ut, FREE + 3);
-    m.ok(S::ThreadControl, [FREE + 3, 2, 1, 0, 0, 0]);
+    m.move_to(FREE + 3, 1);
     m.on(0);
     assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
     m.on(1);

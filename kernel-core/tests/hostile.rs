@@ -226,10 +226,10 @@ fn thread_start_resets_the_extended_state() {
 }
 
 /// Processor time is authority (`SLOT_SCHED`, narrowed by processor): a
-/// scheduling context made from memory alone may lower its threads' share
-/// and not raise it, nor reserve a processor. Without this, any holder of
-/// an Untyped took 1,024 times a service's share, or 90% of the processor
-/// every service runs on.
+/// scheduling context is a share or a reservation of a processor only by
+/// a capability to that processor's time, and memory alone makes none.
+/// Without this, any holder of an Untyped took 1,024 times a service's
+/// share, or 90% of the processor every service runs on.
 #[test]
 fn processor_time_takes_a_capability_to_processor_time() {
     use silica_abi::{SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_MAX_WEIGHT};
@@ -238,23 +238,23 @@ fn processor_time_takes_a_capability_to_processor_time() {
     let (ut, _) = m.big_untyped();
     m.retype(ut, T::SchedContext, 0, FREE, 2);
     let (sc, other) = (FREE, FREE + 1);
-    // Memory alone: down, not up.
-    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, 0]), Error::NoRights);
-    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_DEFAULT_WEIGHT + 1, 0, 0, 0]), Error::NoRights);
+    // Memory alone: nothing, large or small.
+    for weight in [SCHED_MAX_WEIGHT, SCHED_DEFAULT_WEIGHT + 1, SCHED_DEFAULT_WEIGHT, 1] {
+        assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, weight, 0, 0, 0]), Error::NoRights);
+    }
     assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_DEADLINE, 9 * MS, 10 * MS, 0, 0]), Error::NoRights);
-    m.ok(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_DEFAULT_WEIGHT / 2, 0, 0, 0]);
-    m.ok(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, 0]);
     // Not any capability: one to processor time.
     assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, SLOT_IRQS]), Error::WrongType);
-    // Narrowed to processor 1: a reservation there, not on processor 0, and
-    // no weight above the default (a fair thread runs wherever it is moved).
+    // Narrowed to processor 1: a share or a reservation there, none on
+    // processor 0.
     m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2, SLOT_SCHED, 15, 1 | 2 << 32, 0]);
     assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_DEADLINE, 9 * MS, 10 * MS, 0, FREE + 2]), Error::NoRights);
-    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, FREE + 2]), Error::NoRights);
+    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, 1, 0, 0, FREE + 2]), Error::NoRights);
+    m.ok(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 1, FREE + 2]);
     m.ok(S::SchedConfigure, [sc, SCHED_DEADLINE, 9 * MS, 10 * MS, 1, FREE + 2]);
     // The whole machine's: anything.
     m.ok(S::SchedConfigure, [other, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, SLOT_SCHED]);
-    m.ok(S::SchedConfigure, [other, SCHED_FAIR, 1, 0, 0, 0]);
+    m.ok(S::SchedConfigure, [other, SCHED_FAIR, 1, 0, 1, SLOT_SCHED]);
     // A capability without its write right is no authority.
     m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 3, SLOT_SCHED, Rights::READ.0 as u64, 0, 0]);
     assert_eq!(m.err(S::SchedConfigure, [other, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, FREE + 3]), Error::NoRights);
@@ -464,6 +464,7 @@ fn switching_into_and_out_of_an_isolated_address_space_flushes_predictors() {
         m.retype(ut, T::AddressSpace, bits, slot + 1, 1);
         m.retype(ut, T::Thread, 0, slot, 1);
         m.ok(S::ThreadConfigure, [slot, SLOT_CAPSPACE, slot + 1, 0, 0, 0]);
+        m.ok(S::ThreadControl, [slot, 2, silica_abi::root::SLOT_CONTEXT, 0, 0, 0]);
         m.ok(S::ThreadStart, [slot, 0x40_0000, 0, 0, 1, 0]);
         m.cap(slot).unwrap().obj
     };
@@ -611,61 +612,63 @@ fn unmapping_a_range_clears_every_mapping_in_it_with_the_write_right_only() {
 
 /// Processor time went by thread: each fair thread was a share, so a
 /// program with the memory for a hundred threads took a hundred shares of
-/// the processor every service runs on. Measured on the kernel before
-/// groups, a default-weight service beside a program of n threads (all on
-/// one processor, a second of time): n = 1, 501 ms and waits of at most
-/// 3 ms; n = 10, 93 ms and 30 ms; n = 100, 12 ms and 300 ms. Now a group
-/// (`SCHED_GROUP`, made with authority over the processor's time) is one
-/// share however many threads are in it, a thread made by a thread of a
-/// group is in that group, and none leaves it: not by unbinding, not by a
-/// context of its own, not by moving to another processor, not by making a
-/// group without authority.
+/// the processor every service runs on. Measured on the kernel before that
+/// was mended, a default-weight service beside a program of n threads (all
+/// on one processor, a second of time): n = 1, 501 ms and waits of at most
+/// 3 ms; n = 10, 93 ms and 30 ms; n = 100, 12 ms and 300 ms. Now time is a
+/// capability: a fair context (made with authority over the processor's
+/// time) is one share however many threads are bound to it, a thread runs
+/// only once it is bound, and a program has nothing to bind its threads to
+/// but the context it was given: not no context at all, not one it makes
+/// from its own memory.
 #[test]
 fn a_program_with_many_threads_takes_one_share() {
-    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_GROUP};
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
     use std::collections::HashMap;
     const MS: u64 = 1_000_000;
     fn next_timer(m: &Machine) -> u64 {
         let t = m.k.hal.timer();
         if m.k.hal.armed[0].get() && t > m.k.hal.now.get() { t } else { u64::MAX }
     }
-    /// A thread made by `maker` (so in its group), started.
-    fn spawn_by(m: &Machine, maker: u64, ut: u64, slot: u64) -> u64 {
-        m.on(0);
-        assert_eq!(m.sys_as(maker, S::Retype, [ut, T::Thread as u64, 0, SLOT_CAPSPACE, slot, 1]).status, 0);
-        assert_eq!(m.sys_as(maker, S::ThreadConfigure, [slot, SLOT_CAPSPACE, SLOT_ASPACE, 0, 0, 0]).status, 0);
-        assert_eq!(m.sys_as(maker, S::ThreadStart, [slot, 0x40_0000, 0, 0, 1, 0]).status, 0);
-        m.cap(slot).unwrap().obj
-    }
     let share = |n: u64| -> (u64, u64) {
         let m = Machine::with_cpus(64, 2);
         m.on(0);
         let (ut, _) = m.big_untyped();
-        // Two groups on processor 0, made by the holder of processor time.
+        // Two contexts on processor 0, made by the holder of processor time.
         m.retype(ut, T::SchedContext, 0, FREE, 2);
         let (gs, gh) = (FREE, FREE + 1);
         for g in [gs, gh] {
-            m.ok(S::SchedConfigure, [g, SCHED_GROUP, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+            m.ok(S::SchedConfigure, [g, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
         }
         let service = m.spawn(ut, FREE + 2);
-        m.ok(S::ThreadControl, [FREE + 2, 3, gs, 0, 0, 0]);
+        m.ok(S::ThreadControl, [FREE + 2, 2, gs, 0, 0, 0]);
         let first = m.spawn(ut, FREE + 3);
-        m.ok(S::ThreadControl, [FREE + 3, 3, gh, 0, 0, 0]);
-        // The program makes the rest itself, and tries every way out.
+        m.ok(S::ThreadControl, [FREE + 3, 2, gh, 0, 0, 0]);
+        // The program makes the rest itself, and tries every way to more
+        // than its share: a context of its own is no time, whatever it
+        // asks of it.
         m.retype(ut, T::SchedContext, 0, FREE + 4, 1);
         let own = FREE + 4;
-        assert_eq!(m.sys_as(first, S::SchedConfigure, [own, SCHED_GROUP, SCHED_DEFAULT_WEIGHT, 0, 0, 0]).status, Error::NoRights as u64);
-        assert_eq!(m.sys_as(first, S::SchedConfigure, [own, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, 0]).status, 0);
+        for weight in [SCHED_DEFAULT_WEIGHT, 1] {
+            assert_eq!(m.sys_as(first, S::SchedConfigure, [own, SCHED_FAIR, weight, 0, 0, 0]).status, Error::NoRights as u64);
+        }
         let mut threads = vec![first];
         for i in 1..n {
             let slot = FREE + 10 + i;
-            let t = spawn_by(&m, first, ut, slot);
-            match i % 3 {
-                0 => assert_eq!(m.sys_as(first, S::ThreadControl, [slot, 3, 0, 0, 0, 0]).status, 0),
-                1 => assert_eq!(m.sys_as(first, S::ThreadControl, [slot, 3, own, 0, 0, 0]).status, 0),
-                _ => assert_eq!(m.sys_as(first, S::ThreadControl, [slot, 2, 1, 0, 0, 0]).status, Error::InUse as u64),
-            }
-            threads.push(t);
+            assert_eq!(m.sys_as(first, S::Retype, [ut, T::Thread as u64, 0, SLOT_CAPSPACE, slot, 1]).status, 0);
+            assert_eq!(m.sys_as(first, S::ThreadConfigure, [slot, SLOT_CAPSPACE, SLOT_ASPACE, 0, 0, 0]).status, 0);
+            // Bound to nothing, or to its own context, the thread has no
+            // time: it is not started, and not resumed.
+            let refused = match i % 3 {
+                0 => m.sys_as(first, S::ThreadStart, [slot, 0x40_0000, 0, 0, 1, 0]),
+                1 => m.sys_as(first, S::ThreadControl, [slot, 2, own, 0, 0, 0]),
+                _ => m.sys_as(first, S::ThreadControl, [slot, 1, 0, 0, 0, 0]),
+            };
+            assert_eq!(refused.status, Error::NoTime as u64);
+            // What is left is the context the program was given.
+            assert_eq!(m.sys_as(first, S::ThreadControl, [slot, 2, gh, 0, 0, 0]).status, 0);
+            assert_eq!(m.sys_as(first, S::ThreadStart, [slot, 0x40_0000, 0, 0, 1, 0]).status, 0);
+            threads.push(m.cap(slot).unwrap().obj);
         }
         assert!(m.sys(S::ThreadControl, [SLOT_THREAD, 0, 0, 0, 0, 0]).blocked);
         m.k.check_runqueues().unwrap();
@@ -697,35 +700,171 @@ fn a_program_with_many_threads_takes_one_share() {
     }
 }
 
-/// Joining a group takes a thread to the group's processor (the group's
-/// capability is the authority to), where it stays: it cannot be moved
-/// out of its group's share. When the group's last capability goes, its
-/// threads are back in their processor's own group, and free to move.
+/// A thread runs only on time it was bound to through a capability. One
+/// made and never bound cannot be started or resumed, and never runs; a
+/// context made from memory is nobody's time until a holder of a
+/// processor's time says so, for that processor only; and a program in a
+/// CapSpace of its own binds its threads to the context it holds and to no
+/// other: not one it cannot name, not one it holds without the read right,
+/// and it cannot raise the share it was given.
 #[test]
-fn a_group_holds_its_threads_on_its_processor() {
-    use silica_abi::{SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_GROUP};
+fn a_thread_runs_only_on_time_it_was_bound_to_through_a_capability() {
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_MAX_WEIGHT};
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    // Made, configured, never bound.
+    m.retype(ut, T::Thread, 0, FREE, 1);
+    let t = m.cap(FREE).unwrap().obj;
+    m.ok(S::ThreadConfigure, [FREE, SLOT_CAPSPACE, SLOT_ASPACE, 0, 0, 0]);
+    assert_eq!(m.err(S::ThreadStart, [FREE, 0x40_0000, 0, 0, 1, 0]), Error::NoTime);
+    m.ok(S::ThreadStart, [FREE, 0x40_0000, 0, 0, 0, 0]);
+    assert_eq!(m.err(S::ThreadControl, [FREE, 1, 0, 0, 0, 0]), Error::NoTime);
+    // A context from memory alone: no time, and none to be had for it
+    // without the processor's (here, a capability to processor 1's only).
+    m.retype(ut, T::SchedContext, 0, FREE + 1, 2);
+    assert_eq!(m.err(S::ThreadControl, [FREE, 2, FREE + 1, 0, 0, 0]), Error::NoTime);
+    assert_eq!(m.err(S::SchedConfigure, [FREE + 1, SCHED_FAIR, 1, 0, 0, 0]), Error::NoRights);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 3, SLOT_SCHED, 15, 1 | 2 << 32, 0]);
+    assert_eq!(m.err(S::SchedConfigure, [FREE + 1, SCHED_FAIR, 1, 0, 0, FREE + 3]), Error::NoRights);
+    assert_eq!(m.k.thread_view(t).state, 0);
+    for _ in 0..50 {
+        m.k.hal.now.set(m.k.hal.now.get() + 1_000_000);
+        m.tick();
+        assert_ne!(m.k.current(), t, "a thread bound to no context ran");
+    }
+    m.k.check_runqueues().unwrap();
+    // A program: a CapSpace of its own holding its second thread (slot 1),
+    // its own context read-only (slot 2) and another's without the read
+    // right (slot 3).
+    let (own, others) = (FREE + 1, FREE + 2);
+    for g in [own, others] {
+        m.ok(S::SchedConfigure, [g, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    }
+    m.retype(ut, T::CapSpace, 8, FREE + 4, 1);
+    m.retype(ut, T::Thread, 0, FREE + 5, 2);
+    m.ok(S::CapCopy, [FREE + 4, 1, FREE + 6, 15, 0, 0]);
+    m.ok(S::CapCopy, [FREE + 4, 2, own, Rights::READ.0 as u64, 0, 0]);
+    m.ok(S::CapCopy, [FREE + 4, 3, others, Rights::WRITE.0 as u64, 0, 0]);
+    m.ok(S::ThreadConfigure, [FREE + 5, FREE + 4, SLOT_ASPACE, 0, 0, 0]);
+    m.ok(S::ThreadConfigure, [FREE + 6, FREE + 4, SLOT_ASPACE, 0, 0, 0]);
+    m.ok(S::ThreadControl, [FREE + 5, 2, own, 0, 0, 0]);
+    m.ok(S::ThreadStart, [FREE + 5, 0x40_0000, 0, 0, 1, 0]);
+    let p = m.cap(FREE + 5).unwrap().obj;
+    let second = m.cap(FREE + 6).unwrap().obj;
+    let as_p = |n: S, a: [u64; 6]| Error::result(m.sys_as(p, n, a).status);
+    assert_eq!(as_p(S::ThreadControl, [1, 2, others, 0, 0, 0]), Err(Error::BadCap), "bound to a context it cannot name");
+    assert_eq!(as_p(S::ThreadControl, [1, 2, SLOT_CONTEXT, 0, 0, 0]), Err(Error::BadCap), "bound to the root task's own context");
+    assert_eq!(as_p(S::ThreadControl, [1, 2, 3, 0, 0, 0]), Err(Error::NoRights), "bound to a context it holds without the read right");
+    assert_eq!(as_p(S::ThreadStart, [1, 0x40_0000, 0, 0, 1, 0]), Err(Error::NoTime));
+    assert_eq!(as_p(S::SchedConfigure, [2, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, 0]), Err(Error::NoRights), "raised its own share");
+    assert_eq!(as_p(S::ThreadControl, [1, 2, 2, 0, 0, 0]), Ok(()));
+    assert_eq!(as_p(S::ThreadStart, [1, 0x40_0000, 0, 0, 1, 0]), Ok(()));
+    assert_eq!(m.k.thread_view(second).state, RUNNABLE);
+    m.k.check_runqueues().unwrap();
+}
+
+/// Holding every processor's lock stops the machine, so the time a program
+/// spends so is bounded (the 2026-11-24 audit: a flood of capability
+/// operations took two thirds of other processors' round trips). The bound
+/// was each processor's: a program that used it up held back every other
+/// program on its processor, whose calls waited for a share they had not
+/// touched. It is the caller's scheduling context's: the flood waits, and
+/// a program beside it on the same processor carries on.
+#[test]
+fn a_flood_of_lock_taking_calls_holds_back_its_own_context_only() {
+    use kernel_core::thread::THROTTLED;
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    // A thread running on processor 1: what holding every lock costs.
+    m.spawn(ut, FREE + 20);
+    m.move_to(FREE + 20, 1);
+    m.settle(1);
+    m.on(0);
+    // The flood and its victim on processor 0, each on a context of its own.
+    m.retype(ut, T::SchedContext, 0, FREE, 2);
+    for g in [FREE, FREE + 1] {
+        m.ok(S::SchedConfigure, [g, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    }
+    let flood = m.spawn(ut, FREE + 2);
+    m.ok(S::ThreadControl, [FREE + 2, 2, FREE, 0, 0, 0]);
+    let victim = m.spawn(ut, FREE + 3);
+    m.ok(S::ThreadControl, [FREE + 3, 2, FREE + 1, 0, 0, 0]);
+    m.retype(ut, T::Endpoint, 0, FREE + 4, 1);
+    // Every reading of the clock is 10 us later than the last, so a call
+    // that takes every lock holds them at least that long.
+    m.k.hal.now_step.set(10_000);
+    // Capability copies and deletes until the flood is held back.
+    let mut calls = 0;
+    while m.k.thread_view(flood).state != THROTTLED {
+        let slot = FREE + 5;
+        let call = if m.cap(slot).is_none() {
+            (S::CapCopy, [SLOT_CAPSPACE, slot, FREE + 4, 15, 0, 0])
+        } else {
+            (S::CapDelete, [slot, 0, 0, 0, 0, 0])
+        };
+        let r = m.sys_as(flood, call.0, call.1);
+        assert!(r.blocked || r.status == 0, "{:?}", Error::result(r.status));
+        calls += 1;
+        assert!(calls < 100_000, "a flood of calls that take every lock was never held back");
+    }
+    // The victim makes the same calls beside it, and none of them waits.
+    for i in 0..100 {
+        let slot = FREE + 6;
+        let call = if i % 2 == 0 { (S::CapCopy, [SLOT_CAPSPACE, slot, FREE + 4, 15, 0, 0]) } else { (S::CapDelete, [slot, 0, 0, 0, 0, 0]) };
+        let r = m.sys_as(victim, call.0, call.1);
+        assert!(
+            !r.blocked,
+            "call {i} of a program on the flood's processor waited for the flood's share (after {calls} calls of the flood)"
+        );
+        assert_eq!(r.status, 0);
+    }
+    // The flood's share comes back with time, and it carries on.
+    m.k.hal.now_step.set(0);
+    m.k.hal.now.set(m.k.hal.now.get() + 1_000_000_000);
+    m.tick();
+    assert_eq!(m.k.thread_view(flood).state, RUNNABLE);
+    m.k.check_runqueues().unwrap();
+}
+
+/// Binding takes a thread to its context's processor (the context's
+/// capability is the authority to), fair or reserved, and a context with
+/// threads bound keeps its processor. When a context's last capability
+/// goes, so does the time its threads ran on: they stop, bound to nothing,
+/// until they are bound to other time and resumed.
+#[test]
+fn a_context_holds_its_threads_on_its_processor() {
+    use silica_abi::{SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
     let m = Machine::with_cpus(64, 2);
     m.on(0);
     let (ut, _) = m.big_untyped();
     m.retype(ut, T::SchedContext, 0, FREE, 2);
-    m.ok(S::SchedConfigure, [FREE, SCHED_GROUP, SCHED_DEFAULT_WEIGHT, 0, 1, SLOT_SCHED]);
+    m.ok(S::SchedConfigure, [FREE, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 1, SLOT_SCHED]);
     let t = m.spawn(ut, FREE + 2);
-    m.ok(S::ThreadControl, [FREE + 2, 3, FREE, 0, 0, 0]);
-    assert_eq!(m.k.thread_view(t).cpu, 1, "joining the group took it to the group's processor");
-    assert_eq!(m.err(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]), Error::InUse, "moved out of its group");
+    m.ok(S::ThreadControl, [FREE + 2, 2, FREE, 0, 0, 0]);
+    assert_eq!(m.k.thread_view(t).cpu, 1, "binding took it to the context's processor");
     m.k.check_runqueues().unwrap();
-    // A deadline reservation stays where it is.
+    // A reservation is on its processor too, and a thread goes from one
+    // context to another wherever each is (suspended, it stays so).
     m.ok(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 1_000_000, 10_000_000, 0, SLOT_SCHED]);
     let d = m.spawn(ut, FREE + 3);
-    m.ok(S::ThreadControl, [FREE + 3, 3, FREE + 1, 0, 0, 0]);
-    assert_eq!(m.err(S::ThreadControl, [FREE + 3, 3, FREE, 0, 0, 0]), Error::InUse);
-    assert_eq!(m.k.thread_view(d).cpu, 0);
-    // A group in use keeps its processor.
-    assert_eq!(m.err(S::SchedConfigure, [FREE, SCHED_GROUP, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]), Error::InUse);
-    // Its last capability gone: its threads are free again.
+    m.ok(S::ThreadControl, [FREE + 3, 2, FREE, 0, 0, 0]);
+    assert_eq!(m.k.thread_view(d).cpu, 1);
+    m.ok(S::ThreadControl, [FREE + 3, 0, 0, 0, 0, 0]);
+    m.ok(S::ThreadControl, [FREE + 3, 2, FREE + 1, 0, 0, 0]);
+    assert_eq!((m.k.thread_view(d).cpu, m.k.thread_view(d).state), (0, 0));
+    m.k.check_runqueues().unwrap();
+    // A context in use keeps its processor.
+    assert_eq!(m.err(S::SchedConfigure, [FREE, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]), Error::InUse);
+    assert_eq!(m.err(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 1_000_000, 10_000_000, 1, SLOT_SCHED]), Error::InUse);
+    // Its last capability gone: its thread has no time.
     m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
-    assert_eq!(m.k.thread_view(t).cpu, 0);
+    assert_eq!(m.k.thread_view(t).state, 0, "a thread whose context is gone still runs");
+    assert_eq!(m.err(S::ThreadControl, [FREE + 2, 1, 0, 0, 0, 0]), Error::NoTime);
+    m.k.check_runqueues().unwrap();
+    m.move_to(FREE + 2, 0);
+    m.ok(S::ThreadControl, [FREE + 2, 1, 0, 0, 0, 0]);
+    assert_eq!((m.k.thread_view(t).cpu, m.k.thread_view(t).state), (0, RUNNABLE));
     m.k.check_runqueues().unwrap();
 }
 

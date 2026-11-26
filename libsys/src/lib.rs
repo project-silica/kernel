@@ -25,8 +25,7 @@ pub use silica_abi::root;
 pub use silica_abi::{
     ASPACE_IO, ASPACE_ISOLATED, Error, FAULT_FETCH, FAULT_LABEL, FAULT_MAP, FAULT_PRESENT, FAULT_RESUME, FAULT_WRITE, Fault,
     IRQ_ACTIVE_LOW, IRQ_LEVEL, IRQ_LINES, IRQ_MSI, KEEP, LARGE_BITS, LISTEN_SHIFT, MsgInfo, ObjectType, PAGE_BITS, Rights, SCHED_DEADLINE,
-    SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_GROUP, SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE,
-    THREAD_SENDING,
+    SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
 };
 
 /// Platform API level (`spec/CI_RELEASE.md` section 7).
@@ -362,17 +361,8 @@ pub fn thread_suspend(thread: Cap) -> Result<()> {
     sys(Syscall::ThreadControl, [thread.0, 0, 0, 0, 0, 0]).map(|_| ())
 }
 
-/// Move a thread to processor `cpu` (an index below `RootInfo::cpus`). It
-/// carries on there with what it was doing, so moving threads to balance
-/// load is invisible to them: a call waiting for its reply is answered
-/// there, a send or receive not yet delivered is made again there, and a
-/// suspended thread stays suspended. A thread may move itself. `InUse`
-/// while it is bound to a deadline context (which belongs to one processor).
-pub fn thread_set_cpu(thread: Cap, cpu: usize) -> Result<()> {
-    sys(Syscall::ThreadControl, [thread.0, 2, cpu as u64, 0, 0, 0]).map(|_| ())
-}
-
-/// Make a suspended thread runnable.
+/// Make a suspended thread runnable (`NoTime` for one bound to no
+/// scheduling context).
 pub fn thread_resume(thread: Cap) -> Result<()> {
     sys(Syscall::ThreadControl, [thread.0, 1, 0, 0, 0, 0]).map(|_| ())
 }
@@ -606,14 +596,16 @@ pub fn inspect_thread(thread: Cap) -> Result<ThreadInfo> {
     Ok(ThreadInfo { state: r[0], cpu: r[1] as usize, ip: r[2], sp: r[3], waits_on: r[4] })
 }
 
-/// Make `sc` a weighted fair share: threads bound to it share their
-/// processor with others in proportion to `weight` (an unbound thread
-/// weighs [`SCHED_DEFAULT_WEIGHT`]). A weight above the default needs
-/// `time`, a processor-time capability covering every processor
-/// (`root::SLOT_SCHED` or one narrowed from it; `Cap::NONE`: none, and
-/// `NoRights` for more than the default).
-pub fn sched_fair(sc: Cap, weight: u64, time: Cap) -> Result<()> {
-    sys(Syscall::SchedConfigure, [sc.0, SCHED_FAIR, weight, 0, 0, time.0]).map(|_| ())
+/// Make `sc` one fair share of processor `cpu`: among the fair contexts
+/// there it takes the processor in proportion to `weight`, and the
+/// threads bound to it divide that share equally, however many they are.
+/// What a parent gives each program it starts, so that no program's
+/// threads take more of a processor than one share. Needs `time`, a
+/// processor-time capability covering `cpu` (`root::SLOT_SCHED` or one
+/// narrowed from it; `NoRights` otherwise): a context made from memory
+/// alone is no time at all.
+pub fn sched_fair(sc: Cap, weight: u64, cpu: usize, time: Cap) -> Result<()> {
+    sys(Syscall::SchedConfigure, [sc.0, SCHED_FAIR, weight, 0, cpu as u64, time.0]).map(|_| ())
 }
 
 /// Make `sc` a reservation of `budget` nanoseconds in every `period` on
@@ -625,22 +617,16 @@ pub fn sched_deadline(sc: Cap, budget: u64, period: u64, cpu: usize, time: Cap) 
     sys(Syscall::SchedConfigure, [sc.0, SCHED_DEADLINE, budget, period, cpu as u64, time.0]).map(|_| ())
 }
 
-/// Make `sc` a group of `weight` on processor `cpu`: the threads in it
-/// share one share of that processor, however many there are, and a
-/// thread made by one of them is in it too. Needs `time`, a processor-time
-/// capability covering `cpu` (`NoRights` otherwise). What a parent gives
-/// each program it starts, so that no program's threads take more of a
-/// processor than one share.
-pub fn sched_group(sc: Cap, weight: u64, cpu: usize, time: Cap) -> Result<()> {
-    sys(Syscall::SchedConfigure, [sc.0, SCHED_GROUP, weight, 0, cpu as u64, time.0]).map(|_| ())
-}
-
-/// Run `thread` on the scheduling context `sc` (`Cap::NONE`: the default
-/// fair share, leaving any group it is in). A deadline context must be on
-/// the thread's processor; a group takes the thread to its processor, and
-/// the thread stays in it until it joins another.
+/// Run `thread` on the scheduling context `sc` (readable), on that
+/// context's processor: a thread has no time, and cannot be started, until
+/// it is bound, and it leaves a context only for another. One taken to
+/// another processor carries on there with what it was doing, so moving
+/// threads is invisible to them: a call waiting for its reply is answered
+/// there, a send or receive not yet delivered is made again there, and a
+/// suspended thread stays suspended. A thread may bind itself. `NoTime`
+/// for a context nobody gave a processor's time.
 pub fn thread_bind(thread: Cap, sc: Cap) -> Result<()> {
-    sys(Syscall::ThreadControl, [thread.0, 3, sc.0, 0, 0, 0]).map(|_| ())
+    sys(Syscall::ThreadControl, [thread.0, 2, sc.0, 0, 0, 0]).map(|_| ())
 }
 
 /// A scheduling context, as [`inspect_sched`] reports it.
@@ -656,7 +642,7 @@ pub struct SchedInfo {
     pub remaining: u64,
     /// Nanoseconds charged to it so far.
     pub consumed: u64,
-    /// Deadline: its processor.
+    /// Its processor.
     pub cpu: usize,
 }
 

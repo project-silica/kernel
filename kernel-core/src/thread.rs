@@ -90,16 +90,11 @@ pub struct Thread {
     pub(crate) via_slot: Cell<Paddr>,
     /// While receiving: the slot of a notification to park the next call on.
     pub(crate) park: Cell<u64>,
-    /// The scheduling context it is bound to (0: the default fair share),
-    /// and its links in that context's list of threads.
+    /// The scheduling context it is bound to and runs on (0: none, and it
+    /// cannot run), and its links in that context's list of threads.
     pub(crate) sc: Cell<Paddr>,
     pub(crate) sc_next: Cell<Paddr>,
     pub(crate) sc_prev: Cell<Paddr>,
-    /// The group it is in (`sched::Group`: a group context; 0: its
-    /// processor's own), and its links in the group's list of threads.
-    pub(crate) group: Cell<Paddr>,
-    pub(crate) g_next: Cell<Paddr>,
-    pub(crate) g_prev: Cell<Paddr>,
     /// Fair class: virtual runtime (`sched.rs`).
     pub(crate) vr: Cell<u64>,
     /// The notification this thread last listened on while receiving on an
@@ -346,19 +341,16 @@ impl<H: Hal> Kernel<H> {
         cpu.dirty.set(true);
     }
 
-    /// Make processor `to` thread `t`'s home without changing what it does,
-    /// so that balancing (userspace policy) is invisible to the thread: a
-    /// runnable one runs there next; one waiting for a reply keeps waiting
-    /// and is answered there; one blocked in a send or receive (nothing
-    /// delivered yet) makes the same system call again there; an inactive
-    /// one stays inactive. The caller holds every lock.
-    pub(crate) fn move_thread(&self, t: Paddr, to: usize) {
-        let th = self.thread(t);
-        let from = th.cpu.get() as usize;
-        if from == to {
-            return;
-        }
-        let state = th.state.get();
+    /// Take thread `t` off its processor, to carry on with what it does on
+    /// another ([`Kernel::arrive`]): a thread goes where its scheduling
+    /// context is (`Kernel::sched_bind`), and the move is invisible to it.
+    /// A runnable one runs there next; one waiting for a reply keeps
+    /// waiting and is answered there; one blocked in a send or receive
+    /// (nothing delivered yet) makes the same system call again there; an
+    /// inactive one stays inactive. Returns whether it is to be made
+    /// runnable on arrival. The caller holds every lock.
+    pub(crate) fn depart(&self, t: Paddr) -> bool {
+        let state = self.thread(t).state.get();
         let again = state != INACTIVE && state != REPLY;
         if again {
             // Off its run queue or wait queue (a running thread's processor
@@ -366,7 +358,7 @@ impl<H: Hal> Kernel<H> {
             // call set up to run again.
             self.cancel(t, true);
         }
-        let (old, new) = (self.cpus.get(from), self.cpus.get(to));
+        let old = self.home(t);
         if old.account.get() == t {
             self.charge(old, self.hal.now());
             old.account.set(0);
@@ -377,9 +369,13 @@ impl<H: Hal> Kernel<H> {
             }
         }
         old.dirty.set(true);
-        // Its standing among the fair threads, carried over to the new
-        // processor's scale.
-        th.vr.set(th.vr.get().saturating_sub(old.unbound.min_vr.get()).saturating_add(new.unbound.min_vr.get()));
+        again
+    }
+
+    /// Make processor `to` the home of thread `t`, which left its last
+    /// ([`Kernel::depart`], which said whether it runs `again`).
+    pub(crate) fn arrive(&self, t: Paddr, to: usize, again: bool) {
+        let th = self.thread(t);
         // A call waiting for its answer keeps its time limit, among the new
         // processor's timers.
         let deadline = th.deadline.get();
@@ -476,7 +472,6 @@ impl<H: Hal> Kernel<H> {
         }
         self.drop_caller(t);
         self.sched_unlink(t);
-        self.group_unlink(t);
         let cpu = self.home(t);
         if cpu.account.get() == t {
             cpu.account.set(0);
@@ -648,12 +643,12 @@ impl<H: Hal> Kernel<H> {
             // now come before the running one?
             if me.woken.get() && cur_ok {
                 me.woken.set(false);
-                let first = if me.dl_head.get() != 0 { me.dl_head.get() } else { self.grp_first(me) };
+                let first = if me.dl_head.get() != 0 { me.dl_head.get() } else { self.fair_first(me) };
                 if first != 0 && self.preempts(me, first) {
                     me.resched.set(true);
                 }
             }
-            let others = me.gq_first.get() != 0 || me.dl_head.get() != 0;
+            let others = me.fq_first.get() != 0 || me.dl_head.get() != 0;
             if cur_ok && !me.resched.get() {
                 // Keep running; a queue that has just stopped being empty
                 // needs a time at which to look again.
@@ -675,8 +670,7 @@ impl<H: Hal> Kernel<H> {
             // Choose afresh: queue the running thread (behind its equals if
             // it yielded) and pick.
             if cur_ok {
-                let th = self.thread(cur);
-                if me.yielded.replace(false) && me.gq_first.get() != 0 && (th.sc.get() == 0 || self.dl_of(cur).is_none()) {
+                if me.yielded.replace(false) && me.fq_first.get() != 0 && self.dl_of(cur).is_none() {
                     self.requeue_yielded(me, cur);
                 } else {
                     self.enqueue(me, cur);
@@ -761,7 +755,7 @@ impl<H: Hal> Kernel<H> {
         // The devices interrupt again, and what they wrote meanwhile is
         // delivered (`watch.rs`).
         self.end_watches();
-        if halted || me.gq_first.get() != 0 || me.dl_head.get() != 0 || me.direct.get() != 0 || self.hal.now() >= until {
+        if halted || me.fq_first.get() != 0 || me.dl_head.get() != 0 || me.direct.get() != 0 || self.hal.now() >= until {
             return;
         }
         // The watch ran its length with nothing: halt, without watching again.

@@ -91,16 +91,10 @@ impl<H: Hal> Kernel<H> {
             match ty {
                 ObjectType::Thread => {
                     self.hal.init_thread(&self.phys, obj);
-                    // A thread starts on the processor that made it, in the
-                    // group of the thread that made it: a program's threads
-                    // share its group's share however many it makes.
+                    // No time yet: it runs once its maker binds it to a
+                    // scheduling context, on that context's processor
+                    // (until then it is nowhere in particular: here).
                     self.thread(obj).cpu.set(self.hal.cpu() as u64);
-                    let maker = self.me().cur.get();
-                    self.thread(obj).group.set(crate::sched::UNBOUND);
-                    let g = if maker != 0 { self.thread(maker).group.get() } else { crate::sched::UNBOUND };
-                    if g != crate::sched::UNBOUND {
-                        self.regroup(obj, g);
-                    }
                 }
                 ObjectType::SchedContext => self.init_sched(obj),
                 ObjectType::AddressSpace => {

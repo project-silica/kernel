@@ -65,7 +65,7 @@ fn weights_share_the_processor_in_proportion() {
     let a = m.spawn(ut, FREE);
     let b = m.spawn(ut, FREE + 1);
     sched(&m, ut, FREE + 2, SCHED_FAIR, 3072, 0);
-    m.ok(S::ThreadControl, [FREE + 1, 3, FREE + 2, 0, 0, 0]);
+    m.ok(S::ThreadControl, [FREE + 1, 2, FREE + 2, 0, 0, 0]);
     suspend_root(&m);
     let ran = run(&m, 600 * MS);
     let (ta, tb) = (ran[&a] as f64, ran[&b] as f64);
@@ -115,7 +115,7 @@ fn a_deadline_reservation_gets_its_budget_and_no_more() {
     let hogs = [m.spawn(ut, FREE), m.spawn(ut, FREE + 1), m.spawn(ut, FREE + 2)];
     let dl = m.spawn(ut, FREE + 3);
     sched(&m, ut, FREE + 4, SCHED_DEADLINE, 2 * MS, 10 * MS);
-    m.ok(S::ThreadControl, [FREE + 3, 3, FREE + 4, 0, 0, 0]);
+    m.ok(S::ThreadControl, [FREE + 3, 2, FREE + 4, 0, 0, 0]);
     suspend_root(&m);
     let ran = run(&m, 1000 * MS);
     let share = ran[&dl] as f64 / (1000 * MS) as f64;
@@ -161,23 +161,33 @@ fn admission_control_refuses_to_promise_more_than_the_processor_has() {
 
 #[test]
 fn bindings_follow_what_happens_to_contexts_and_threads() {
+    use silica_abi::root::SLOT_CONTEXT;
     let (m, ut) = machine();
     let t = m.spawn(ut, FREE);
     sched(&m, ut, FREE + 1, SCHED_DEADLINE, MS, 10 * MS);
-    m.ok(S::ThreadControl, [FREE, 3, FREE + 1, 0, 0, 0]);
-    // A bound deadline context keeps its class and processor.
-    assert_eq!(m.err(S::SchedConfigure, [FREE + 1, SCHED_FAIR, 1024, 0, 0, 0]), Error::InUse);
-    // A thread with a reservation on this processor cannot simply move.
-    assert_eq!(m.err(S::ThreadControl, [FREE, 2, 0, 0, 0, 0]), Error::InUse);
-    // Binding needs a scheduling context.
-    assert_eq!(m.err(S::ThreadControl, [FREE, 3, SLOT_THREAD, 0, 0, 0]), Error::WrongType);
-    // Destroying the context returns the thread to the default fair share,
-    // still runnable, and gives the reservation back.
+    m.ok(S::ThreadControl, [FREE, 2, FREE + 1, 0, 0, 0]);
+    // A context with threads bound keeps its class and processor.
+    assert_eq!(m.err(S::SchedConfigure, [FREE + 1, SCHED_FAIR, 1024, 0, 0, SLOT_SCHED]), Error::InUse);
+    // Binding needs a scheduling context, and one that is somebody's time:
+    // a thread leaves its context only for another.
+    assert_eq!(m.err(S::ThreadControl, [FREE, 2, SLOT_THREAD, 0, 0, 0]), Error::WrongType);
+    assert_eq!(m.err(S::ThreadControl, [FREE, 2, 0, 0, 0, 0]), Error::BadCap);
+    m.ok(S::Retype, [ut, T::SchedContext as u64, 0, SLOT_CAPSPACE, FREE + 3, 1]);
+    assert_eq!(m.err(S::ThreadControl, [FREE, 2, FREE + 3, 0, 0, 0]), Error::NoTime, "a context made from memory alone is no time");
+    // Destroying the context takes the time its thread ran on: the thread
+    // stops, bound to nothing, and the reservation is given back.
     m.ok(S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]);
+    assert_eq!(m.k.thread_view(t).state, 0, "a thread whose time is gone still runs");
+    assert_eq!(m.err(S::ThreadControl, [FREE, 1, 0, 0, 0, 0]), Error::NoTime);
+    assert_eq!(m.err(S::ThreadStart, [FREE, 0x40_0000, 0, 0, 1, 0]), Error::NoTime);
     sched(&m, ut, FREE + 2, SCHED_DEADLINE, 9 * MS, 10 * MS);
+    m.k.check_runqueues().unwrap();
+    // Bound to other time and resumed, it runs again.
+    m.ok(S::ThreadControl, [FREE, 2, SLOT_CONTEXT, 0, 0, 0]);
+    m.ok(S::ThreadControl, [FREE, 1, 0, 0, 0, 0]);
     suspend_root(&m);
     let ran = run(&m, 50 * MS);
-    assert!(ran.get(&t).copied().unwrap_or(0) >= 49 * MS, "the unbound thread did not run on its own");
+    assert!(ran.get(&t).copied().unwrap_or(0) >= 49 * MS, "the thread did not run on the time it was bound to");
     m.k.check_runqueues().unwrap();
 }
 

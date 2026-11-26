@@ -82,11 +82,29 @@ fn memory() -> (Cap, usize) {
     (f, at)
 }
 
+/// Time on each processor for the tests' threads: one fair context of the
+/// default weight a processor, made on first use (processor 0's is the
+/// root task's own). A thread runs only once it is bound to one, on that
+/// context's processor; binding it to another's takes it there.
+static CONTEXTS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+fn time_on(cpu: usize) -> Cap {
+    if cpu == 0 {
+        return Cap(SLOT_CONTEXT);
+    }
+    if CONTEXTS[cpu].load(SeqCst) == 0 {
+        let sc = new(ObjectType::SchedContext, 0);
+        sched_fair(sc, SCHED_DEFAULT_WEIGHT, cpu, TIME).expect("a share of a processor");
+        CONTEXTS[cpu].store(sc.0, SeqCst);
+    }
+    Cap(CONTEXTS[cpu].load(SeqCst))
+}
+
 /// A thread in this address space running `entry(arg)`, reporting faults to `fault`.
 fn spawn(entry: extern "C" fn(u64) -> !, arg: u64, fault: Cap) -> (Cap, usize) {
     let t = new(ObjectType::Thread, 0);
     let (_, stack) = memory();
     thread_configure(t, SPACE, ASPACE, fault, Cap::NONE).expect("configure");
+    thread_bind(t, time_on(0)).expect("bind");
     // SAFETY: `entry` is a function of this program; the stack was just mapped.
     unsafe { thread_start(t, entry as usize, stack + (1 << 16) - 8, arg | t.0 << 32, true) }.expect("start");
     (t, stack)
@@ -321,6 +339,7 @@ fn t_w_xor_x() -> T {
     let t = new(ObjectType::Thread, 0);
     let (_, stack) = memory();
     thread_configure(t, SPACE, ASPACE, ep, Cap::NONE).map_err(|_| "configure")?;
+    thread_bind(t, time_on(0)).map_err(|_| "bind")?;
     // SAFETY: the thread is expected to fault on its first instruction.
     unsafe { thread_start(t, at, stack + 0xFFF8, 0, true) }.map_err(|_| "start")?;
     let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000)).map_err(|_| "executing a data page did not fault")?;
@@ -628,6 +647,7 @@ fn spawn_with_buffer(entry: extern "C" fn(u64) -> !, arg: u64) -> (Cap, usize) {
     thread_configure(t, SPACE, ASPACE, Cap::NONE, frame).expect("configure");
     // SAFETY: `entry` is a function of this program; the stack was just mapped.
     SERVER_BUFFER.store(at as u64, SeqCst);
+    thread_bind(t, time_on(0)).expect("bind");
     unsafe { thread_start(t, entry as usize, stack + (1 << 16) - 8, arg | t.0 << 32, true) }.expect("start");
     (t, at)
 }
@@ -787,7 +807,7 @@ fn t_irq_follow() -> T {
     };
     let info = || inspect_irq(LINES, LINE as u64).map_err(|_| "cannot inspect the interrupt line");
     let on = |cpu: usize| -> T {
-        thread_set_cpu(Cap(SLOT_THREAD), cpu).map_err(|_| "cannot move this thread")?;
+        thread_bind(Cap(SLOT_THREAD), time_on(cpu)).map_err(|_| "cannot move this thread")?;
         (inspect_thread(Cap(SLOT_THREAD)).map_err(|_| "inspect")?.cpu == cpu).then_some(()).ok_or("this thread did not move")
     };
     let result = (|| -> T {
@@ -1021,7 +1041,7 @@ fn spawn_on(cpu: usize, entry: extern "C" fn(u64) -> !, arg: u64, fault: Cap) ->
     thread_configure(t, SPACE, ASPACE, fault, Cap::NONE).expect("configure");
     // SAFETY: `entry` is a function of this program; the stack was just mapped.
     unsafe { thread_start(t, entry as usize, stack + (1 << 16) - 8, arg | t.0 << 32, false) }.expect("start");
-    thread_set_cpu(t, cpu).expect("move to processor");
+    thread_bind(t, time_on(cpu)).expect("time on its processor");
     thread_resume(t).expect("resume");
     (t, stack)
 }
@@ -1505,9 +1525,7 @@ fn foreign_thread_on(cpu: usize, code: &[u8], arg: u64) -> Cap {
     thread_configure(t, SPACE, aspace, Cap::NONE, Cap::NONE).expect("configure");
     // SAFETY: the code was written for exactly this: it runs at any address without a stack.
     unsafe { thread_start(t, 0x10_0000, 0, arg, false) }.expect("start");
-    if cpu != 0 {
-        thread_set_cpu(t, cpu).expect("move to processor");
-    }
+    thread_bind(t, time_on(cpu)).expect("time on its processor");
     thread_resume(t).expect("resume");
     t
 }
@@ -1992,7 +2010,7 @@ extern "C" fn sched_sleeper(arg: u64) -> ! {
     finish(arg)
 }
 
-/// Run `spinners` (index, scheduling context or Cap::NONE) on processor
+/// Run `spinners` (index, scheduling context or Cap::NONE: the tests' own on that processor) on processor
 /// `cpu` for `ms` and return what each counted.
 fn spin_on(cpu: usize, spinners: &[(usize, Cap)], ms: u64) -> core::result::Result<[u64; 8], &'static str> {
     SPIN.store(0, SeqCst);
@@ -2025,16 +2043,26 @@ fn t_sched() -> T {
     // main thread sleeps while the others run.
     let cpus = CPUS.load(SeqCst) as usize;
     let cpu = cpus - 1;
-    // 1. Weights 1024 and 3072 share the processor about 1:3.
-    let heavy = new(ObjectType::SchedContext, 0);
-    // Without processor time, memory buys no more than the default share.
-    if sched_fair(heavy, 3072, Cap::NONE) != Err(Error::NoRights)
+    // 1. Contexts of weights 1024 and 3072 share the processor about 1:3.
+    let (light, heavy) = (new(ObjectType::SchedContext, 0), new(ObjectType::SchedContext, 0));
+    // Memory alone is no time: a context is a share or a reservation of a
+    // processor only by a capability to that processor's time, and a
+    // thread cannot be bound to one that is neither.
+    if sched_fair(heavy, 3072, cpu, Cap::NONE) != Err(Error::NoRights)
+        || sched_fair(heavy, 1, cpu, Cap::NONE) != Err(Error::NoRights)
         || sched_deadline(heavy, 1_000_000, 10_000_000, cpu, Cap::NONE) != Err(Error::NoRights)
     {
-        return Err("a scheduling context was given more than the default share without processor time");
+        return Err("a scheduling context was given a processor's time without a capability to it");
     }
-    sched_fair(heavy, 3072, TIME).map_err(|_| "cannot configure a fair context")?;
-    let c = spin_on(cpu, &[(0, Cap::NONE), (1, heavy)], 300)?;
+    let unbound = new(ObjectType::Thread, 0);
+    // SAFETY: the thread is never started: it has no time to run on.
+    let started = unsafe { thread_start(unbound, 0x10_0000, 0, 0, true) };
+    if started != Err(Error::NoTime) || thread_bind(unbound, heavy) != Err(Error::NoTime) || thread_resume(unbound) != Err(Error::NoTime) {
+        return Err("a thread bound to no scheduling context, or to one nobody gave time, was let run");
+    }
+    sched_fair(light, SCHED_DEFAULT_WEIGHT, cpu, TIME).map_err(|_| "cannot configure a fair context")?;
+    sched_fair(heavy, 3072, cpu, TIME).map_err(|_| "cannot configure a fair context")?;
+    let c = spin_on(cpu, &[(0, light), (1, heavy)], 300)?;
     let ratio = c[1] as f64 / c[0].max(1) as f64;
     println!("sched: weights 1024 and 3072 counted {} and {} (ratio {:.2})", c[0], c[1], ratio);
     if !(2.5..=3.5).contains(&ratio) {
@@ -2062,6 +2090,8 @@ fn t_sched() -> T {
     unsafe {
         let _ = cap_delete(dl);
         let _ = cap_delete(heavy);
+        let _ = cap_delete(light);
+        let _ = cap_delete(unbound);
     }
     sched_deadline(more, 8_000_000, 10_000_000, cpu, TIME).map_err(|_| "a reservation's share was not given back when it was destroyed")?;
     // SAFETY: nothing is bound to it.
@@ -2179,6 +2209,7 @@ fn t_isolated() -> T {
     map(Cap(s), frame, 0x10_0000, Rights(5)).map_err(|_| "map code in the isolated space")?;
     let t = new(ObjectType::Thread, 0);
     thread_configure(t, SPACE, Cap(s), Cap::NONE, Cap::NONE).map_err(|_| "configure")?;
+    thread_bind(t, time_on(0)).map_err(|_| "bind")?;
     // SAFETY: the code runs at any address without a stack.
     unsafe { thread_start(t, 0x10_0000, 0, 0, true) }.map_err(|_| "start")?;
     for _ in 0..100 {
