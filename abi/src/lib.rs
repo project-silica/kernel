@@ -151,7 +151,8 @@ pub enum Syscall {
     /// `a0` a CapSpace and `a1` a slot index: what that slot holds. Returns
     /// `a0` object type (0: empty), `a1` rights, `a2` size in bits, `a3` the
     /// object's identity (equal for capabilities to one object), `a4` badge,
-    /// `a5` depth in the derivation tree.
+    /// `a5` depth in the derivation tree (bits 0..16) and, from bit 16, whether an
+    /// address space is isolated against speculation (`INSPECT_ISOLATED`).
     /// `a0` a Thread and `a1` 0: returns `a0` state (the `THREAD_` values),
     /// `a1` processor, `a2` instruction pointer, `a3` stack pointer, `a4`
     /// the identity of what it waits on.
@@ -369,6 +370,10 @@ pub const ASPACE_IO: u64 = 1 << 8;
 /// into and out of them a few microseconds, and others nothing. Not with
 /// [`ASPACE_IO`].
 pub const ASPACE_ISOLATED: u64 = 1 << 9;
+/// `Inspect` of a slot: set in `a5` when the slot holds an address space
+/// isolated against speculation (`ASPACE_ISOLATED`), so an owner can see
+/// which programs are.
+pub const INSPECT_ISOLATED: u64 = 1 << 16;
 /// `Console`: more of the same text follows this piece (bit 63 of `a1`).
 pub const CONSOLE_MORE: u64 = 1 << 63;
 

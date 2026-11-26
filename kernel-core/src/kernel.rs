@@ -869,6 +869,10 @@ impl<H: Hal> Kernel<H> {
                     let th = self.thread(obj);
                     [th.state.get(), th.cpu.get(), th.regs[H::IP].get(), th.regs[H::SP].get(), th.blocked_on.get(), 0]
                 };
+                let isolated = |c: &crate::cap::Cap| {
+                    let yes = c.ty == ObjectType::AddressSpace && c.flags & crate::cap::FLAG_ISOLATED != 0;
+                    if yes { silica_abi::INSPECT_ISOLATED } else { 0 }
+                };
                 let out = match cap.ty {
                     ObjectType::CapSpace if a[2] == 1 => {
                         // The thread in that slot of the CapSpace.
@@ -882,7 +886,7 @@ impl<H: Hal> Kernel<H> {
                     ObjectType::CapSpace if a[2] == 0 => {
                         let s = self.slot_in(&cap, a[1])?;
                         match self.view(s) {
-                            Some(v) => [v.cap.ty as u64, v.cap.rights.0 as u64, v.cap.bits as u64, v.cap.obj, v.cap.badge, v.depth as u64],
+                            Some(v) => [v.cap.ty as u64, v.cap.rights.0 as u64, v.cap.bits as u64, v.cap.obj, v.cap.badge, v.depth as u64 | isolated(&v.cap)],
                             None => [0; 6],
                         }
                     }
