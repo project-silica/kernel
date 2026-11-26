@@ -54,7 +54,7 @@ impl Machine {
     /// A kernel entry that goes global: everybody's state.
     fn global(&self, me: usize) {
         self.locks[me].lock();
-        go_global(&self.locks[me], self.locks.iter(), || {});
+        go_global(&self.locks[me], self.locks.iter(), |_, _| {});
         self.shared.with_mut(|p| unsafe { *p += 1 });
         for c in &self.cpu {
             c.with_mut(|p| unsafe { *p += 10 });
@@ -115,7 +115,7 @@ impl Three {
     }
     fn pair(&self, me: usize, other: usize) {
         self.locks[me].lock();
-        go_pair(&self.locks[me], &self.locks[other], other < me, || {});
+        go_pair(&self.locks[me], &self.locks[other], other < me, |_, _| {});
         for c in [me, other] {
             self.cpu[c].with_mut(|p| unsafe { *p += 1 });
         }
@@ -124,7 +124,7 @@ impl Three {
     }
     fn global(&self, me: usize) {
         self.locks[me].lock();
-        go_global(&self.locks[me], self.locks.iter(), || {});
+        go_global(&self.locks[me], self.locks.iter(), |_, _| {});
         for c in &self.cpu {
             c.with_mut(|p| unsafe { *p += 10 });
         }
@@ -191,7 +191,7 @@ fn a_queue_changing_owner_is_never_used_under_the_old_owners_lock_alone() {
         // Processor 0: a receive on a queue processor 1 owns.
         s.locks[0].lock();
         if s.owner.load(Ordering::Relaxed) == 2 {
-            go_pair(&s.locks[0], &s.locks[1], false, || {});
+            go_pair(&s.locks[0], &s.locks[1], false, |_, _| {});
             // Looked at again with both locks held.
             if s.owner.load(Ordering::Relaxed) == 2 {
                 s.queue.with_mut(|p| unsafe { *p += 10 });
@@ -512,7 +512,7 @@ fn a_root_is_reused_only_after_the_processor_on_it_has_left_it() {
                     }
                     walk(*on);
                 };
-                s.lock.lock_while(|| answer(&mut on));
+                s.lock.lock_while(|_| answer(&mut on));
                 walk(on);
                 s.lock.unlock();
                 walk(on); // back in user mode
@@ -521,7 +521,7 @@ fn a_root_is_reused_only_after_the_processor_on_it_has_left_it() {
                     while !s.kicked.load(Ordering::Acquire) {
                         thread::yield_now();
                     }
-                    s.lock.lock_while(|| answer(&mut on));
+                    s.lock.lock_while(|_| answer(&mut on));
                     assert!(!on, "the request is answered before the lock is had");
                     s.lock.unlock();
                 }

@@ -235,7 +235,10 @@ pub enum Syscall {
     /// `a0` device-identity capability, `a1` a device's identity (its PCI
     /// segment, bus, device and function: `segment << 16 | bus << 8 |
     /// device << 3 | function`), `a2` an address space made for devices
-    /// ([`ASPACE_IO`]; write), or 0. From now on the device reaches exactly
+    /// ([`ASPACE_IO`]; write), or 0. With `a3` a notification (write; 0: none,
+    /// or keep the last one given), every access of the space's devices the
+    /// IOMMU refuses signals it, and the space counts them (`Inspect` of the
+    /// space: io, devices attached, refused accesses). From now on the device reaches exactly
     /// the frames mapped in that address space, at the addresses they are
     /// mapped at, and nothing else; with 0 it reaches nothing, which is how
     /// every device starts and what it returns to when the address space is

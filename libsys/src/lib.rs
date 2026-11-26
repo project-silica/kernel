@@ -478,6 +478,20 @@ pub fn device_attach(devices: Cap, device: u32, io_space: Cap) -> Result<()> {
     sys(Syscall::DeviceAttach, [devices.0, device as u64, io_space.0, 0, 0, 0]).map(|_| ())
 }
 
+/// [`device_attach`], and from now on every access of the space's devices
+/// the IOMMU refuses signals `faults` (a notification, write right; the
+/// last one given counts) and is counted in the space ([`inspect_io_space`]).
+pub fn device_attach_noting(devices: Cap, device: u32, io_space: Cap, faults: Cap) -> Result<()> {
+    sys(Syscall::DeviceAttach, [devices.0, device as u64, io_space.0, faults.0, 0, 0]).map(|_| ())
+}
+
+/// A device address space: how many devices are attached and how many of
+/// their accesses the IOMMU refused.
+pub fn inspect_io_space(space: Cap) -> Result<(u64, u64)> {
+    let r = sys(Syscall::Inspect, [space.0, 0, 0, 0, 0, 0])?;
+    Ok((r[1], r[2]))
+}
+
 /// From now on the device with identity `device` reaches no memory.
 pub fn device_detach(devices: Cap, device: u32) -> Result<()> {
     sys(Syscall::DeviceAttach, [devices.0, device as u64, 0, 0, 0, 0]).map(|_| ())

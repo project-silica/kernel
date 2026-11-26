@@ -216,6 +216,13 @@ pub trait Hal {
     fn irq_route(&self, line: usize, cpu: usize, level: bool, active_low: bool) -> bool;
     /// Hold interrupt line `line` off, or let it interrupt again.
     fn irq_mask(&self, line: usize, masked: bool);
+    /// Hold line `line` off because it fired again before its waiter took
+    /// its news, or let it interrupt again (`held` false). A level line
+    /// stays masked until its driver acknowledges it (`IrqAck`) whatever
+    /// this says. By default the line is masked.
+    fn irq_hold(&self, line: usize, held: bool) {
+        self.irq_mask(line, held)
+    }
     /// Deliver line `line`, routed already (by [`Hal::irq_route`] or
     /// [`Hal::msi_route`]), to processor `cpu` from now on, as it was
     /// triggered before, without its device being told anything. `false`

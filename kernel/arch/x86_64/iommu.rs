@@ -17,11 +17,11 @@
 //! when `Unmap` returns, no unit holds the translation.
 //!
 //! The kernel's own memory for this is carved at boot: the root table, one
-//! context table per bus that has an attached device (from a pool of
-//! [`CONTEXT_TABLES`]), and a queue page per unit.
+//! context table per bus that has an attached device (from a pool sized
+//! by the MCFG's buses), and a queue page per unit.
 //!
 //! A refused access is recorded by the unit and raises its fault interrupt,
-//! which logs who was refused what (the first [`FAULT_LINES`] times).
+//! which logs who was refused what (at most ten lines a second, `fault`).
 //!
 //! Interrupts are remapped too, where every unit can (ECAP.IR, with
 //! extended interrupt mode for x2APIC destinations): a device's message is
@@ -35,7 +35,7 @@
 
 use super::cpu::percpu;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::boot::{BootInfo, RegionTable};
 use kernel_core::hal::Hal as _;
 use kernel_core::klog;
@@ -45,12 +45,12 @@ use silica_abi::Error;
 
 const PAGE: u64 = 4096;
 const MAX_UNITS: usize = 32;
-/// Buses that can have an attached device at one time.
-const CONTEXT_TABLES: u64 = 64;
+/// Buses that can have an attached device when the firmware gives no MCFG
+/// (legacy configuration access reaches 256). With one, the pool holds a
+/// context table for every bus of segment 0 it names (`contexts`).
+const CONTEXT_TABLES: u64 = 256;
 /// Device address spaces that can have devices attached at one time.
 const DOMAINS: usize = 256;
-/// Refused accesses logged before the fault interrupt is switched off.
-const FAULT_LINES: u32 = 32;
 /// The vector the units' fault interrupts arrive at.
 pub const FAULT_VECTOR: u64 = 0xF2;
 
@@ -102,6 +102,8 @@ struct State {
     root: u64,
     pool: u64,
     pool_used: u64,
+    /// Context tables in the pool: one per bus of segment 0 (the MCFG).
+    contexts: u64,
     /// A word the units write when a queued wait completes.
     status: u64,
     /// Whether the units walk four levels (48 bits) or three (39).
@@ -135,6 +137,7 @@ static STATE: Racy = Racy(UnsafeCell::new(State {
     root: 0,
     pool: 0,
     pool_used: 0,
+    contexts: 0,
     status: 0,
     four_levels: true,
     large: true,
@@ -149,7 +152,6 @@ static STATE: Racy = Racy(UnsafeCell::new(State {
     ioapic_count: 0,
 }));
 static LOCK: Lock = Lock::new();
-static REPORTED: AtomicU32 = AtomicU32::new(0);
 /// `top` again, readable without the lock: 0 until the units translate.
 static TOP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static LARGE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -352,7 +354,11 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
     // Root table, an empty root for other segments, the wait status word's
     // page, the interrupt remapping table and an empty one for other
     // segments, the context tables, and a queue page per unit.
-    let pages = 5 + CONTEXT_TABLES + (s.n + others) as u64;
+    // A context table for every bus segment 0 has (the MCFG), not a fixed
+    // number: a server with devices past bus 64 had them refused.
+    s.contexts =
+        super::acpi_table(bi, phys, b"MCFG").and_then(|t| silica_formats::acpi::mcfg_buses(t, 0)).unwrap_or(CONTEXT_TABLES).clamp(1, 256);
+    let pages = 5 + s.contexts + (s.n + others) as u64;
     let Some(mem) = table.carve(pages * PAGE, PAGE, 1 << 20, bi.phys_map_len) else {
         klog!(super::kernel(), "kernel: no memory for the IOMMU's tables; devices are not confined");
         s.n = 0;
@@ -360,7 +366,7 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
     };
     phys.zero(mem, pages * PAGE);
     (s.root, s.status, s.pool) = (mem, mem + 2 * PAGE, mem + 5 * PAGE);
-    let queues = s.pool + CONTEXT_TABLES * PAGE;
+    let queues = s.pool + s.contexts * PAGE;
     // A unit of another segment remaps nothing: its devices' identifiers
     // could be those of segment 0's.
     let (irt, empty_irt) = if remap { (Some(mem + 3 * PAGE), Some(mem + 4 * PAGE)) } else { (None, None) };
@@ -444,6 +450,7 @@ const fn empty() -> State {
         root: 0,
         pool: 0,
         pool_used: 0,
+        contexts: 0,
         status: 0,
         four_levels: true,
         large: true,
@@ -573,7 +580,7 @@ fn attach_locked(phys: &Phys, s: &mut State, id: u64, root: Paddr) -> Result<Pad
             if root == 0 {
                 return Ok(0);
             }
-            if s.pool_used == CONTEXT_TABLES {
+            if s.pool_used == s.contexts {
                 return Err(Error::NoMemory);
             }
             let page = s.pool + s.pool_used * PAGE;
@@ -688,9 +695,29 @@ pub fn release(phys: &Phys, root: Paddr) {
     LOCK.unlock();
 }
 
-/// A unit's fault interrupt: say which device was refused what. Runs with
-/// or without the processor's lock; it touches only the units' registers.
-pub fn fault(phys: &Phys) {
+/// The devices a fault interrupt found refused, by source identifier (at
+/// most eight distinct a pass; more are counted in the log's line only).
+pub struct Refused {
+    pub sids: [u16; 8],
+    pub n: usize,
+}
+
+/// Lines about refused accesses, at most ten a second (the kernel log's
+/// rate); past them the units' fault interrupt is held off for the rest of
+/// the second, so a device refused without end costs neither the console nor
+/// a processor, and reporting resumes after (`tick`). Before, reporting
+/// stopped for good after 32 refusals since boot.
+static FAULT_RATE: kernel_core::log::Rate = kernel_core::log::Rate::new();
+/// When the held-off fault interrupt is let go again (0: it is not held).
+static PAUSED_UNTIL: AtomicU64 = AtomicU64::new(0);
+const PAUSE_NS: u64 = 1_000_000_000;
+
+/// A unit's fault interrupt: say which device was refused what, and return
+/// the devices, whose attachers are told (`deliver`). Runs with or without
+/// the processor's lock; it touches only the units' registers.
+pub fn fault(phys: &Phys, now: u64) -> Refused {
+    let mut out = Refused { sids: [0; 8], n: 0 };
+    let mut over = false;
     LOCK.lock();
     // SAFETY: under `LOCK`.
     let s = unsafe { &*STATE.0.get() };
@@ -711,47 +738,35 @@ pub fn fault(phys: &Phys) {
                 let lo = r64(phys, u.base, at);
                 let (address, sid, reason, read) = (lo & !0xFFF, hi & 0xFFFF, hi >> 32 & 0xFF, hi >> 62 & 1 != 0);
                 w64(phys, u.base, at + 8, 1 << 63);
-                let n = REPORTED.fetch_add(1, Ordering::Relaxed);
-                if n < FAULT_LINES && reason >= 0x20 {
+                if !out.sids[..out.n].contains(&(sid as u16)) && out.n < out.sids.len() {
+                    out.sids[out.n] = sid as u16;
+                    out.n += 1;
+                }
+                let Some(missed) = FAULT_RATE.allow(now) else {
+                    over = true;
+                    continue;
+                };
+                let (b, d, f) = (sid >> 8, sid >> 3 & 31, sid & 7);
+                let k = super::kernel();
+                if missed != 0 {
+                    klog!(k, "kernel: {missed} refused device accesses were not reported (more than ten a second)");
+                }
+                if reason == 0x25 {
+                    klog!(
+                        k,
+                        "kernel: device {b:02x}:{d:02x}.{f} was refused an interrupt in the old format (IOMMU fault reason {reason:#x})"
+                    );
+                } else if reason >= 0x20 {
                     // An interrupt request: the entry it named is in the
                     // top bits of the record (VT-d 7.2.2).
-                    if reason == 0x25 {
-                        klog!(
-                            super::kernel(),
-                            "kernel: device {:02x}:{:02x}.{} was refused an interrupt in the old format (IOMMU fault reason {:#x})",
-                            sid >> 8,
-                            sid >> 3 & 31,
-                            sid & 7,
-                            reason
-                        );
-                    } else {
-                        klog!(
-                            super::kernel(),
-                            "kernel: device {:02x}:{:02x}.{} was refused interrupt entry {} (IOMMU fault reason {:#x})",
-                            sid >> 8,
-                            sid >> 3 & 31,
-                            sid & 7,
-                            lo >> 48,
-                            reason
-                        );
-                    }
-                } else if n < FAULT_LINES {
                     klog!(
-                        super::kernel(),
-                        "kernel: device {:02x}:{:02x}.{} was refused a {} at {:#x} (IOMMU fault reason {})",
-                        sid >> 8,
-                        sid >> 3 & 31,
-                        sid & 7,
-                        if read { "read" } else { "write" },
-                        address,
-                        reason
+                        k,
+                        "kernel: device {b:02x}:{d:02x}.{f} was refused interrupt entry {} (IOMMU fault reason {reason:#x})",
+                        lo >> 48
                     );
                 } else {
-                    if n == FAULT_LINES {
-                        klog!(super::kernel(), "kernel: further refused device accesses are not reported");
-                    }
-                    w32(phys, u.base, FECTL, 1 << 31);
-                    found = false;
+                    let what = if read { "read" } else { "write" };
+                    klog!(k, "kernel: device {b:02x}:{d:02x}.{f} was refused a {what} at {address:#x} (IOMMU fault reason {reason})");
                 }
             }
         }
@@ -759,14 +774,73 @@ pub fn fault(phys: &Phys) {
         // unit whose records were all full dropped the faults after them
         // (QEMU's has one record): said, so a missing line is explained.
         let status = r32(phys, u.base, FSTS);
-        if status & 1 != 0 && REPORTED.load(Ordering::Relaxed) < FAULT_LINES {
+        if status & 1 != 0 && FAULT_RATE.allow(now).is_some() {
             klog!(super::kernel(), "kernel: the IOMMU's fault records overflowed: refused accesses went unreported");
         }
         // Only the fault records' overflow is cleared here: a queue error
         // is left for the wait it holds up, which says what failed.
         w32(phys, u.base, FSTS, status & !FSTS_QUEUE_ERRORS);
     }
+    // Past the rate: the fault interrupt is held off for the rest of the
+    // second (records still collect; the timer lets it go, `tick`).
+    if over && PAUSED_UNTIL.load(Ordering::Relaxed) == 0 {
+        for u in &s.units[..s.n] {
+            w32(phys, u.base, FECTL, 1 << 31);
+        }
+        PAUSED_UNTIL.store(now.saturating_add(PAUSE_NS).max(1), Ordering::Relaxed);
+    }
     LOCK.unlock();
+    out
+}
+
+/// When the timer must next look at the fault interrupt (`u64::MAX`: never).
+pub fn due() -> u64 {
+    match PAUSED_UNTIL.load(Ordering::Relaxed) {
+        0 => u64::MAX,
+        t => t,
+    }
+}
+
+/// The timer: a fault interrupt held off past its pause is let go again;
+/// records that collected meanwhile interrupt at once.
+pub fn tick(phys: &Phys, now: u64) {
+    let until = PAUSED_UNTIL.load(Ordering::Relaxed);
+    if until == 0 || now < until {
+        return;
+    }
+    LOCK.lock();
+    // SAFETY: under `LOCK`.
+    let s = unsafe { &*STATE.0.get() };
+    for u in &s.units[..s.n] {
+        w32(phys, u.base, FECTL, 0);
+    }
+    PAUSED_UNTIL.store(0, Ordering::Relaxed);
+    LOCK.unlock();
+}
+
+/// The device address space device `sid` is attached to now, by the root
+/// `Hal::io_attach` named it with (0: none).
+pub fn space_of(phys: &Phys, sid: u16) -> Paddr {
+    if top() == 0 {
+        return 0;
+    }
+    LOCK.lock();
+    // SAFETY: under `LOCK`.
+    let s = unsafe { &*STATE.0.get() };
+    let skip = if s.four_levels { 0 } else { PAGE };
+    let (bus, devfn) = (sid as u64 >> 8, sid as u64 & 0xFF);
+    // SAFETY: the root and context tables are the kernel's (see `attach_locked`).
+    let root = unsafe {
+        let root_entry = *word(phys, s.root + bus * 16);
+        if root_entry & 1 == 0 {
+            0
+        } else {
+            let lo = *word(phys, (root_entry & !0xFFF) + devfn * 16);
+            if lo & 1 != 0 { (lo & !0xFFF) - skip } else { 0 }
+        }
+    };
+    LOCK.unlock();
+    root
 }
 
 /// Remapping entry `line` delivers nothing from now on (its line was
@@ -796,6 +870,33 @@ pub fn unremap(phys: &Phys, line: usize) {
         }
     }
     invalidate(phys, s, &[[4 | 1 << 4 | (line as u64) << 32, 0]]);
+    LOCK.unlock();
+}
+
+/// Hold the message line `line` off (its entry delivers to the discard
+/// vector) or let it interrupt again at its own vector: how a line that fires
+/// again before its waiter took its news stops costing a processor. One
+/// aligned store changes the vector; the entry stays present.
+pub fn hold(phys: &Phys, line: usize, held: bool) {
+    if !remapping() || line >= IRT_ENTRIES {
+        return;
+    }
+    LOCK.lock();
+    // SAFETY: under `LOCK`.
+    let s = unsafe { &*STATE.0.get() };
+    let at = s.irt + line as u64 * 16;
+    let vector = if held { DISCARD_VECTOR } else { super::ioapic::FIRST_VECTOR + line as u64 };
+    // SAFETY: entry `line` of the kernel's table; only its vector changes.
+    let present = unsafe {
+        let low = word(phys, at).read_volatile();
+        if low & 1 != 0 {
+            word(phys, at).write_volatile(low & !(0xFF << 16) | vector << 16);
+        }
+        low & 1 != 0
+    };
+    if present {
+        invalidate(phys, s, &[[4 | 1 << 4 | (line as u64) << 32, 0]]);
+    }
     LOCK.unlock();
 }
 

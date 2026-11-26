@@ -383,6 +383,11 @@ impl<H: Hal> Kernel<H> {
         self.reaping.get() != 0 || self.reap.get() != 0
     }
 
+    /// [`Kernel::delete_shallow`], for an object's embedded slot.
+    pub(crate) fn delete_slot_shallow(&self, s: Paddr) {
+        self.delete_shallow(s);
+    }
+
     /// Delete the capability in `s` and everything derived from it.
     fn delete_shallow(&self, s: Paddr) {
         while self.has_children(s) {

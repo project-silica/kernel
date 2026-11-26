@@ -24,15 +24,19 @@ impl Lock {
     }
     /// Take the lock, waiting for it if need be.
     pub fn lock(&self) {
-        self.lock_while(|| {});
+        self.lock_while(|_| {});
     }
     /// Take the lock, calling `waiting` on every turn of the wait: what a
     /// processor that does not hold its own lock must go on answering
-    /// ([`Leave`]).
-    pub fn lock_while(&self, mut waiting: impl FnMut()) {
+    /// ([`Leave`]). `waiting(true)` begins a wait: the lock was just found
+    /// held (again, when another processor took it first as it was let
+    /// go); `waiting(false)` is a turn of the same wait. A bound on the
+    /// wait is a bound on how long the lock is not seen free.
+    pub fn lock_while(&self, mut waiting: impl FnMut(bool)) {
         while self.0.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            let mut began = true;
             while self.0.load(Ordering::Relaxed) {
-                waiting();
+                waiting(core::mem::take(&mut began));
                 spin();
             }
         }
@@ -51,12 +55,12 @@ impl Lock {
 
 /// From holding `mine` to holding every lock in `all` (which includes
 /// `mine`), taken in order so two processors doing this cannot deadlock.
-/// `waiting` is called on every turn of a wait, as in [`Lock::lock_while`]:
-/// `mine` is let go first.
-pub fn go_global<'a>(mine: &Lock, all: impl Iterator<Item = &'a Lock>, mut waiting: impl FnMut()) {
+/// `waiting` is called on every turn of a wait with the lock waited for, as
+/// in [`Lock::lock_while`]: `mine` is let go first.
+pub fn go_global<'a>(mine: &Lock, all: impl Iterator<Item = &'a Lock>, mut waiting: impl FnMut(&Lock, bool)) {
     mine.unlock();
     for l in all {
-        l.lock_while(&mut waiting);
+        l.lock_while(|began| waiting(l, began));
     }
 }
 
@@ -64,14 +68,15 @@ pub fn go_global<'a>(mine: &Lock, all: impl Iterator<Item = &'a Lock>, mut waiti
 /// (the order [`go_global`] uses), so no two of these transitions deadlock.
 /// When `other` comes first `mine` is let go on the way: the caller then
 /// re-examines everything it looked at before, and `waiting` is called on
-/// every turn of the waits that follow ([`Lock::lock_while`]).
-pub fn go_pair(mine: &Lock, other: &Lock, other_first: bool, mut waiting: impl FnMut()) {
+/// every turn of the waits that follow ([`Lock::lock_while`]), given the lock
+/// waited for.
+pub fn go_pair(mine: &Lock, other: &Lock, other_first: bool, mut waiting: impl FnMut(&Lock, bool)) {
     if other_first {
         mine.unlock();
-        other.lock_while(&mut waiting);
-        mine.lock_while(&mut waiting);
+        other.lock_while(|began| waiting(other, began));
+        mine.lock_while(|began| waiting(mine, began));
     } else {
-        other.lock();
+        other.lock_while(|began| waiting(other, began));
     }
 }
 

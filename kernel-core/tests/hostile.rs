@@ -707,3 +707,53 @@ fn a_group_holds_its_threads_on_its_processor() {
     assert_eq!(m.k.thread_view(t).cpu, 0);
     m.k.check_runqueues().unwrap();
 }
+
+/// A device (or a driver programming one) that raises an edge or message
+/// line without end cost a processor: each interrupt was delivered whole,
+/// and only level lines were held off. A line that fires again before its
+/// waiter took the last news gains nothing by being heard, so it is held off
+/// (masked, or its remapping entry sent to the discard vector) until the
+/// waiter receives, and the device costs one interrupt per receive.
+#[test]
+fn a_line_firing_faster_than_its_waiter_receives_is_held_off_until_it_does() {
+    let m = Machine::with_cpus(16, 1);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 15, 0b10, 0]);
+    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 5, FREE + 1, 0, 0, 0]);
+    let log = || m.k.hal.irq_log.borrow().clone();
+    let held = || log().iter().filter(|l| l.as_str() == "mask 5").count();
+    m.irq(5);
+    assert_eq!(held(), 0, "the first interrupt is news");
+    for _ in 0..100 {
+        m.irq(5);
+    }
+    assert_eq!(held(), 1, "a storm while the news is pending holds the line off once: {:?}", log());
+    m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 0b10);
+    assert_eq!(log().last().map(String::as_str), Some("unmask 5"), "taking the news lets the line interrupt again");
+    // Heard and taken one at a time, it is never held.
+    let before = held();
+    for _ in 0..10 {
+        m.irq(5);
+        m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    }
+    assert_eq!(held(), before);
+    // A busy line its waiter falls a little behind is never held: only a
+    // run of 64 deliveries with the news pending is a storm.
+    for _ in 0..30 {
+        m.irq(5);
+    }
+    assert_eq!(held(), before, "thirty deliveries with the news pending are not a storm");
+    m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    // Bound anew while held, the hold ends with the old binding.
+    for _ in 0..70 {
+        m.irq(5);
+    }
+    assert_eq!(held(), before + 1);
+    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 5, FREE + 1, 0, 0, 0]);
+    m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    m.irq(5);
+    assert_eq!(held(), before + 1, "a hold of the old binding does not outlive it");
+    assert_eq!(log().iter().filter(|l| l.as_str() == "unmask 5").count(), 1, "the new binding is not released twice");
+}

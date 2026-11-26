@@ -222,6 +222,46 @@ fn last_panic(at: u64) -> &'static [u8] {
     kept[..n].copy_from_slice(&text[..n]);
     kernel_core::crash::clear(region);
     &kept[..n]
+/// A panic is under way: a processor taking a kick stops for good.
+static PANICKING: AtomicBool = AtomicBool::new(false);
+/// Processors that stopped for the panic.
+static STOPPED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Stop every other processor (the kick SGI, which they take while a panic
+/// is under way as a stop), then say how many did, so the kernel's state is
+/// not changed further behind the panic. GICv3 without pseudo-NMIs has no
+/// interrupt that reaches a processor with interrupts masked: one spinning
+/// in the kernel with them off does not stop, and the count says so.
+fn stop_others() {
+    if PANICKING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let tpidr: u64;
+    // SAFETY: reading this processor's data pointer (0 before `install`).
+    unsafe { asm!("mrs {}, tpidr_el1", out(reg) tpidr, options(nomem, nostack, preserves_flags)) }
+    if tpidr == 0 {
+        return;
+    }
+    let me = percpu().index;
+    let mut others = 0;
+    for i in 0..kernel_core::smp::MAX_CPUS {
+        let Some(c) = cpu::percpu_of(i) else { break };
+        if i != me && c.online.load(Ordering::Acquire) {
+            gic::kick(c.mpidr.load(Ordering::Relaxed));
+            others += 1;
+        }
+    }
+    if others == 0 {
+        return;
+    }
+    // A bounded wait: each answers within microseconds if it can at all.
+    for _ in 0..50_000_000u64 {
+        if STOPPED.load(Ordering::Acquire) == others {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let _ = write!(Out, "kernel: {} of {others} other processors stopped\r\n", STOPPED.load(Ordering::Acquire));
 }
 
 /// Stop this processor: tell a test harness the kernel failed, then wait.
@@ -504,6 +544,7 @@ pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     // SAFETY: reads the program counter and the frame pointer.
     unsafe { asm!("adr {}, .", "mov {}, x29", out(reg) pc, out(reg) fp, options(nomem, nostack)) }
     backtrace(pc, fp);
+    stop_others();
     after_panic()
 }
 
@@ -521,6 +562,7 @@ extern "C" fn kernel_fault(esr: u64, elr: u64, far: u64, entry: u64, fp: u64) ->
         SLIDE.load(Ordering::Relaxed)
     );
     backtrace(elr, fp);
+    stop_others();
     after_panic()
 }
 
@@ -897,15 +939,26 @@ impl Hal for Arm {
             return;
         }
         gic::kick(them.mpidr.load(Ordering::Relaxed));
+        // Bounded as on x86_64: sent again after a second, then named.
+        let mut stall = kernel_core::smp::Stall::new();
+        let mut resent = false;
         while wait && them.mode.is_user() {
+            let now = self.now();
+            stall.turn(now, cpu, "entered the kernel when asked");
+            if !resent && stall.longer_than(now, 1_000_000_000) {
+                resent = true;
+                gic::kick(them.mpidr.load(Ordering::Relaxed));
+            }
             core::hint::spin_loop();
         }
     }
 
-    fn wait_left(&self, _cpu: usize, request: &kernel_core::lock::Leave) {
+    fn wait_left(&self, cpu: usize, request: &kernel_core::lock::Leave) {
         // Never asked here (`KERNEL_IN_ROOT` is false), but as on x86: it
         // answers while it waits for its lock.
+        let mut stall = kernel_core::smp::Stall::new();
         while !request.answered() {
+            stall.turn(self.now(), cpu, "left an address space being destroyed");
             core::hint::spin_loop();
         }
     }
@@ -934,6 +987,13 @@ impl Hal for Arm {
 
     fn irq_mask(&self, line: usize, masked: bool) {
         gic::mask(line, masked);
+    }
+
+    fn irq_hold(&self, line: usize, held: bool) {
+        // A level line is enabled again by its driver's acknowledgement only.
+        if held || !gic::is_level(line) {
+            gic::mask(line, held);
+        }
     }
 
     fn irq_move(&self, line: usize, cpu: usize) -> bool {
@@ -1001,6 +1061,24 @@ extern "C" fn user_trap(kind: u64) {
     // saved it (REG_BY_SVC).
     percpu().mode.enter_kernel();
     k.enter();
+    if kind == 2 {
+        // An SError from a program: its fault when the processor says the
+        // error was contained (as an x86 machine check in user mode is);
+        // the machine stops when nothing says so (`kernel_core::arm::serror`).
+        let esr: u64;
+        // SAFETY: reading the syndrome of this exception.
+        unsafe { asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack, preserves_flags)) }
+        match kernel_core::arm::serror(esr) {
+            kernel_core::arm::SError::Contained => k.fault(Fault::Exception, 0x2F, esr),
+            kernel_core::arm::SError::Corrected => {
+                let _ = write!(Out, "kernel: the processor corrected an error a program met (syndrome {esr:#x})\r\n");
+            }
+            kernel_core::arm::SError::Uncontainable => {
+                panic!("an SError a program met was not contained (syndrome {esr:#x}): the machine's state may be lost")
+            }
+        }
+        return;
+    }
     if kind != 0 {
         irq(true);
         return;
@@ -1061,7 +1139,17 @@ fn irq(locked: bool) {
                     k.on_timer();
                 }
             }
-            gic::SGI_KICK => gic::end(id),
+            gic::SGI_KICK => {
+                gic::end(id);
+                // Another processor panicked: this one stops where it is.
+                if PANICKING.load(Ordering::Acquire) {
+                    STOPPED.fetch_add(1, Ordering::AcqRel);
+                    loop {
+                        // SAFETY: masking interrupts and waiting change nothing else.
+                        unsafe { asm!("msr daifset, #0xf", "wfe", options(nomem, nostack)) }
+                    }
+                }
+            }
             id if id >= gic::SPI_BASE => {
                 // An LPI is a message line; anything else a wire.
                 let line = its::line_of(id).unwrap_or((id - gic::SPI_BASE) as usize);

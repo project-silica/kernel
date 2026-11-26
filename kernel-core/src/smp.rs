@@ -54,6 +54,67 @@ pub const GLOBAL_BURST_NS: u64 = crate::tuned(option_env!("SILICA_TUNE_GLOBAL_BU
 
 /// Most processors the kernel will run.
 pub const MAX_CPUS: usize = 256;
+
+/// How long one processor waits for another (its lock, its entry into the
+/// kernel, its leaving a root) before the machine stops, naming it. Every
+/// wait between processors is bounded: a processor that never answers (an
+/// interrupt lost, a firmware SMI that does not return, a core hung in
+/// hardware) would otherwise hold the whole machine with every lock taken
+/// and say nothing. Ten seconds is far beyond any wait the kernel makes
+/// itself (a global entry is bounded in its work and its share of time).
+pub const STALL_NS: u64 = 10_000_000_000;
+
+/// One wait for another processor, timed from its first turn: what
+/// [`STALL_NS`] bounds. Reads the clock only while it waits.
+pub struct Stall {
+    since: u64,
+}
+
+impl Stall {
+    /// A wait not yet begun.
+    pub const fn new() -> Stall {
+        Stall { since: 0 }
+    }
+
+    /// One turn of waiting, at `now`, for processor `cpu` to do `what`.
+    /// Past [`STALL_NS`] the machine stops (see [`stalled`]).
+    #[inline]
+    pub fn turn(&mut self, now: u64, cpu: usize, what: &str) {
+        if self.over(now) {
+            stalled(cpu, what);
+        }
+    }
+
+    /// One turn of waiting, at `now`: whether it has gone past [`STALL_NS`].
+    #[inline]
+    pub fn over(&mut self, now: u64) -> bool {
+        if self.since == 0 {
+            self.since = now.max(1);
+            return false;
+        }
+        now.saturating_sub(self.since) > STALL_NS
+    }
+
+    /// Whether the wait has gone on longer than `ns` (for one retry before
+    /// giving up, as a kick sent again).
+    pub fn longer_than(&self, now: u64, ns: u64) -> bool {
+        self.since != 0 && now.saturating_sub(self.since) > ns
+    }
+}
+
+impl Default for Stall {
+    fn default() -> Stall {
+        Stall::new()
+    }
+}
+
+/// Processor `cpu` did not `what` within [`STALL_NS`]: stop the machine,
+/// naming it, rather than hang with every lock held.
+#[cold]
+#[inline(never)]
+pub fn stalled(cpu: usize, what: &str) -> ! {
+    panic!("processor {cpu} has not {what} in 10 s: the machine stops")
+}
 const _: () = assert!(MAX_CPUS.is_power_of_two());
 
 /// Every processor's [`Cpu`], laid out so that no processor's state shares
@@ -106,9 +167,11 @@ impl CpuTable {
     pub(crate) fn at_slot(&self, s: usize) -> &Cpu {
         &self.0[s & (CPU_SLOTS - 1)]
     }
-    /// The first `n` processors' states, in order.
+    /// The first `n` processors' states, in order. By slot, masked
+    /// ([`CpuTable::at_slot`]): every global transition walks this, and a
+    /// bounds check on each processor cost it two instructions apiece.
     pub(crate) fn iter(&self, n: usize) -> impl Iterator<Item = &Cpu> {
-        (0..n).map(move |i| self.get(i))
+        (0..n).map(move |i| self.at_slot(cpu_slot(i)))
     }
 }
 
@@ -193,7 +256,13 @@ pub struct Cpu {
     /// Last: read only when a lock is contended, so it moves nothing the
     /// entry paths use.
     pub(crate) leave: crate::lock::Leave,
+    /// When the lock wait under way began ([`Kernel::lock_wait_turn`]).
+    /// Touched only by this processor, also while it does not hold its own
+    /// lock; after `leave` for the same reason.
+    pub(crate) wait_since: Cell<u64>,
 }
+
+const _: () = assert!(core::mem::size_of::<Cpu>() == 512);
 
 /// The processors whose locks a kernel entry holds.
 #[derive(Clone, Copy)]
@@ -248,6 +317,7 @@ impl Cpu {
             global_from: Cell::new(0),
             throttles: Cell::new(0),
             leave: crate::lock::Leave::new(),
+            wait_since: Cell::new(0),
         }
     }
 
@@ -307,7 +377,7 @@ impl<H: Hal> Kernel<H> {
         // cannot see past), and finding it again after the wait cost every
         // entry an instruction.
         let me = self.me();
-        me.lock.lock_while(|| self.answer_leave(me));
+        me.lock.lock_while(|began| self.lock_wait_turn(me, &me.lock, began));
         self.catch_up(me);
     }
 
@@ -333,6 +403,44 @@ impl<H: Hal> Kernel<H> {
                 leave.answer();
             }
         }
+    }
+
+    /// One turn of this processor's wait for lock `l` (its own, entering
+    /// the kernel, or another's, taking more locks than its own:
+    /// [`crate::lock::go_global`], [`crate::lock::go_pair`]): answer what
+    /// other processors ask of it ([`Kernel::answer_leave`]), and once the
+    /// lock has not been seen free for [`STALL_NS`] stop the machine,
+    /// naming the processor whose lock it is (`began`: the lock was just
+    /// found held, [`Lock::lock_while`]).
+    ///
+    /// The wait is timed in the processor's own record, not on the stack,
+    /// so a transition that finds every lock free sets nothing up, and the
+    /// wait's only call is one that does not return: the entry paths keep
+    /// the frame they had without the bound (a bound kept on the stack, or
+    /// a call that returns, cost a page fault 16 to 23 instructions in
+    /// saved registers).
+    #[inline(always)]
+    fn lock_wait_turn(&self, me: &Cpu, l: &Lock, began: bool) {
+        self.answer_leave(me);
+        let now = self.hal.now();
+        if began {
+            me.wait_since.set(now);
+        } else if now.saturating_sub(me.wait_since.get()) > STALL_NS {
+            self.stalled_on(l);
+        }
+    }
+
+    /// The machine stops: lock `l` was not seen free within [`STALL_NS`].
+    #[cold]
+    #[inline(never)]
+    fn stalled_on(&self, l: &Lock) -> ! {
+        let cpu = (0..self.ncpu()).find(|&i| core::ptr::eq(&self.cpus.get(i).lock, l)).unwrap_or(usize::MAX);
+        if cpu == self.hal.cpu() {
+            // Its own lock, held by a processor taking every lock (which
+            // one is not recorded): that processor is the one stalled.
+            stalled(cpu, "had its lock back from a processor holding every lock")
+        }
+        stalled(cpu, "let go of its lock")
     }
 
     /// Enter the kernel on this processor, whose lock the architecture's
@@ -370,7 +478,7 @@ impl<H: Hal> Kernel<H> {
     /// everything it looked at before.
     pub(crate) fn go_global(&self) {
         let me = self.me();
-        crate::lock::go_global(&me.lock, self.cpus.iter(self.ncpu()).map(|c| &c.lock), || self.answer_leave(me));
+        crate::lock::go_global(&me.lock, self.cpus.iter(self.ncpu()).map(|c| &c.lock), |l, began| self.lock_wait_turn(me, l, began));
         self.global.set(true);
         self.globals.set(self.globals.get() + 1);
         self.catch_up(me);
@@ -455,7 +563,7 @@ impl<H: Hal> Kernel<H> {
     /// re-examines everything it looked at before.
     pub(crate) fn go_pair(&self, other: usize) {
         let cpu = self.me();
-        crate::lock::go_pair(&cpu.lock, &self.cpus.get(other).lock, other < self.hal.cpu(), || self.answer_leave(cpu));
+        crate::lock::go_pair(&cpu.lock, &self.cpus.get(other).lock, other < self.hal.cpu(), |l, began| self.lock_wait_turn(cpu, l, began));
         cpu.pair.set(other as u64 + 1);
         cpu.pairs.set(cpu.pairs.get() + 1);
         self.catch_up(cpu);
