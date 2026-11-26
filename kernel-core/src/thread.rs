@@ -518,6 +518,7 @@ impl<H: Hal> Kernel<H> {
             for (line, irq) in self.irqs.iter().enumerate() {
                 if irq.0.get() == q {
                     self.unwatch_line(line);
+                    self.irq_stat[line].held.store(false, core::sync::atomic::Ordering::Relaxed);
                     irq.0.set(0);
                     self.hal.irq_mask(line, true);
                 }

@@ -254,7 +254,7 @@ impl<H: Hal> Kernel<H> {
                 s0.badge.set(cap.bits as u64);
                 self.reap.set(cap.obj);
                 // A watch names its frames by slots of a CapSpace (`watch.rs`).
-                if self.nwatches.get() != 0 {
+                if self.watched.get() != 0 {
                     self.unwatch_space(cap.obj, cap.obj + ((1u64 << cap.bits) << silica_abi::SLOT_BITS));
                 }
             }

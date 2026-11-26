@@ -496,7 +496,7 @@ fn fault_is_delivered_as_a_call_and_the_reply_decides() {
 }
 
 #[test]
-fn fault_without_an_endpoint_stops_the_thread_and_is_logged() {
+fn fault_without_an_endpoint_stops_the_thread_and_only_the_root_tasks_is_said() {
     let m = Machine::new(16);
     let (ut, _) = m.big_untyped();
     let t = m.spawn(ut, FREE);
@@ -508,8 +508,11 @@ fn fault_without_an_endpoint_stops_the_thread_and_is_logged() {
     m.k.schedule();
     assert_eq!(m.k.thread_view(t).state, INACTIVE);
     assert_eq!(m.k.current(), m.root);
-    let log = String::from_utf8_lossy(&m.k.hal.console.borrow()).into_owned();
-    assert!(log.contains("Exception fault") && log.contains("no fault endpoint"), "{log}");
+    let log = || String::from_utf8_lossy(&m.k.hal.console.borrow()).into_owned();
+    assert!(!log().contains("no fault endpoint"), "a program's fault on the kernel's console: {}", log());
+    // The root task's first thread is nobody's to hold: the kernel says it.
+    m.k.fault(Fault::Exception, 0, 13);
+    assert!(log().contains("Exception fault") && log().contains("no fault endpoint"), "{}", log());
 }
 
 #[test]

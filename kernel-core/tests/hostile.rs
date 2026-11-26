@@ -164,10 +164,14 @@ fn a_watch_does_not_reach_past_a_smaller_frame_put_in_its_slot() {
 }
 
 /// A program that makes its thread fault again and again, with nobody to
-/// tell, does not get a kernel console line per fault: the console is
-/// shared, and writing it is slow on real hardware.
+/// tell, writes nothing on the kernel's console: the fault stops the thread
+/// and stays in it for whoever holds it. (Before, each was a console line
+/// until one ration of ten a second for the machine ran out, so one
+/// program's faults took the lines another's would have had.) Only the
+/// thread the kernel started itself, which nobody holds, is spoken for by
+/// the kernel.
 #[test]
-fn faults_with_nobody_to_tell_are_not_logged_without_limit() {
+fn faults_with_nobody_to_tell_write_nothing_on_the_console() {
     let m = Machine::new(16);
     let (ut, _) = m.big_untyped();
     let t = m.spawn(ut, FREE);
@@ -180,18 +184,14 @@ fn faults_with_nobody_to_tell_are_not_logged_without_limit() {
         assert_ne!(m.k.thread_view(t).state, RUNNABLE);
         m.ok(S::ThreadStart, [FREE, 0x40_0000, 0, 0, 1, 0]);
     }
-    let log = String::from_utf8_lossy(&m.k.hal.console.borrow()).into_owned();
-    let lines = log.matches("no fault endpoint").count();
-    assert!((1..=20).contains(&lines), "{lines} lines for 1000 faults in no time");
-    // Time passing: the next is told, with how many were not.
-    m.k.hal.now.set(m.k.hal.now() + 2_000_000_000);
-    m.sys_as(t, S::Yield, [0; 6]);
-    while m.k.current() != t {
-        m.sys(S::Yield, [0; 6]);
+    let said = || String::from_utf8_lossy(&m.k.hal.console.borrow()).matches("no fault endpoint").count();
+    assert_eq!(said(), 0, "console lines for a program's faults");
+    // The root task's first thread: the kernel says it, at once.
+    while m.k.current() != m.root {
+        m.sys_as(t, S::Yield, [0; 6]);
     }
     m.fault(Fault::Exception, 0, 13);
-    let log = String::from_utf8_lossy(&m.k.hal.console.borrow()).into_owned();
-    assert!(log.contains("not logged"), "{log}");
+    assert_eq!(said(), 1, "the root task stopped and the kernel did not say so");
 }
 
 /// A thread object reused for a new program (`ThreadStart`) starts it with
@@ -730,29 +730,38 @@ fn a_group_holds_its_threads_on_its_processor() {
 }
 
 /// A device (or a driver programming one) that raises an edge or message
-/// line without end cost a processor: each interrupt was delivered whole,
-/// and only level lines were held off. A line that fires again before its
-/// waiter took the last news gains nothing by being heard, so it is held off
-/// (masked, or its remapping entry sent to the discard vector) until the
-/// waiter receives, and the device costs one interrupt per receive.
+/// line without end cost a processor: each interrupt was delivered whole.
+/// A line that fires while its notification bit is still pending brings no
+/// news, and the kernel knows it exactly, so that delivery holds the line
+/// off (masked, or its remapping entry sent to the discard vector) until
+/// the waiter receives: one interrupt per receive, whatever the device
+/// does. (Before, the hold began after 64 such deliveries in a row, a
+/// count standing in for the pending bit.)
 #[test]
-fn a_line_firing_faster_than_its_waiter_receives_is_held_off_until_it_does() {
+fn a_line_that_fires_with_its_news_pending_is_held_off_until_its_waiter_receives() {
     let m = Machine::with_cpus(16, 1);
     let (ut, _) = m.big_untyped();
-    m.retype(ut, T::Notification, 0, FREE, 1);
-    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 15, 0b10, 0]);
-    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 5, FREE + 1, 0, 0, 0]);
+    m.retype(ut, T::Notification, 0, FREE, 2);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2, FREE, 15, 0b10, 0]);
+    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 5, FREE + 2, 0, 0, 0]);
     let log = || m.k.hal.irq_log.borrow().clone();
     let held = || log().iter().filter(|l| l.as_str() == "mask 5").count();
+    let let_go = || log().iter().filter(|l| l.as_str() == "unmask 5").count();
     m.irq(5);
     assert_eq!(held(), 0, "the first interrupt is news");
+    m.irq(5);
+    assert_eq!(held(), 1, "the second found the news pending: it holds the line off: {:?}", log());
     for _ in 0..100 {
         m.irq(5);
     }
-    assert_eq!(held(), 1, "a storm while the news is pending holds the line off once: {:?}", log());
+    assert_eq!(held(), 1, "held once: {:?}", log());
+    // A receive on another notification lets nothing of this one go.
+    m.ok(S::Send, [FREE + 1, 0, 0, 0, 0, 0]);
+    m.ok(S::Recv, [FREE + 1, 1, 0, 0, 0, 0]);
+    assert_eq!(let_go(), 0);
     m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
     assert_eq!(m.arg(m.root, 0), 0b10);
-    assert_eq!(log().last().map(String::as_str), Some("unmask 5"), "taking the news lets the line interrupt again");
+    assert_eq!((let_go(), m.k.line_held(5)), (1, false), "taking the news lets the line interrupt again");
     // Heard and taken one at a time, it is never held.
     let before = held();
     for _ in 0..10 {
@@ -760,21 +769,68 @@ fn a_line_firing_faster_than_its_waiter_receives_is_held_off_until_it_does() {
         m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
     }
     assert_eq!(held(), before);
-    // A busy line its waiter falls a little behind is never held: only a
-    // run of 64 deliveries with the news pending is a storm.
-    for _ in 0..30 {
-        m.irq(5);
-    }
-    assert_eq!(held(), before, "thirty deliveries with the news pending are not a storm");
-    m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
     // Bound anew while held, the hold ends with the old binding.
-    for _ in 0..70 {
-        m.irq(5);
-    }
+    m.irq(5);
+    m.irq(5);
     assert_eq!(held(), before + 1);
-    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 5, FREE + 1, 0, 0, 0]);
+    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 5, FREE + 2, 0, 0, 0]);
+    assert!(!m.k.line_held(5));
     m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
     m.irq(5);
     assert_eq!(held(), before + 1, "a hold of the old binding does not outlive it");
-    assert_eq!(log().iter().filter(|l| l.as_str() == "unmask 5").count(), 1, "the new binding is not released twice");
+    assert_eq!(let_go(), 1, "the new binding is not released twice");
+}
+
+/// A hold is its notification's: when the notification goes, no line stays
+/// held for it. (Before, a driver that let its line storm and then deleted
+/// the notification left the kernel's count of held lines above zero for
+/// good, and every receive on any notification of the machine walked all
+/// 192 lines from then on.)
+#[test]
+fn a_held_line_does_not_outlive_its_notification() {
+    let m = Machine::with_cpus(16, 1);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 5, FREE, 0, 0, 0]);
+    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 6, FREE, 0, 0, 0]);
+    for _ in 0..70 {
+        m.irq(5);
+        m.irq(6);
+    }
+    assert!(m.k.line_held(5) && m.k.line_held(6));
+    // One of them unbound: the other is still held, and let go by a receive.
+    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 5, 0, 0, 0, 0]);
+    assert!(!m.k.line_held(5) && m.k.line_held(6));
+    m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
+    assert!(!m.k.line_held(6), "a line is still held off for a notification that is gone");
+}
+
+/// A watch is kept in its line's own entry: a driver can watch every line
+/// it holds, and no number of them takes another driver's. (Before, the
+/// kernel had sixteen watches for the machine and whoever asked first had
+/// them: the seventeenth `IrqWatch` was `NoMemory`, whoever made it.)
+#[test]
+fn watching_many_lines_takes_no_watch_from_anyone() {
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, SLOT_DEVICES, 15, 0x18 | 0x19 << 32, 0]);
+    m.retype(ut, T::Frame, 12, FREE + 2, 1);
+    let frame = m.cap(FREE + 2).unwrap().obj;
+    for line in 70..110u64 {
+        m.ok(S::IrqBind, [SLOT_IRQS, line, FREE, IRQ_MSI, FREE + 1, 0x18]);
+        m.ok(S::IrqWatch, [SLOT_IRQS, line, FREE + 2, (line - 70) * 4, 0xFFFF, 0]);
+    }
+    // Each still tells news from none: line 109's word changed, 70's not.
+    m.k.phys.write_val(frame + 39 * 4, &7u32);
+    m.irq(70);
+    assert_eq!(m.err(S::Recv, [FREE, 1, 0, 0, 0, 0]), Error::WouldBlock, "an interrupt with its word unchanged is no news");
+    m.irq(109);
+    m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    // Unwatched, a line's every interrupt is news again; the rest stay.
+    m.ok(S::IrqWatch, [SLOT_IRQS, 70, 0, 0, 0, 0]);
+    m.irq(70);
+    m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    m.irq(71);
+    assert_eq!(m.err(S::Recv, [FREE, 1, 0, 0, 0, 0]), Error::WouldBlock);
 }

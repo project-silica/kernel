@@ -46,14 +46,13 @@ pub struct Kernel<H: Hal> {
     pub(crate) irqs: [(Cell<Paddr>, Cell<u64>); silica_abi::IRQ_LINES as usize],
     /// Where each line is routed and how its deliveries went.
     pub(crate) irq_stat: [crate::ipc::IrqStat; silica_abi::IRQ_LINES as usize],
-    /// How many lines are held off waiting for their news to be taken
-    /// (`Kernel::release_lines`).
-    pub(crate) held_lines: core::sync::atomic::AtomicU32,
-    /// Watched lines (`watch.rs`), and how many entries are in use.
-    pub(crate) watches: [crate::watch::LineWatch; silica_abi::IRQ_WATCHES],
-    pub(crate) nwatches: Cell<usize>,
-    /// How often programs may make the kernel write a console line.
-    pub(crate) log_rate: crate::log::Rate,
+    /// Each line's watch (`watch.rs`), and the first watched line plus one
+    /// (0: none): the watched lines are a list through their entries.
+    pub(crate) watches: [crate::watch::LineWatch; silica_abi::IRQ_LINES as usize],
+    pub(crate) watched: Cell<u8>,
+    /// The root task's first thread: the one thread nobody holds, whose
+    /// stopping the kernel says itself (`fault_unheard`).
+    pub(crate) root_thread: Cell<Paddr>,
 }
 
 impl<H: Hal> Kernel<H> {
@@ -73,10 +72,9 @@ impl<H: Hal> Kernel<H> {
             reaping: Cell::new(0),
             irqs: [const { (Cell::new(0), Cell::new(0)) }; silica_abi::IRQ_LINES as usize],
             irq_stat: [const { crate::ipc::IrqStat::new() }; silica_abi::IRQ_LINES as usize],
-            held_lines: core::sync::atomic::AtomicU32::new(0),
-            watches: [const { crate::watch::LineWatch::new() }; silica_abi::IRQ_WATCHES],
-            nwatches: Cell::new(0),
-            log_rate: crate::log::Rate::new(),
+            watches: [const { crate::watch::LineWatch::new() }; silica_abi::IRQ_LINES as usize],
+            watched: Cell::new(0),
+            root_thread: Cell::new(0),
         }
     }
 
@@ -479,11 +477,17 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// `Inspect` of a device address space: the devices attached, and how
-    /// many of their accesses the IOMMU refused. Out of line as
+    /// many reports of refused accesses there were. Reading it takes the
+    /// report: a device is reported once and then held quiet until its
+    /// space's holder has looked (`Hal::io_taken`), so one refused without
+    /// end costs one interrupt per look. Out of line as
     /// [`Kernel::device_attach`] is.
     #[inline(never)]
     fn inspect_io_space(&self, a: Paddr) -> [u64; 6] {
         let h = self.aspace(a);
+        if h.io.get() != 0 {
+            self.hal.io_taken(&self.phys, a + (1 << PAGE_BITS));
+        }
         [h.io.get(), h.attached.get(), h.faults.get(), 0, 0, 0]
     }
 
@@ -816,9 +820,7 @@ impl<H: Hal> Kernel<H> {
                 // and its news is no longer known; a hold on it ends (the new
                 // route, or the mask below, sets what the hardware does).
                 self.unwatch_line(line);
-                if self.irq_stat[line].held.swap(false, core::sync::atomic::Ordering::Relaxed) {
-                    self.held_lines.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-                }
+                self.unhold_line(line);
                 let old = self.irqs[line].0.replace(0);
                 if old != 0 {
                     let q = self.queue(old);
@@ -897,9 +899,7 @@ impl<H: Hal> Kernel<H> {
                 {
                     return Err(Error::BadArg);
                 }
-                if !self.watch_line(line, self.hal.cpu(), slot, frame.obj, a[3], mask) {
-                    return Err(Error::NoMemory);
-                }
+                self.watch_line(line, self.hal.cpu(), slot, frame.obj, a[3], mask);
                 Ok(Exit::Done)
             }
             Syscall::Inspect => {

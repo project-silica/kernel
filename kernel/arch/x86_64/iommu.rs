@@ -21,7 +21,8 @@
 //! by the MCFG's buses), and a queue page per unit.
 //!
 //! A refused access is recorded by the unit and raises its fault interrupt,
-//! which logs who was refused what (at most ten lines a second, `fault`).
+//! which says who was refused what and tells whoever attached the device;
+//! the device is then held quiet until that report is taken (`fault`).
 //!
 //! Interrupts are remapped too, where every unit can (ECAP.IR, with
 //! extended interrupt mode for x2APIC destinations): a device's message is
@@ -35,7 +36,7 @@
 
 use super::cpu::percpu;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 use kernel_core::boot::{BootInfo, RegionTable};
 use kernel_core::hal::Hal as _;
 use kernel_core::klog;
@@ -624,6 +625,7 @@ fn attach_locked(phys: &Phys, s: &mut State, id: u64, root: Paddr) -> Result<Pad
             *header(phys, root).add(1) += 1;
             s.per_bus[bus as usize] += 1;
         }
+        listen(phys, s);
         Ok(old)
     }
 }
@@ -691,6 +693,7 @@ pub fn release(phys: &Phys, root: Paddr) {
         if did != 0 {
             invalidate(phys, s, &[domain(did)]);
         }
+        listen(phys, s);
     }
     LOCK.unlock();
 }
@@ -702,22 +705,24 @@ pub struct Refused {
     pub n: usize,
 }
 
-/// Lines about refused accesses, at most ten a second (the kernel log's
-/// rate); past them the units' fault interrupt is held off for the rest of
-/// the second, so a device refused without end costs neither the console nor
-/// a processor, and reporting resumes after (`tick`). Before, reporting
-/// stopped for good after 32 refusals since boot.
+/// The console's ration of lines about refused accesses (the kernel log's
+/// rate: a serial port takes so many a second, whoever causes them).
 static FAULT_RATE: kernel_core::log::Rate = kernel_core::log::Rate::new();
-/// When the held-off fault interrupt is let go again (0: it is not held).
-static PAUSED_UNTIL: AtomicU64 = AtomicU64::new(0);
-const PAUSE_NS: u64 = 1_000_000_000;
 
 /// A unit's fault interrupt: say which device was refused what, and return
 /// the devices, whose attachers are told (`deliver`). Runs with or without
-/// the processor's lock; it touches only the units' registers.
+/// the processor's lock; it touches only the units' registers and tables.
+///
+/// What is reported is then held quiet until someone takes the report,
+/// which the kernel is told of ([`taken`]), never for a time: a device
+/// refused a memory access has its fault processing disabled in its own
+/// context entry (it is still refused, and nobody else's reports stop);
+/// what a unit cannot hold per device (a refused interrupt message, a
+/// device on a bus with no context table) masks that unit's fault
+/// interrupt. Before, ten lines in a second held every unit's fault
+/// interrupt off for the rest of it, by the timer.
 pub fn fault(phys: &Phys, now: u64) -> Refused {
     let mut out = Refused { sids: [0; 8], n: 0 };
-    let mut over = false;
     LOCK.lock();
     // SAFETY: under `LOCK`.
     let s = unsafe { &*STATE.0.get() };
@@ -742,10 +747,11 @@ pub fn fault(phys: &Phys, now: u64) -> Refused {
                     out.sids[out.n] = sid as u16;
                     out.n += 1;
                 }
-                let Some(missed) = FAULT_RATE.allow(now) else {
-                    over = true;
-                    continue;
-                };
+                // SAFETY: under `LOCK`; table accesses as in `attach_locked`.
+                if reason >= 0x20 || !unsafe { quiet(phys, s, sid) } {
+                    w32(phys, u.base, FECTL, 1 << 31);
+                }
+                let Some(missed) = FAULT_RATE.allow(now) else { continue };
                 let (b, d, f) = (sid >> 8, sid >> 3 & 31, sid & 7);
                 let k = super::kernel();
                 if missed != 0 {
@@ -781,40 +787,65 @@ pub fn fault(phys: &Phys, now: u64) -> Refused {
         // is left for the wait it holds up, which says what failed.
         w32(phys, u.base, FSTS, status & !FSTS_QUEUE_ERRORS);
     }
-    // Past the rate: the fault interrupt is held off for the rest of the
-    // second (records still collect; the timer lets it go, `tick`).
-    if over && PAUSED_UNTIL.load(Ordering::Relaxed) == 0 {
-        for u in &s.units[..s.n] {
-            w32(phys, u.base, FECTL, 1 << 31);
-        }
-        PAUSED_UNTIL.store(now.saturating_add(PAUSE_NS).max(1), Ordering::Relaxed);
-    }
     LOCK.unlock();
     out
 }
 
-/// When the timer must next look at the fault interrupt (`u64::MAX`: never).
-pub fn due() -> u64 {
-    match PAUSED_UNTIL.load(Ordering::Relaxed) {
-        0 => u64::MAX,
-        t => t,
+/// Disable fault processing for device `sid`, in its context entry (the
+/// bit counts whether or not the entry is present, and goes with the entry
+/// when the device is attached anew or detached): the unit still refuses
+/// the device and records nothing. `false` when the device's bus has no
+/// context table to say it in.
+///
+/// # Safety
+/// As for the table accesses of `attach_locked`.
+unsafe fn quiet(phys: &Phys, s: &State, sid: u64) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        let root_entry = *word(phys, s.root + (sid >> 8) * 16);
+        if root_entry & 1 == 0 {
+            return false;
+        }
+        let entry = word(phys, (root_entry & !0xFFF) + (sid & 0xFF) * 16);
+        let lo = *entry;
+        entry.write_volatile(lo | 2);
+        if lo & 1 != 0 || s.caching {
+            invalidate(phys, s, &[context_of(*entry.add(1) >> 8 & 0xFFFF, sid)]);
+        }
+        true
     }
 }
 
-/// The timer: a fault interrupt held off past its pause is let go again;
-/// records that collected meanwhile interrupt at once.
-pub fn tick(phys: &Phys, now: u64) {
-    let until = PAUSED_UNTIL.load(Ordering::Relaxed);
-    if until == 0 || now < until {
-        return;
-    }
-    LOCK.lock();
-    // SAFETY: under `LOCK`.
-    let s = unsafe { &*STATE.0.get() };
+/// The units' fault interrupts are taken again: something changed that
+/// makes their reports news (a report was taken, a device was attached or
+/// its space went). One masked meanwhile interrupts at once if it holds a
+/// record.
+fn listen(phys: &Phys, s: &State) {
     for u in &s.units[..s.n] {
         w32(phys, u.base, FECTL, 0);
     }
-    PAUSED_UNTIL.store(0, Ordering::Relaxed);
+}
+
+/// `Hal::io_taken`: the holder of `root` has read its count of refusals;
+/// its devices' next refusals are reported again.
+pub fn taken(phys: &Phys, root: Paddr) {
+    LOCK.lock();
+    // SAFETY: under `LOCK`; table accesses as in `attach_locked`.
+    unsafe {
+        let s = &*STATE.0.get();
+        let target = root + if s.four_levels { 0 } else { PAGE };
+        for bus in (0..256u64).filter(|b| s.per_bus[*b as usize] != 0) {
+            let table = *word(phys, s.root + bus * 16) & !0xFFF;
+            for devfn in 0..256u64 {
+                let entry = word(phys, table + devfn * 16);
+                if *entry & 3 == 3 && *entry & !0xFFF == target {
+                    entry.write_volatile(*entry & !2);
+                    invalidate(phys, s, &[context_of(*entry.add(1) >> 8 & 0xFFFF, bus << 8 | devfn)]);
+                }
+            }
+        }
+        listen(phys, s);
+    }
     LOCK.unlock();
 }
 

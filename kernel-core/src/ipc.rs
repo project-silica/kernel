@@ -25,27 +25,39 @@ pub struct IrqStat {
     /// still take one routed before, so these are atomic.
     pub(crate) fired: core::sync::atomic::AtomicU64,
     pub(crate) far: core::sync::atomic::AtomicU64,
-    /// Held off: it fired again while its last news was still pending, so
-    /// it waits (masked, or sent to the discard vector) until its waiter
-    /// takes the news (`Kernel::release_lines`).
+    /// Held off: it fired while its last news was still pending, so it
+    /// waits (masked, or sent to the discard vector) until its waiter
+    /// takes the news (`Kernel::release_lines`). Changed under the lock
+    /// that protects its notification.
     pub(crate) held: core::sync::atomic::AtomicBool,
-    /// Deliveries in a row that found the line's last news still pending
-    /// (one that found it taken starts again): past [`STORM`] the line is
-    /// held off. A busy device that its waiter keeps up with never gets
-    /// there, so the hold costs ordinary interrupts nothing.
-    pub(crate) pending_run: core::sync::atomic::AtomicU32,
+    /// The next line held off for the same notification, plus one (0: the
+    /// last): the list a receive lets go, which starts in the
+    /// notification ([`Queue::held`]).
+    pub(crate) next_held: core::cell::Cell<u8>,
 }
 
 impl IrqStat {
     ctor! {
         pub(crate) fn new() -> IrqStat {
-            IrqStat { cpu: core::cell::Cell::new(0), fired: core::sync::atomic::AtomicU64::new(0), far: core::sync::atomic::AtomicU64::new(0), held: core::sync::atomic::AtomicBool::new(false), pending_run: core::sync::atomic::AtomicU32::new(0) }
+            IrqStat { cpu: core::cell::Cell::new(0), fired: core::sync::atomic::AtomicU64::new(0), far: core::sync::atomic::AtomicU64::new(0), held: core::sync::atomic::AtomicBool::new(false), next_held: core::cell::Cell::new(0) }
         }
     }
 }
 
-/// Deliveries in a row with the news still pending that make a storm.
-pub(crate) const STORM: u32 = 64;
+/// Where a notification's count of bound lines ends in its `bound` word and
+/// its first held line (plus one) begins.
+const HELD_SHIFT: u32 = 32;
+
+impl crate::thread::Queue {
+    /// Notification: the first interrupt line held off for it, plus one (0:
+    /// none), kept above the count of the lines bound to it.
+    fn held(&self) -> u64 {
+        self.bound.get() >> HELD_SHIFT
+    }
+    fn set_held(&self, line: u64) {
+        self.bound.set(self.bound.get() & ((1 << HELD_SHIFT) - 1) | line << HELD_SHIFT);
+    }
+}
 
 /// The notification slot a receive listens on, from its first argument.
 pub(crate) fn listen_slot(a0: u64) -> u64 {
@@ -404,17 +416,8 @@ impl<H: Hal> Kernel<H> {
             });
         let stat = &self.irq_stat[line];
         stat.fired.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        // A line that keeps firing while its waiter has not taken the last
-        // news gains nothing by being heard: past [`STORM`] such deliveries
-        // in a row it is held off until the waiter receives, so a device (or
-        // a driver programming one) raising it without end costs one
-        // interrupt per receive, not a processor.
-        let storm = self.storming(line, q.word.get() & irq.1.get() != 0);
         if local {
-            self.signal(n, irq.1.get());
-            if storm {
-                self.hold_line(line);
-            }
+            self.line_fired(line, n, irq.1.get());
             return;
         }
         // The waiter is another processor's: take every lock, and look
@@ -428,11 +431,8 @@ impl<H: Hal> Kernel<H> {
             // moved to another processor (or one that waits on a processor
             // other than the one it bound the line on) is otherwise
             // interrupted through every processor's lock, every time.
-            if storm {
-                self.hold_line(line);
-            }
             let to = self.waiter_cpu(n);
-            self.signal(n, irq.1.get());
+            self.line_fired(line, n, irq.1.get());
             if let Some(to) = to.filter(|c| *c != me)
                 && self.hal.irq_move(line, to as usize)
             {
@@ -442,51 +442,75 @@ impl<H: Hal> Kernel<H> {
         self.go_local();
     }
 
-    /// Whether line `line`, delivered now with its news `pending` (not yet
-    /// taken) or not, has fired [`STORM`] times in a row with it pending.
+    /// Line `line` fired for notification `n`, whose lock the caller holds.
+    /// With its bit not pending this is news: signal it. With it pending
+    /// the waiter has not taken the last news and this brings none, so the
+    /// line is held off until it does: a device (or a driver programming
+    /// one) raising it without end costs one interrupt per receive, not a
+    /// processor.
     #[inline]
-    fn storming(&self, line: usize, pending: bool) -> bool {
-        let run = &self.irq_stat[line].pending_run;
-        if !pending {
-            run.store(0, core::sync::atomic::Ordering::Relaxed);
-            return false;
-        }
-        run.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1 >= STORM
-    }
-
-    /// Hold line `line` off until its waiter takes its news.
-    fn hold_line(&self, line: usize) {
-        if !self.irq_stat[line].held.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            self.held_lines.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    fn line_fired(&self, line: usize, n: Paddr, badge: u64) {
+        let q = self.queue(n);
+        if q.word.get() & badge == 0 {
+            self.signal(n, badge);
+        } else if !self.irq_stat[line].held.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            self.irq_stat[line].next_held.set(q.held() as u8);
+            q.set_held(line as u64 + 1);
             self.hal.irq_hold(line, true);
         }
     }
 
     /// Notification `n`'s news was taken: the lines held off for it may
-    /// interrupt again. Costs one load while no line is held anywhere.
+    /// interrupt again. One look at the notification's own word while it
+    /// holds none; no other notification's lines are touched.
     #[inline]
     pub(crate) fn release_lines(&self, n: Paddr) {
-        if self.held_lines.load(core::sync::atomic::Ordering::Relaxed) != 0 {
-            self.release_lines_of(n);
+        let q = self.queue(n);
+        if q.held() != 0 {
+            self.release_lines_of(q);
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn release_lines_of(&self, n: Paddr) {
-        for (line, irq) in self.irqs.iter().enumerate() {
-            if irq.0.get() == n {
-                self.unhold_line(line);
-            }
+    fn release_lines_of(&self, q: &crate::thread::Queue) {
+        let mut next = q.held() as usize;
+        q.set_held(0);
+        while next != 0 {
+            let line = next - 1;
+            let stat = &self.irq_stat[line];
+            next = stat.next_held.get() as usize;
+            stat.held.store(false, core::sync::atomic::Ordering::Relaxed);
+            self.hal.irq_hold(line, false);
         }
     }
 
-    /// Line `line` is no longer held off (released, or bound anew).
+    /// Whether interrupt line `line` is held off. For tests.
+    pub fn line_held(&self, line: usize) -> bool {
+        self.irq_stat[line].held.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Line `line` is leaving its notification (unbound, bound anew, or the
+    /// notification is going): a hold on it ends, off the notification's
+    /// list. The hardware is the caller's to set (the new route, or the
+    /// mask of an unbound line). The caller holds every lock.
     pub(crate) fn unhold_line(&self, line: usize) {
-        self.irq_stat[line].pending_run.store(0, core::sync::atomic::Ordering::Relaxed);
-        if self.irq_stat[line].held.swap(false, core::sync::atomic::Ordering::Relaxed) {
-            self.held_lines.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-            self.hal.irq_hold(line, false);
+        let stat = &self.irq_stat[line];
+        if !stat.held.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        // The link that names it: the notification's, or an earlier line's.
+        let (q, me) = (self.queue(self.irqs[line].0.get()), line as u64 + 1);
+        let mut at = q.held();
+        if at == me {
+            return q.set_held(stat.next_held.get() as u64);
+        }
+        while at != 0 {
+            let link = &self.irq_stat[at as usize - 1].next_held;
+            at = link.get() as u64;
+            if at == me {
+                return link.set(stat.next_held.get());
+            }
         }
     }
 
@@ -650,26 +674,22 @@ impl<H: Hal> Kernel<H> {
 }
 
 impl<H: Hal> Kernel<H> {
-    /// Thread `t` faulted with no fault endpoint: it stops, and the console
-    /// is told, as often as the ration allows (`log::Rate`: a program can
-    /// fault as often as it likes). Out of line: the fault path that has an
-    /// endpoint must not pay for this one's registers (in line it cost the
-    /// page fault 32 instructions).
+    /// Thread `t` faulted with no fault endpoint: it stops, and the fault
+    /// stays in it for whoever holds it. The console is not told: it is
+    /// everyone's, and a program can fault as often as it likes. Only the
+    /// root task's first thread, which nobody holds, is the kernel's to
+    /// speak for. Out of line: the fault path that has an endpoint must
+    /// not pay for this one's registers (in line it cost the page fault 32
+    /// instructions).
     #[cold]
     #[inline(never)]
     fn fault_unheard(&self, t: Paddr, kind: Fault, addr: u64, code: u64) {
         self.cancel(t, false);
-        if let Some(dropped) = self.log_rate.allow(self.hal.now()) {
+        if t == self.root_thread.get() {
+            let ip = self.thread(t).regs[H::IP].get();
             crate::klog!(
                 self,
-                "thread {:#x}: {:?} fault at ip {:#x}, address {:#x}, code {:#x}; no fault endpoint, thread stopped{}{}",
-                t,
-                kind,
-                self.thread(t).regs[H::IP].get(),
-                addr,
-                code,
-                if dropped != 0 { " (faults since not logged: " } else { "" },
-                crate::log::Count(dropped)
+                "root task: {kind:?} fault at ip {ip:#x}, address {addr:#x}, code {code:#x}; no fault endpoint, thread stopped"
             );
         }
     }

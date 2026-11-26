@@ -126,10 +126,10 @@ pub fn write_parts<H: Hal>(hal: &H, writer: u64, parts: &[&[u8]]) {
     LINE.unlock();
 }
 
-/// Lines a program can cause (a fault with nobody to tell) allowed in one
-/// [`RATE_WINDOW`]: the console is shared by every processor and slow on a
-/// real serial port, so how often a program can make the kernel write is
-/// bounded, whatever it does.
+/// Lines a device can cause (an access the IOMMU refused it) allowed in one
+/// [`RATE_WINDOW`]: the console is shared by every processor and a real
+/// serial port takes only so many a second, so how often a device and its
+/// driver can make the kernel write is the port's rate, whatever they do.
 const RATE_LINES: u64 = 10;
 const RATE_WINDOW: u64 = 1_000_000_000;
 
@@ -224,16 +224,6 @@ macro_rules! klog {
         let _ = c.write_str("\r\n");
         c.flush();
     }};
-}
-
-/// A count of lines not logged, as the end of a line: nothing for 0, else
-/// the number and a closing parenthesis.
-pub struct Count(pub u64);
-
-impl fmt::Display for Count {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0 == 0 { Ok(()) } else { write!(f, "{})", self.0) }
-    }
 }
 
 /// The bytes a console has been given and not yet sent: the architecture's

@@ -112,6 +112,10 @@ pub trait Hal {
     /// The device address space `root` is going away: every device attached
     /// to it reaches nothing from now on.
     fn io_release(&self, _phys: &Phys, _root: Paddr) {}
+    /// Whoever holds the device address space `root` has read how many of
+    /// its devices' accesses were refused (`Inspect`): a device held quiet
+    /// since its last refusal was reported is heard again.
+    fn io_taken(&self, _phys: &Phys, _root: Paddr) {}
     /// The first interrupt line that is a message, not a wire.
     fn msi_first(&self) -> usize {
         usize::MAX
