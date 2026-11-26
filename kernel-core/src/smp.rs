@@ -114,8 +114,10 @@ impl CpuTable {
 
 /// One processor's lock and scheduling state (protected by the lock). Each
 /// has its own cache lines: processors working independently must not make
-/// each other's memory bounce.
-#[repr(align(128))]
+/// each other's memory bounce. Its size is a power of two that divides a
+/// page ([`CpuTable`]): 512 bytes since the scheduling groups and the share
+/// of time holding every lock took it past 256.
+#[repr(align(512))]
 pub struct Cpu {
     pub(crate) lock: Lock,
     /// The thread it runs (0 while idle).
