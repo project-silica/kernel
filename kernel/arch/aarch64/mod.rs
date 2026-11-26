@@ -851,6 +851,11 @@ impl Hal for Arm {
         gic::mask(line, masked);
     }
 
+    fn irq_move(&self, line: usize, cpu: usize) -> bool {
+        let Some(mpidr) = cpu::percpu_of(cpu).map(|c| c.mpidr.load(Ordering::Relaxed)) else { return false };
+        if line >= its::FIRST_LINE { its::retarget(line, cpu) } else { gic::retarget(line, mpidr) }
+    }
+
     /// There is no I/O port space on aarch64; no port capability exists.
     fn port_io(&self, _port: u16, _width: u8, _write: bool, _value: u32) -> u32 {
         0

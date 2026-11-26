@@ -24,6 +24,7 @@ fpu
 untyped
 caps
 irq
+irq_follow smp=2
 inspect
 ipc_caps
 ipc_parked

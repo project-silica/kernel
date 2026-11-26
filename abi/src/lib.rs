@@ -161,6 +161,12 @@ pub enum Syscall {
     /// at. `Unsupported` on a machine that confines DMA: there a device's
     /// addresses are the ones its driver mapped, and physical addresses are
     /// nobody's business.
+    /// `a0` an interrupt-line capability and `a1` a line it covers: returns
+    /// `a0` the processor the line is routed to plus one (0: not bound),
+    /// `a1` how many interrupts it delivered since it was bound, `a2` how
+    /// many of those arrived on a processor other than the one its waiter
+    /// runs on (each is delivered through every processor's lock, and the
+    /// kernel then moves the line to the waiter's processor).
     /// `a0` a SchedContext: returns `a0` class, `a1` weight (fair) or
     /// budget (deadline), `a2` period, `a3` budget left this period, `a4`
     /// nanoseconds charged to it so far, `a5` processor (deadline).

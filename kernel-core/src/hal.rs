@@ -216,6 +216,16 @@ pub trait Hal {
     fn irq_route(&self, line: usize, cpu: usize, level: bool, active_low: bool) -> bool;
     /// Hold interrupt line `line` off, or let it interrupt again.
     fn irq_mask(&self, line: usize, masked: bool);
+    /// Deliver line `line`, routed already (by [`Hal::irq_route`] or
+    /// [`Hal::msi_route`]), to processor `cpu` from now on, as it was
+    /// triggered before, without its device being told anything. `false`
+    /// where the machine cannot: a message line whose device names the
+    /// processor itself (no interrupt remapping). An interrupt already on
+    /// its way may still arrive where the line went before.
+    fn irq_move(&self, line: usize, cpu: usize) -> bool {
+        let _ = (line, cpu);
+        false
+    }
     /// Port I/O (x86_64). `width` is 1, 2 or 4.
     fn port_io(&self, port: u16, width: u8, write: bool, value: u32) -> u32;
     /// Write to the kernel's console.

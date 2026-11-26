@@ -44,6 +44,8 @@ pub struct Kernel<H: Hal> {
     /// The notification and badge each interrupt line signals (changed
     /// only by a holder of every lock).
     pub(crate) irqs: [(Cell<Paddr>, Cell<u64>); silica_abi::IRQ_LINES as usize],
+    /// Where each line is routed and how its deliveries went.
+    pub(crate) irq_stat: [crate::ipc::IrqStat; silica_abi::IRQ_LINES as usize],
     /// Watched lines (`watch.rs`), and how many entries are in use.
     pub(crate) watches: [crate::watch::LineWatch; silica_abi::IRQ_WATCHES],
     pub(crate) nwatches: Cell<usize>,
@@ -67,6 +69,7 @@ impl<H: Hal> Kernel<H> {
             reap: Cell::new(0),
             reaping: Cell::new(0),
             irqs: [const { (Cell::new(0), Cell::new(0)) }; silica_abi::IRQ_LINES as usize],
+            irq_stat: [const { crate::ipc::IrqStat::new() }; silica_abi::IRQ_LINES as usize],
             watches: [const { crate::watch::LineWatch::new() }; silica_abi::IRQ_WATCHES],
             nwatches: Cell::new(0),
             log_rate: crate::log::Rate::new(),
@@ -747,6 +750,10 @@ impl<H: Hal> Kernel<H> {
                 // changes nothing when it fails), before the old binding is
                 // touched: a bind that fails leaves the line as it was.
                 let msi = line >= self.hal.msi_first();
+                // To the processor of whoever waits on the notification (a
+                // driver binds its lines before its thread is placed, or
+                // from another thread), else the binder's.
+                let cpu = if to == 0 { 0 } else { self.waiter_cpu(to).unwrap_or(self.hal.cpu() as u64) as usize };
                 if to != 0 {
                     if msi {
                         // A message, raised by one device.
@@ -754,18 +761,13 @@ impl<H: Hal> Kernel<H> {
                             return Err(Error::BadArg);
                         }
                         let source = self.device(t, a[4], a[5])?;
-                        let (address, data) = self.hal.msi_route(line, self.hal.cpu(), source).ok_or(Error::Unsupported)?;
+                        let (address, data) = self.hal.msi_route(line, cpu, source).ok_or(Error::Unsupported)?;
                         let r = &self.thread(t).regs;
                         r[H::ARG[0]].set(address);
                         r[H::ARG[1]].set(data);
                     } else if a[3] & silica_abi::IRQ_MSI != 0 {
                         return Err(Error::BadArg);
-                    } else if !self.hal.irq_route(
-                        line,
-                        self.hal.cpu(),
-                        a[3] & silica_abi::IRQ_LEVEL != 0,
-                        a[3] & silica_abi::IRQ_ACTIVE_LOW != 0,
-                    ) {
+                    } else if !self.hal.irq_route(line, cpu, a[3] & silica_abi::IRQ_LEVEL != 0, a[3] & silica_abi::IRQ_ACTIVE_LOW != 0) {
                         return Err(Error::Unsupported);
                     }
                 }
@@ -778,6 +780,7 @@ impl<H: Hal> Kernel<H> {
                     q.bound.set(q.bound.get() - 1);
                 }
                 if to == 0 {
+                    self.irq_stat[line].cpu.set(0);
                     self.hal.irq_mask(line, true);
                     // A message line unbound: no device may raise it.
                     if msi && old != 0 {
@@ -785,6 +788,10 @@ impl<H: Hal> Kernel<H> {
                     }
                 } else {
                     self.irqs[line].0.set(to);
+                    let stat = &self.irq_stat[line];
+                    stat.cpu.set(cpu as u64 + 1);
+                    stat.fired.store(0, core::sync::atomic::Ordering::Relaxed);
+                    stat.far.store(0, core::sync::atomic::Ordering::Relaxed);
                     self.irqs[line].1.set(badge);
                     let q = self.queue(to);
                     q.bound.set(q.bound.get() + 1);
@@ -892,6 +899,17 @@ impl<H: Hal> Kernel<H> {
                     // caller still waiting for the answer: how a server
                     // tells a parked caller from one that has gone.
                     ObjectType::Notification => [(self.queue(cap.obj).kind.get() == crate::ipc::PARKED) as u64, 0, 0, 0, 0, 0],
+                    // An interrupt line: the processor it is routed to plus one
+                    // (0: not bound), how many interrupts it delivered, and how
+                    // many of them took every lock to reach a waiter elsewhere.
+                    ObjectType::Hw if cap.flags & crate::cap::FLAG_IRQS != 0 => {
+                        if a[1] < cap.obj || a[1] >= cap.badge || a[1] >= silica_abi::IRQ_LINES {
+                            return Err(Error::BadArg);
+                        }
+                        let s = &self.irq_stat[a[1] as usize];
+                        let n = |c: &core::sync::atomic::AtomicU64| c.load(core::sync::atomic::Ordering::Relaxed);
+                        [s.cpu.get(), n(&s.fired), n(&s.far), 0, 0, 0]
+                    }
                     // Where a device reaches a frame on a machine that
                     // cannot confine DMA: its physical address.
                     ObjectType::Hw if cap.flags & FLAG_DMA != 0 => {

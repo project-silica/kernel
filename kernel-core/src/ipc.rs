@@ -12,6 +12,29 @@ pub(crate) const RECEIVERS: u64 = 2;
 /// The queue holds one call waiting for its answer (a parked caller).
 pub(crate) const PARKED: u64 = 3;
 
+/// Where an interrupt line goes and how its deliveries went (`Inspect` of
+/// an interrupt-line capability): what an owner reads to see which
+/// processor a device interrupts, and how often that was the wrong one.
+pub struct IrqStat {
+    /// The processor the line is routed to, plus one (0: not bound). Changed
+    /// only by a holder of every lock.
+    pub(crate) cpu: core::cell::Cell<u64>,
+    /// Interrupts delivered, and how many of them found the line's waiter
+    /// on another processor and took every lock to reach it. Counted by
+    /// whichever processor took the interrupt: one moved a moment ago may
+    /// still take one routed before, so these are atomic.
+    pub(crate) fired: core::sync::atomic::AtomicU64,
+    pub(crate) far: core::sync::atomic::AtomicU64,
+}
+
+impl IrqStat {
+    ctor! {
+        pub(crate) fn new() -> IrqStat {
+            IrqStat { cpu: core::cell::Cell::new(0), fired: core::sync::atomic::AtomicU64::new(0), far: core::sync::atomic::AtomicU64::new(0) }
+        }
+    }
+}
+
 /// The notification slot a receive listens on, from its first argument.
 pub(crate) fn listen_slot(a0: u64) -> u64 {
     a0 >> LISTEN_SHIFT & 0x7FFF_FFFF
@@ -366,18 +389,46 @@ impl<H: Hal> Kernel<H> {
                 let l = self.listener(n);
                 l == 0 || self.queue(self.thread(l).blocked_on.get()).owner.get() == me + 1
             });
+        let stat = &self.irq_stat[line];
+        stat.fired.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if local {
             self.signal(n, irq.1.get());
             return;
         }
         // The waiter is another processor's: take every lock, and look
         // again at what the line is bound to now.
+        stat.far.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.go_global();
         let n = irq.0.get();
         if n != 0 {
+            // The line goes where its waiter is, so the next interrupt is
+            // delivered there holding that processor's lock alone: a driver
+            // moved to another processor (or one that waits on a processor
+            // other than the one it bound the line on) is otherwise
+            // interrupted through every processor's lock, every time.
+            let to = self.waiter_cpu(n);
             self.signal(n, irq.1.get());
+            if let Some(to) = to.filter(|c| *c != me)
+                && self.hal.irq_move(line, to as usize)
+            {
+                stat.cpu.set(to + 1);
+            }
         }
         self.go_local();
+    }
+
+    /// The processor of whoever waits on notification `n`: the first
+    /// thread waiting, else its listener, else the processor that last
+    /// waited there (`None`: nobody ever has).
+    pub(crate) fn waiter_cpu(&self, n: Paddr) -> Option<u64> {
+        let q = self.queue(n);
+        if q.kind.get() == RECEIVERS && q.head.get() != 0 {
+            return Some(self.thread(q.head.get()).cpu.get());
+        }
+        match q.listener().get() {
+            0 => q.owner.get().checked_sub(1),
+            l => Some(self.thread(l).cpu.get()),
+        }
     }
 
     /// OR `badge` into notification `n`, waking one waiter.

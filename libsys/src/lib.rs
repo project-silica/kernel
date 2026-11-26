@@ -552,6 +552,26 @@ pub struct ThreadInfo {
     pub waits_on: u64,
 }
 
+/// Where interrupt line `line` (of the interrupt-line capability `lines`)
+/// is routed and how its deliveries went.
+pub fn inspect_irq(lines: Cap, line: u64) -> Result<IrqInfo> {
+    let r = sys(Syscall::Inspect, [lines.0, line, 0, 0, 0, 0])?;
+    Ok(IrqInfo { cpu: r[0].checked_sub(1).map(|c| c as usize), delivered: r[1], from_afar: r[2] })
+}
+
+/// What [`inspect_irq`] says of an interrupt line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IrqInfo {
+    /// The processor it is routed to (`None`: not bound). The kernel moves
+    /// a line to the processor of the thread waiting on its notification.
+    pub cpu: Option<usize>,
+    /// Interrupts it delivered since it was bound.
+    pub delivered: u64,
+    /// How many of them arrived on a processor other than their waiter's
+    /// and were delivered through every processor's lock.
+    pub from_afar: u64,
+}
+
 /// The state of `thread`.
 pub fn inspect_thread(thread: Cap) -> Result<ThreadInfo> {
     let r = sys(Syscall::Inspect, [thread.0, 0, 0, 0, 0, 0])?;
