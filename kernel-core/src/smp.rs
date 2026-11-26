@@ -327,12 +327,19 @@ impl Cpu {
 impl<H: Hal> Kernel<H> {
     /// This processor's state.
     pub(crate) fn me(&self) -> &Cpu {
-        // Masked rather than bounds-checked: this is on every path through
-        // the kernel, and a processor's index is below MAX_CPUS (a power of
-        // two) by construction.
-        let s = self.hal.cpu_slot();
-        debug_assert!(s == cpu_slot(self.hal.cpu()));
-        self.cpus.at_slot(s)
+        // On every path through the kernel, many times: one load where the
+        // architecture keeps the address ([`Hal::cpu_state`]), else the
+        // slot masked rather than bounds-checked (a processor's index is
+        // below MAX_CPUS, a power of two, by construction).
+        let me = self.hal.cpu_state(&self.cpus);
+        debug_assert!(core::ptr::eq(me, self.cpus.get(self.hal.cpu())));
+        me
+    }
+
+    /// Processor `i`'s state, for an architecture to record beside the
+    /// processor's index when it starts ([`Hal::cpu_state`]).
+    pub fn cpu_state_of(&self, i: usize) -> &Cpu {
+        self.cpus.get(i)
     }
 
     /// Number of processors the machine has (set once at boot).

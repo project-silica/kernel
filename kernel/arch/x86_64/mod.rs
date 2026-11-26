@@ -620,6 +620,20 @@ impl Hal for X86 {
         s
     }
 
+    fn cpu_state<'a>(&self, cpus: &'a kernel_core::smp::CpuTable) -> &'a kernel_core::smp::Cpu {
+        let _ = cpus;
+        let p: u64;
+        // SAFETY: `PerCpu::state` is this processor's entry in the kernel's
+        // table (`Kernel::cpu_state_of`, written by `cpu::init` before any
+        // kernel code runs here), and there is one kernel, a static: `cpus`
+        // is that table, so the entry lives as long as it. Constant for
+        // all kernel code, as in `cpu_slot` (`nomem`).
+        unsafe {
+            asm!("mov {}, gs:[{off}]", out(reg) p, off = const core::mem::offset_of!(cpu::PerCpu, state), options(nostack, pure, nomem, preserves_flags));
+            &*(p as *const kernel_core::smp::Cpu)
+        }
+    }
+
     fn cpu(&self) -> usize {
         let i: usize;
         // SAFETY: reads this processor's index from its `PerCpu` (offset 40

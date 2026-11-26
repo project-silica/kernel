@@ -42,6 +42,9 @@ pub struct PerCpu {
     /// The address of this processor's kernel lock (`Kernel::cpu_lock`),
     /// which the system-call entry takes before it saves anything.
     pub lock: u64,
+    /// The address of this processor's state in the kernel's table
+    /// (`Kernel::cpu_state_of`), for `Hal::cpu_state`.
+    pub state: u64,
     /// Its x2APIC identifier.
     pub apic_id: u32,
     /// Where the processor is; read by other processors.
@@ -120,6 +123,7 @@ impl Tables {
                 watch: kernel_core::sched::Watch::new(),
                 slot: 0,
                 lock: 0,
+                state: 0,
             },
         }
     }
@@ -286,6 +290,7 @@ pub unsafe fn init(t: *mut Tables, index: usize, apic_id: u32, stack: (u64, u64)
         (*t).percpu.index = index;
         (*t).percpu.slot = kernel_core::smp::cpu_slot(index);
         (*t).percpu.lock = super::kernel().cpu_lock(index) as *const kernel_core::lock::Lock as u64;
+        (*t).percpu.state = core::ptr::from_ref(super::kernel().cpu_state_of(index)) as u64;
         (*t).percpu.apic_id = apic_id;
         CPUS[index].store(t, Ordering::Release);
         let gdtr: [u16; 5] = pseudo(&raw const (*t).gdt as u64, 7 * 8 - 1);
@@ -482,7 +487,12 @@ syscall_entry:
     mov rax, gs:[{lock}]
     mov bl, 1
     xchg [rax], bl
-    mov [rsp + 16], rcx
+    // rcx and r11 hold the return address and flags (saved below as
+    // rip and rflags): a thread that entered by `syscall` resumes by
+    // `sysret`, which loads them from there, so their own slots (16, 80)
+    // are not written. Only the `iret` way out reads those, for a thread
+    // that entered by a trap (which writes them) or was started afresh
+    // (all zero).
     mov [rsp + 24], rdx
     mov [rsp + 32], rsi
     mov [rsp + 40], rdi
@@ -490,7 +500,6 @@ syscall_entry:
     mov [rsp + 56], r8
     mov [rsp + 64], r9
     mov [rsp + 72], r10
-    mov [rsp + 80], r11
     mov [rsp + 88], r12
     mov [rsp + 96], r13
     mov [rsp + 104], r14
@@ -501,7 +510,6 @@ syscall_entry:
     mov [rsp + 136], rax
     mov qword ptr [rsp + 160], 1
     movzx r12d, bl
-    mov rbx, [rsp + 8]
     mov rsp, gs:[0]
     xor ebp, ebp
     call {syscall}
