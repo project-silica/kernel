@@ -444,7 +444,7 @@ impl<H: Hal> Kernel<H> {
             Err(e) => r[H::SYS].set(e as u64),
         }
         if global {
-            self.spent_global(me);
+            self.spent_global(me, t);
             self.go_local();
         }
         self.leave_pair();

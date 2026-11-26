@@ -763,6 +763,70 @@ fn a_thread_runs_only_on_time_it_was_bound_to_through_a_capability() {
     m.k.check_runqueues().unwrap();
 }
 
+/// Holding every processor's lock stops the machine, so the time a program
+/// spends so is bounded (the 2026-11-24 audit: a flood of capability
+/// operations took two thirds of other processors' round trips). The bound
+/// was each processor's: a program that used it up held back every other
+/// program on its processor, whose calls waited for a share they had not
+/// touched. It is the caller's scheduling context's: the flood waits, and
+/// a program beside it on the same processor carries on.
+#[test]
+fn a_flood_of_lock_taking_calls_holds_back_its_own_context_only() {
+    use kernel_core::thread::THROTTLED;
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    // A thread running on processor 1: what holding every lock costs.
+    m.spawn(ut, FREE + 20);
+    m.move_to(FREE + 20, 1);
+    m.settle(1);
+    m.on(0);
+    // The flood and its victim on processor 0, each on a context of its own.
+    m.retype(ut, T::SchedContext, 0, FREE, 2);
+    for g in [FREE, FREE + 1] {
+        m.ok(S::SchedConfigure, [g, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    }
+    let flood = m.spawn(ut, FREE + 2);
+    m.ok(S::ThreadControl, [FREE + 2, 2, FREE, 0, 0, 0]);
+    let victim = m.spawn(ut, FREE + 3);
+    m.ok(S::ThreadControl, [FREE + 3, 2, FREE + 1, 0, 0, 0]);
+    m.retype(ut, T::Endpoint, 0, FREE + 4, 1);
+    // Every reading of the clock is 10 us later than the last, so a call
+    // that takes every lock holds them at least that long.
+    m.k.hal.now_step.set(10_000);
+    // Capability copies and deletes until the flood is held back.
+    let mut calls = 0;
+    while m.k.thread_view(flood).state != THROTTLED {
+        let slot = FREE + 5;
+        let call = if m.cap(slot).is_none() {
+            (S::CapCopy, [SLOT_CAPSPACE, slot, FREE + 4, 15, 0, 0])
+        } else {
+            (S::CapDelete, [slot, 0, 0, 0, 0, 0])
+        };
+        let r = m.sys_as(flood, call.0, call.1);
+        assert!(r.blocked || r.status == 0, "{:?}", Error::result(r.status));
+        calls += 1;
+        assert!(calls < 100_000, "a flood of calls that take every lock was never held back");
+    }
+    // The victim makes the same calls beside it, and none of them waits.
+    for i in 0..100 {
+        let slot = FREE + 6;
+        let call = if i % 2 == 0 { (S::CapCopy, [SLOT_CAPSPACE, slot, FREE + 4, 15, 0, 0]) } else { (S::CapDelete, [slot, 0, 0, 0, 0, 0]) };
+        let r = m.sys_as(victim, call.0, call.1);
+        assert!(
+            !r.blocked,
+            "call {i} of a program on the flood's processor waited for the flood's share (after {calls} calls of the flood)"
+        );
+        assert_eq!(r.status, 0);
+    }
+    // The flood's share comes back with time, and it carries on.
+    m.k.hal.now_step.set(0);
+    m.k.hal.now.set(m.k.hal.now.get() + 1_000_000_000);
+    m.tick();
+    assert_eq!(m.k.thread_view(flood).state, RUNNABLE);
+    m.k.check_runqueues().unwrap();
+}
+
 /// Binding takes a thread to its context's processor (the context's
 /// capability is the authority to), fair or reserved, and a context with
 /// threads bound keeps its processor. When a context's last capability

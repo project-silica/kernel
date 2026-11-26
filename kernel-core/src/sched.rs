@@ -147,6 +147,12 @@ pub struct SchedCtx {
     pub(crate) deadline: Cell<u64>,
     /// Nanoseconds charged to it, ever.
     pub(crate) consumed: Cell<u64>,
+    /// Time its threads may still spend holding every lock, in nanoseconds
+    /// (negative: overdrawn), and when that was last refilled
+    /// (`Kernel::throttled`). Both zero in a new context: its first such
+    /// call starts it with the burst.
+    pub(crate) global_budget: Cell<i64>,
+    pub(crate) global_at: Cell<u64>,
     /// The threads bound to it, linked through `Thread::sc_next`.
     pub(crate) threads: Cell<Paddr>,
     /// Fair: its place on its processor.

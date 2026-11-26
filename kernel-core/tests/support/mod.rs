@@ -40,6 +40,10 @@ impl TestHal {
 
 pub struct TestHal {
     pub now: Cell<u64>,
+    /// How much later each reading of the clock is than the last (0: time
+    /// moves only when a test moves it): what makes a kernel entry take
+    /// time, for a test that judges what holding a lock costs.
+    pub now_step: Cell<u64>,
     /// Each simulated processor's timer: its deadline, and whether it is
     /// armed (set and not yet fired).
     pub timers: [Cell<u64>; TEST_CPUS],
@@ -220,7 +224,9 @@ impl Hal for TestHal {
         self.forgets.set(self.forgets.get() + 1);
     }
     fn now(&self) -> u64 {
-        self.now.get()
+        let now = self.now.get();
+        self.now.set(now + self.now_step.get());
+        now
     }
     fn set_timer(&self, deadline: u64) {
         let c = self.cpu.get();
@@ -445,6 +451,7 @@ impl Machine {
         let ram = Ram::new((mib << 20) as usize);
         let hal = TestHal {
             now: Cell::new(1000),
+            now_step: Cell::new(0),
             timers: [const { Cell::new(u64::MAX) }; TEST_CPUS],
             armed: [const { Cell::new(false) }; TEST_CPUS],
             pending: Cell::new(0),
