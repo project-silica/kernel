@@ -118,9 +118,11 @@ pub enum Syscall {
     /// (it carries on there with what it was doing: a call waiting for its
     /// reply is answered there, a send or receive not yet delivered is made
     /// again there, a suspended thread stays suspended; `InUse` while it is
-    /// bound to a deadline context), 3 bind it to the SchedContext `a2`
-    /// (read; 0: unbind, back to the default fair share; a deadline context
-    /// must be on the thread's processor).
+    /// bound to a deadline context or in a group), 3 bind it to the
+    /// SchedContext `a2` (read; 0: unbind its fair or deadline context,
+    /// back to the default fair share; a deadline context or a group must
+    /// be on the thread's processor; a group's thread stays in its group
+    /// until bound to another).
     ThreadControl = 14,
     /// `a0` port capability, `a1` port, `a2` width in bytes (1, 2, 4) with
     /// bit 8 set for a write, `a3` value. Returns `a0` value read.
@@ -209,6 +211,19 @@ pub enum Syscall {
     /// weight needs one covering every processor (a fair thread runs
     /// wherever it is moved); a reservation, one covering `a4`. `NoRights`
     /// otherwise, `WrongType` for a capability that is not processor time.
+    ///
+    /// [`SCHED_GROUP`]: `a2` weight, `a4` processor: a group, which every
+    /// thread bound to it shares as one: on its processor the group takes
+    /// the share its weight gives it among the other groups there, and
+    /// divides it among its threads (each by the weight of its own fair
+    /// context, or the default). Every fair thread is in a group: the one
+    /// it was bound to, else that of the thread that made it (`Retype`),
+    /// else its processor's own (the threads no group was given to). A
+    /// thread cannot leave its group but for another it is bound to, nor
+    /// be moved off its group's processor, so a program's threads take its
+    /// group's share however many it makes. Needs a processor-time
+    /// capability covering `a4`; `InUse` to change the processor or the
+    /// class while threads are in it.
     SchedConfigure = 21,
     /// `a0` device-identity capability, `a1` a device's identity (its PCI
     /// segment, bus, device and function: `segment << 16 | bus << 8 |
@@ -455,11 +470,13 @@ pub const THREAD_BITS: u8 = 12;
 /// Size of an Endpoint or Notification in bits.
 pub const ENDPOINT_BITS: u8 = 6;
 /// Size in bits of a SchedContext object.
-pub const SCHED_BITS: u8 = 7;
+pub const SCHED_BITS: u8 = 8;
 /// `SchedConfigure` class: weighted fair share.
 pub const SCHED_FAIR: u64 = 0;
 /// `SchedConfigure` class: a deadline reservation.
 pub const SCHED_DEADLINE: u64 = 1;
+/// `SchedConfigure` class: a group of threads sharing one share.
+pub const SCHED_GROUP: u64 = 2;
 /// The weight of a thread with no scheduling context, and of a new one.
 pub const SCHED_DEFAULT_WEIGHT: u64 = 1024;
 /// The largest weight.

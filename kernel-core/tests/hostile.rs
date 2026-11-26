@@ -587,3 +587,123 @@ fn unmapping_a_range_clears_every_mapping_in_it_with_the_write_right_only() {
     m.ok(S::Map, [FREE + 10, FREE + 3, base + 0x20_0000, 3, 0, 0]);
     assert!(m.k.translate(space, base + 0x20_0000).is_some());
 }
+
+/// Processor time went by thread: each fair thread was a share, so a
+/// program with the memory for a hundred threads took a hundred shares of
+/// the processor every service runs on. Measured on the kernel before
+/// groups, a default-weight service beside a program of n threads (all on
+/// one processor, a second of time): n = 1, 501 ms and waits of at most
+/// 3 ms; n = 10, 93 ms and 30 ms; n = 100, 12 ms and 300 ms. Now a group
+/// (`SCHED_GROUP`, made with authority over the processor's time) is one
+/// share however many threads are in it, a thread made by a thread of a
+/// group is in that group, and none leaves it: not by unbinding, not by a
+/// context of its own, not by moving to another processor, not by making a
+/// group without authority.
+#[test]
+fn a_program_with_many_threads_takes_one_share() {
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_GROUP};
+    use std::collections::HashMap;
+    const MS: u64 = 1_000_000;
+    fn next_timer(m: &Machine) -> u64 {
+        let t = m.k.hal.timer();
+        if m.k.hal.armed[0].get() && t > m.k.hal.now.get() { t } else { u64::MAX }
+    }
+    /// A thread made by `maker` (so in its group), started.
+    fn spawn_by(m: &Machine, maker: u64, ut: u64, slot: u64) -> u64 {
+        m.on(0);
+        assert_eq!(m.sys_as(maker, S::Retype, [ut, T::Thread as u64, 0, SLOT_CAPSPACE, slot, 1]).status, 0);
+        assert_eq!(m.sys_as(maker, S::ThreadConfigure, [slot, SLOT_CAPSPACE, SLOT_ASPACE, 0, 0, 0]).status, 0);
+        assert_eq!(m.sys_as(maker, S::ThreadStart, [slot, 0x40_0000, 0, 0, 1, 0]).status, 0);
+        m.cap(slot).unwrap().obj
+    }
+    let share = |n: u64| -> (u64, u64) {
+        let m = Machine::with_cpus(64, 2);
+        m.on(0);
+        let (ut, _) = m.big_untyped();
+        // Two groups on processor 0, made by the holder of processor time.
+        m.retype(ut, T::SchedContext, 0, FREE, 2);
+        let (gs, gh) = (FREE, FREE + 1);
+        for g in [gs, gh] {
+            m.ok(S::SchedConfigure, [g, SCHED_GROUP, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+        }
+        let service = m.spawn(ut, FREE + 2);
+        m.ok(S::ThreadControl, [FREE + 2, 3, gs, 0, 0, 0]);
+        let first = m.spawn(ut, FREE + 3);
+        m.ok(S::ThreadControl, [FREE + 3, 3, gh, 0, 0, 0]);
+        // The program makes the rest itself, and tries every way out.
+        m.retype(ut, T::SchedContext, 0, FREE + 4, 1);
+        let own = FREE + 4;
+        assert_eq!(m.sys_as(first, S::SchedConfigure, [own, SCHED_GROUP, SCHED_DEFAULT_WEIGHT, 0, 0, 0]).status, Error::NoRights as u64);
+        assert_eq!(m.sys_as(first, S::SchedConfigure, [own, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, 0]).status, 0);
+        let mut threads = vec![first];
+        for i in 1..n {
+            let slot = FREE + 10 + i;
+            let t = spawn_by(&m, first, ut, slot);
+            match i % 3 {
+                0 => assert_eq!(m.sys_as(first, S::ThreadControl, [slot, 3, 0, 0, 0, 0]).status, 0),
+                1 => assert_eq!(m.sys_as(first, S::ThreadControl, [slot, 3, own, 0, 0, 0]).status, 0),
+                _ => assert_eq!(m.sys_as(first, S::ThreadControl, [slot, 2, 1, 0, 0, 0]).status, Error::InUse as u64),
+            }
+            threads.push(t);
+        }
+        assert!(m.sys(S::ThreadControl, [SLOT_THREAD, 0, 0, 0, 0, 0]).blocked);
+        m.k.check_runqueues().unwrap();
+        let (mut ran, mut last, mut worst) = (HashMap::<u64, u64>::new(), m.k.hal.now.get(), 0);
+        let until = m.k.hal.now.get() + 1000 * MS;
+        let mut steps = 0;
+        while m.k.hal.now.get() < until {
+            let now = m.k.hal.now.get();
+            let next = next_timer(&m).min(until);
+            let cur = m.k.current();
+            if cur == service {
+                worst = worst.max(now - last);
+                last = next;
+            }
+            *ran.entry(cur).or_insert(0) += next - now;
+            m.k.hal.now.set(next);
+            m.tick();
+            steps += 1;
+            assert!(steps < 1_000_000);
+        }
+        m.k.check_runqueues().unwrap();
+        (ran.get(&service).copied().unwrap_or(0) / MS, worst / MS)
+    };
+    for n in [1, 10, 100] {
+        let (ran, worst) = share(n);
+        println!("a service beside a program of {n} threads: {ran} ms of 1000, waits of at most {worst} ms");
+        assert!(ran >= 450, "beside a program of {n} threads the service ran {ran} ms of 1000");
+        assert!(worst <= 7, "beside a program of {n} threads the service waited {worst} ms");
+    }
+}
+
+/// Joining a group takes a thread to the group's processor (the group's
+/// capability is the authority to), where it stays: it cannot be moved
+/// out of its group's share. When the group's last capability goes, its
+/// threads are back in their processor's own group, and free to move.
+#[test]
+fn a_group_holds_its_threads_on_its_processor() {
+    use silica_abi::{SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_GROUP};
+    let m = Machine::with_cpus(64, 2);
+    m.on(0);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::SchedContext, 0, FREE, 2);
+    m.ok(S::SchedConfigure, [FREE, SCHED_GROUP, SCHED_DEFAULT_WEIGHT, 0, 1, SLOT_SCHED]);
+    let t = m.spawn(ut, FREE + 2);
+    m.ok(S::ThreadControl, [FREE + 2, 3, FREE, 0, 0, 0]);
+    assert_eq!(m.k.thread_view(t).cpu, 1, "joining the group took it to the group's processor");
+    assert_eq!(m.err(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]), Error::InUse, "moved out of its group");
+    m.k.check_runqueues().unwrap();
+    // A deadline reservation stays where it is.
+    m.ok(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 1_000_000, 10_000_000, 0, SLOT_SCHED]);
+    let d = m.spawn(ut, FREE + 3);
+    m.ok(S::ThreadControl, [FREE + 3, 3, FREE + 1, 0, 0, 0]);
+    assert_eq!(m.err(S::ThreadControl, [FREE + 3, 3, FREE, 0, 0, 0]), Error::InUse);
+    assert_eq!(m.k.thread_view(d).cpu, 0);
+    // A group in use keeps its processor.
+    assert_eq!(m.err(S::SchedConfigure, [FREE, SCHED_GROUP, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]), Error::InUse);
+    // Its last capability gone: its threads are free again.
+    m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
+    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    assert_eq!(m.k.thread_view(t).cpu, 0);
+    m.k.check_runqueues().unwrap();
+}

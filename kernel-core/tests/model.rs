@@ -176,7 +176,7 @@ impl Model {
                     T::AddressSpace if (13..=30).contains(&bits) => (bits, bits),
                     T::Thread => (12, 12),
                     T::Endpoint | T::Notification => (6, 6),
-                    T::SchedContext => (7, 7),
+                    T::SchedContext => (silica_abi::SCHED_BITS as u64, silica_abi::SCHED_BITS as u64),
                     T::Vcpu => return Err(Error::Unsupported),
                     _ => return Err(Error::BadArg),
                 };
