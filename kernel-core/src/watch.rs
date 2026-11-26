@@ -41,51 +41,55 @@
 //! own memory is reused only when its CapSpace is destroyed, which ends the
 //! watches naming slots in it (`unwatch_space`).
 //!
-//! The table is changed only by a holder of every lock; a line's `seen`
-//! also by its processor under its own lock, where the line is delivered.
+//! A watch lives in its line's own entry, so a driver can watch every line
+//! it holds and takes nothing from anyone; the watched lines are a list
+//! through those entries, so a processor going idle looks at them alone.
+//! The list and the entries are changed only by a holder of every lock; a
+//! line's `seen` also by its processor under its own lock, where the line
+//! is delivered.
 
 use crate::hal::{Hal, Watched};
 use crate::kernel::Kernel;
 use crate::mem::Paddr;
 use core::cell::Cell;
-use silica_abi::{IRQ_WATCHES, ObjectType, Rights};
+use silica_abi::{ObjectType, Rights};
 
-/// One watched line.
+/// One line's watch.
 pub(crate) struct LineWatch {
-    /// The line (meaningful while `slot` is not 0).
-    line: Cell<u64>,
-    /// The slot that names the frame of the word; 0: this entry is free.
+    /// The slot that names the frame of the word; 0: the line is not watched.
     slot: Cell<Paddr>,
     /// The frame, and the word's offset in it.
     frame: Cell<Paddr>,
     offset: Cell<u64>,
-    mask: Cell<u64>,
+    mask: Cell<u32>,
     /// `word & mask` at the last delivery (or when the watch began).
-    seen: Cell<u64>,
-    /// The processor the line is delivered to: the one that watches it.
-    cpu: Cell<u64>,
+    seen: Cell<u32>,
     /// The quiet word (`IrqQuiet`): the slot naming its frame (0: none),
     /// the frame, the offset, and the bits that say "no interrupt".
     quiet_slot: Cell<Paddr>,
     quiet_frame: Cell<Paddr>,
     quiet_offset: Cell<u64>,
-    quiet_bits: Cell<u64>,
+    quiet_bits: Cell<u32>,
+    /// The processor the line is delivered to: the one that watches it.
+    cpu: Cell<u16>,
+    /// The next watched line, plus one (0: the last).
+    next: Cell<u8>,
 }
 
 impl LineWatch {
     pub(crate) const fn new() -> LineWatch {
         LineWatch {
-            line: Cell::new(0),
             slot: Cell::new(0),
             frame: Cell::new(0),
             offset: Cell::new(0),
             mask: Cell::new(0),
             seen: Cell::new(0),
-            cpu: Cell::new(0),
             quiet_slot: Cell::new(0),
             quiet_frame: Cell::new(0),
             quiet_offset: Cell::new(0),
             quiet_bits: Cell::new(0),
+            cpu: Cell::new(0),
+            next: Cell::new(0),
         }
     }
 }
@@ -95,10 +99,20 @@ pub const WATCHED_PER_CPU: usize = 4;
 
 impl<H: Hal> Kernel<H> {
     fn line_watch(&self, line: usize) -> Option<&LineWatch> {
-        if self.nwatches.get() == 0 {
-            return None;
-        }
-        self.watches.iter().find(|w| w.slot.get() != 0 && w.line.get() == line as u64)
+        let w = &self.watches[line];
+        (w.slot.get() != 0).then_some(w)
+    }
+
+    /// The watched lines and their watches. A watch may be released while
+    /// this goes on: its successor was read before it was given out.
+    fn watched(&self) -> impl Iterator<Item = (usize, &LineWatch)> {
+        let mut next = self.watched.get() as usize;
+        core::iter::from_fn(move || {
+            let line = next.checked_sub(1)?;
+            let w = &self.watches[line];
+            next = w.next.get() as usize;
+            Some((line, w))
+        })
     }
 
     /// Whether slot `slot` still holds a capability to frame `frame` with
@@ -133,45 +147,48 @@ impl<H: Hal> Kernel<H> {
     /// The device of `w` may interrupt.
     fn loud(&self, w: &LineWatch) {
         if let Some(q) = self.quiet(w) {
-            self.phys.device_word_update(q, 0, w.quiet_bits.get() as u32);
+            self.phys.device_word_update(q, 0, w.quiet_bits.get());
         }
     }
 
     /// `IrqWatch`: the news of `line`, delivered to processor `cpu`, is the
     /// word at `offset` in the frame `frame`, named by slot `slot`, under
     /// `mask`. Holding every lock.
-    pub(crate) fn watch_line(&self, line: usize, cpu: usize, slot: Paddr, frame: Paddr, offset: u64, mask: u32) -> bool {
+    pub(crate) fn watch_line(&self, line: usize, cpu: usize, slot: Paddr, frame: Paddr, offset: u64, mask: u32) {
         self.unwatch_line(line);
-        let Some(w) = self.watches.iter().find(|w| w.slot.get() == 0) else { return false };
-        w.line.set(line as u64);
+        let w = &self.watches[line];
         w.frame.set(frame);
         w.offset.set(offset);
-        w.mask.set(mask as u64);
+        w.mask.set(mask);
         // What is there now is not news: a driver arms the watch before it
         // starts requests, or looks once more after arming.
-        w.seen.set((self.phys.device_word(frame + offset) & mask) as u64);
-        w.cpu.set(cpu as u64);
+        w.seen.set(self.phys.device_word(frame + offset) & mask);
+        w.cpu.set(cpu as u16);
         w.quiet_slot.set(0);
         w.slot.set(slot);
-        self.nwatches.set(self.nwatches.get() + 1);
-        true
+        w.next.set(self.watched.replace(line as u8 + 1));
     }
 
     /// `line` is no longer watched (rebound, unbound, or asked). Holding
     /// every lock.
     pub(crate) fn unwatch_line(&self, line: usize) {
         if let Some(w) = self.line_watch(line) {
-            self.release(w);
+            self.release(line, w);
         }
     }
 
-    /// End watch `w`: a device told to be quiet interrupts again (its
-    /// processor may be watching now, and would not clear it any more).
-    fn release(&self, w: &LineWatch) {
+    /// End the watch `w` of `line`: a device told to be quiet interrupts
+    /// again (its processor may be watching now, and would not clear it any
+    /// more), and the line is off the list.
+    fn release(&self, line: usize, w: &LineWatch) {
         self.loud(w);
         w.quiet_slot.set(0);
         w.slot.set(0);
-        self.nwatches.set(self.nwatches.get() - 1);
+        let me = line as u8 + 1;
+        match self.watched().find(|(_, before)| before.next.get() == me) {
+            Some((_, before)) => before.next.set(w.next.get()),
+            None => self.watched.set(w.next.get()),
+        }
         // Its processor may be reading the word in its idle wait: it looks
         // again (a read until then is only a reason to look under the lock).
         let cpu = w.cpu.get() as usize;
@@ -189,7 +206,7 @@ impl<H: Hal> Kernel<H> {
         self.loud(w);
         w.quiet_frame.set(frame);
         w.quiet_offset.set(offset);
-        w.quiet_bits.set(bits as u64);
+        w.quiet_bits.set(bits);
         w.quiet_slot.set(slot);
         // Loud until its processor next watches.
         self.loud(w);
@@ -202,16 +219,13 @@ impl<H: Hal> Kernel<H> {
     #[inline(never)]
     pub(crate) fn unwatch_space(&self, start: Paddr, end: Paddr) {
         let within = |s: Paddr| start <= s && s < end;
-        for w in self.watches.iter() {
-            if w.slot.get() == 0 {
-                continue;
-            }
+        for (line, w) in self.watched() {
             if within(w.quiet_slot.get()) {
                 self.loud(w);
                 w.quiet_slot.set(0);
             }
             if within(w.slot.get()) {
-                self.release(w);
+                self.release(line, w);
             }
         }
     }
@@ -222,14 +236,14 @@ impl<H: Hal> Kernel<H> {
     /// named. Holding the line's processor's lock (or every lock).
     #[inline(always)]
     pub(crate) fn line_news(&self, line: usize) -> bool {
-        self.nwatches.get() == 0 || self.line_news_slow(line)
+        self.watched.get() == 0 || self.line_news_slow(line)
     }
 
     #[inline(never)]
     fn line_news_slow(&self, line: usize) -> bool {
         let Some(w) = self.line_watch(line) else { return true };
         let Some(word) = self.word(w) else { return true };
-        let now = (self.phys.device_word(word) as u64) & w.mask.get();
+        let now = self.phys.device_word(word) & w.mask.get();
         now != w.seen.replace(now)
     }
 
@@ -237,20 +251,17 @@ impl<H: Hal> Kernel<H> {
     /// Their devices are told to be quiet meanwhile. Holding this
     /// processor's lock.
     pub(crate) fn begin_watches(&self, out: &mut [Watched; WATCHED_PER_CPU]) -> usize {
-        if self.nwatches.get() == 0 {
-            return 0;
-        }
-        let me = self.hal.cpu() as u64;
+        let me = self.hal.cpu() as u16;
         let mut n = 0;
-        for w in self.watches.iter() {
-            if n == WATCHED_PER_CPU || w.slot.get() == 0 || w.cpu.get() != me {
+        for (_, w) in self.watched() {
+            if n == WATCHED_PER_CPU || w.cpu.get() != me {
                 continue;
             }
             let Some(word) = self.word(w) else { continue };
-            out[n] = Watched { at: self.phys.ptr(word).cast::<u32>().cast_const(), mask: w.mask.get() as u32, seen: w.seen.get() as u32 };
+            out[n] = Watched { at: self.phys.ptr(word).cast::<u32>().cast_const(), mask: w.mask.get(), seen: w.seen.get() };
             n += 1;
             if let Some(q) = self.quiet(w) {
-                self.phys.device_word_update(q, w.quiet_bits.get() as u32, 0);
+                self.phys.device_word_update(q, w.quiet_bits.get(), 0);
             }
         }
         n
@@ -260,27 +271,21 @@ impl<H: Hal> Kernel<H> {
     /// then each line whose word changed is delivered, as its interrupt
     /// would be. Holding this processor's lock.
     pub(crate) fn end_watches(&self) {
-        if self.nwatches.get() == 0 {
+        if self.watched.get() == 0 {
             return;
         }
-        let me = self.hal.cpu() as u64;
-        for w in self.watches.iter() {
-            if w.slot.get() != 0 && w.cpu.get() == me {
-                self.loud(w);
-            }
+        let me = self.hal.cpu() as u16;
+        for (_, w) in self.watched().filter(|(_, w)| w.cpu.get() == me) {
+            self.loud(w);
         }
         // The flag is cleared before the news is read (the atomic
         // read-modify-write orders them on x86; a fence on the rest).
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        for i in 0..IRQ_WATCHES {
-            let w = &self.watches[i];
-            if w.slot.get() == 0 || w.cpu.get() != me {
-                continue;
-            }
+        for (line, w) in self.watched().filter(|(_, w)| w.cpu.get() == me) {
             let Some(word) = self.word(w) else { continue };
-            if (self.phys.device_word(word) as u64) & w.mask.get() != w.seen.get() {
+            if self.phys.device_word(word) & w.mask.get() != w.seen.get() {
                 // `irq` takes the news (`line_news`) and signals.
-                self.irq(w.line.get() as usize);
+                self.irq(line);
             }
         }
     }

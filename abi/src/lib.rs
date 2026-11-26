@@ -278,8 +278,8 @@ pub enum Syscall {
     /// line, or destroying the notification or the CapSpace, ends it. The word is watched by
     /// the processor of the calling thread: call it from the thread that
     /// bound the line, which is where the line is delivered. `BadArg` for a line that
-    /// is a wire or not bound, a word outside the frame, or a mask of 0;
-    /// `NoMemory` when the kernel's watches ([`IRQ_WATCHES`]) are all in use.
+    /// is a wire or not bound, a word outside the frame, or a mask of 0. A
+    /// watch is kept with its line: every line a driver holds can be watched.
     IrqWatch = 24,
     /// `a0` interrupt-line capability, `a1` a line watched with `IrqWatch`,
     /// `a2` a Frame (writable), `a3` the offset of a 32-bit word in it (a
@@ -312,9 +312,6 @@ pub enum Syscall {
     /// badged notification; `SlotFull` when `a2` is not empty.
     CapNotice = 26,
 }
-
-/// Interrupt lines that can be watched (`IrqWatch`) at once.
-pub const IRQ_WATCHES: usize = 16;
 
 impl Syscall {
     /// One past the highest syscall number.

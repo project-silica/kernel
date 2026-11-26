@@ -227,6 +227,9 @@ impl Hal for X86 {
     fn io_release(&self, phys: &Phys, root: Paddr) {
         iommu::release(phys, root);
     }
+    fn io_taken(&self, phys: &Phys, root: Paddr) {
+        iommu::taken(phys, root);
+    }
     fn msi_first(&self) -> usize {
         ioapic::lines()
     }
@@ -435,7 +438,7 @@ impl Hal for X86 {
 
     fn set_timer(&self, deadline: u64) {
         // No later than the console must be fed again (`serial::due`).
-        let deadline = deadline.min(serial::due()).min(iommu::due());
+        let deadline = deadline.min(serial::due());
         let tsc = self.tsc_at(deadline);
         let per_ns = self.apic_per_ns.get();
         // Writing the timer leaves a virtual machine; writing what it holds
@@ -944,12 +947,6 @@ pub fn irq(vector: u64, locked: bool) {
         KICK_VECTOR => {}
         iommu::FAULT_VECTOR => {
             let refused = iommu::fault(&k.phys, k.hal.now());
-            // Held off for the rest of the second: the timer lets it go
-            // (`console_tick`), armed for then unless it fires sooner.
-            let due = iommu::due();
-            if due != u64::MAX && k.hal.tsc_at(due) < percpu().deadline.get() {
-                k.hal.set_timer(due);
-            }
             if refused.n != 0 {
                 // Whoever attached each device hears of it, through the
                 // kernel (which the idle wait has not entered).
@@ -1778,8 +1775,7 @@ fn console_tick(k: &kernel_core::Kernel<X86>) {
     report_nmis(k);
     let now = k.hal.now();
     serial::drain(now);
-    iommu::tick(&k.phys, now);
-    if serial::due() != u64::MAX || iommu::due() != u64::MAX {
+    if serial::due() != u64::MAX {
         k.hal.set_timer(u64::MAX);
     }
 }

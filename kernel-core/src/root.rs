@@ -285,6 +285,7 @@ impl<H: Hal> Kernel<H> {
         }
         r[H::FLAGS].set(H::FLAGS_INIT);
         self.make_runnable(t);
+        self.root_thread.set(t);
         Ok(t)
     }
 }
