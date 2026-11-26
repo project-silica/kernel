@@ -430,6 +430,17 @@ impl Machine {
 
     /// A machine with `cpus` processors; the root task runs on processor 0.
     pub fn with_cpus(mib: u64, cpus: usize) -> Machine {
+        Machine::build(mib, cpus, RAM_BASE)
+    }
+
+    /// A machine whose usable memory starts at `from` (at or above
+    /// `RAM_BASE`), as an aarch64 machine's starts at a large aligned
+    /// address: what lies below is not described to the kernel.
+    pub fn with_usable_from(mib: u64, from: u64) -> Machine {
+        Machine::build(mib, 1, from)
+    }
+
+    fn build(mib: u64, cpus: usize, from: u64) -> Machine {
         assert!(cpus <= TEST_CPUS, "the test machine has at most {TEST_CPUS} processors");
         let ram = Ram::new((mib << 20) as usize);
         let hal = TestHal {
@@ -464,7 +475,7 @@ impl Machine {
         // lives as long as the kernel and is used by nothing else.
         let k = Kernel::new(hal, unsafe { Phys::new(base) });
         let regions = [
-            Region { base: RAM_BASE, len: (mib << 20) - 0x4000, kind: RegionKind::Usable as u32, reserved: 0 },
+            Region { base: from, len: RAM_BASE + (mib << 20) - 0x4000 - from, kind: RegionKind::Usable as u32, reserved: 0 },
             Region { base: RAM_BASE + (mib << 20) - 0x4000, len: 0x4000, kind: RegionKind::Ramdisk as u32, reserved: 0 },
         ];
         let elf = tiny_elf(&[0x0F, 0x05, 0xEB, 0xFC], 0x3000);

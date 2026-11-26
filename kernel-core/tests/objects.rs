@@ -56,6 +56,23 @@ fn root_task_starts_with_documented_layout() {
     assert!(m.k.translate(asp, 0x60_3000).is_none());
 }
 
+/// The root task's own memory comes from the smallest aligned block that
+/// holds it, so the large blocks a big service needs stay whole. Taken from
+/// the lowest aligned address of memory that starts on a 64 MiB boundary
+/// (an aarch64 machine's), it split that block, and on a 256 MB machine the
+/// device manager could not be given its 64 MiB.
+#[test]
+fn the_root_task_leaves_the_largest_blocks_whole() {
+    // Usable: a 64 MiB block at 64 MiB, a 128 MiB one at 128 MiB, an 8 MiB
+    // one at 256 MiB and less than 1 MiB after it.
+    let m = Machine::with_usable_from(264, 64 << 20);
+    let big: Vec<_> = m.untyped().into_iter().filter(|(_, d)| d.kind == KIND_RAM && d.bits >= 26).map(|(_, d)| (d.base, d.bits)).collect();
+    assert_eq!(big, [(64 << 20, 26), (128 << 20, 27)], "a block of 64 MiB or more was split");
+    // And when only the large blocks are there, it still starts.
+    let m = Machine::with_usable_from(256, 64 << 20);
+    assert!(m.untyped().iter().any(|(_, d)| d.kind == KIND_RAM && d.bits == 27));
+}
+
 #[test]
 fn bad_syscalls_and_capabilities_are_errors() {
     let m = Machine::new(16);

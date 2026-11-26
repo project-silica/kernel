@@ -102,16 +102,25 @@ impl<H: Hal> Kernel<H> {
         let need = (1u64 << (CS_BITS + SLOT_BITS)) + (1 << AS_BITS) + image + (1 << STACK_BITS) + (1 << INFO_BITS) + (4 << PAGE_BITS);
         let bits = (64 - (2 * need - 1).leading_zeros()).max(22) as u8;
         let size = 1u64 << bits;
-        let base = spec
-            .regions
-            .iter()
-            .filter(|r| r.kind == RegionKind::Usable as u32)
-            .filter_map(|r| {
-                let b = (r.base.max(1 << 20) + size - 1) & !(size - 1);
-                (b.checked_add(size)? <= r.base + r.len).then_some(b)
-            })
-            .next_back()
-            .ok_or(BootError::NoMemory)?;
+        // Where it costs least: usable memory cut into the largest aligned
+        // blocks (as the root task's Untypeds are cut below), and the
+        // smallest of them that holds it taken, the highest of equals. A
+        // larger block, the only kind a big service's memory can come from
+        // on a small machine, stays whole (taking the region's lowest
+        // aligned address once split the one 64 MiB block of a 256 MB
+        // aarch64 machine, and its device manager could not start).
+        let mut base = None::<(u8, u64)>;
+        for r in spec.regions.iter().filter(|r| r.kind == RegionKind::Usable as u32) {
+            let (mut a, end) = (r.base.max(1 << 20), r.base.saturating_add(r.len));
+            while a < end {
+                let b = (a.trailing_zeros().min(63 - (end - a).leading_zeros()) as u8).min(silica_abi::UNTYPED_MAX_BITS);
+                if b >= bits && base.is_none_or(|(best, _)| b <= best) {
+                    base = Some((b, a));
+                }
+                a += 1 << b;
+            }
+        }
+        let base = base.ok_or(BootError::NoMemory)?.1;
 
         // The CapSpace comes first, by hand: until it exists there is no slot
         // to hold the Untyped it is made from.

@@ -331,8 +331,9 @@ const MAP_BYTES: u64 = 256 * 1024;
 
 /// Where the crash record may live, in order, from the start of memory: low
 /// enough for the smallest machine (256 MB), above what the firmware uses
-/// early in its boot.
-const CRASH_AT: [u64; 3] = [0x0300_0000, 0x0500_0000, 0x0700_0000];
+/// early in its boot, and all inside the 16 MiB below the 64 MiB mark, so
+/// the 64 MiB block above stays whole for a service that needs it.
+const CRASH_AT: [u64; 3] = [0x0300_0000, 0x0380_0000, 0x03C0_0000];
 
 /// UEFI image entry point.
 // SAFETY: `efi_main` is the entry symbol the UEFI target's linker expects;
