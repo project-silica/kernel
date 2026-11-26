@@ -1672,8 +1672,13 @@ pub extern "C" fn kmain(info: u64) -> ! {
         Ok(Some(warning)) => klog!(k, "{warning}"),
         Ok(None) => {}
     }
+    // A test image's deliberate panic, once: a boot that follows a panic
+    // (its record is here) goes on, so its root task can be seen to be
+    // given the record.
     #[cfg(feature = "harness")]
-    harness::deliberate(cmdline, k);
+    if last_panic.is_empty() {
+        harness::deliberate(cmdline, k);
+    }
 
     // Nothing in the archive runs, the root task included, unless the whole
     // of it is as the image builder wrote it (`ramdisk::check`).

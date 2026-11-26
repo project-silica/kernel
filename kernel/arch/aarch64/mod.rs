@@ -1186,11 +1186,18 @@ extern "C" fn kmain(info: u64) -> ! {
         bi.kernel_slide
     );
     verify_stack(BOOT_STACK.0.get() as u64 + STACK_SIZE as u64);
+    // A test image's deliberate panic, once: a boot that follows a panic
+    // (its record is here) goes on, so its root task can be seen to be
+    // given the record.
     #[cfg(feature = "harness")]
-    harness::deliberate_early(cmdline);
+    if last_panic.is_empty() {
+        harness::deliberate_early(cmdline);
+    }
     let k = kernel();
     #[cfg(feature = "harness")]
-    harness::deliberate(cmdline, k);
+    if last_panic.is_empty() {
+        harness::deliberate(cmdline, k);
+    }
     BOOT_CPU.kstack_top.store(BOOT_STACK.0.get() as u64 + STACK_SIZE as u64, Ordering::Relaxed);
     BOOT_CPU.mpidr.store(gic::my_affinity(), Ordering::Relaxed);
     // SAFETY: once, on the boot processor, with interrupts masked; the
