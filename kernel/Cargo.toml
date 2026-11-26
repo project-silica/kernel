@@ -17,5 +17,11 @@ kernel-core = { path = "../kernel-core" }
 silica-abi = { path = "../abi" }
 silica-formats = { path = "../formats" }
 
+# A test image's kernel: the command-line words a test drives it with
+# (`exit=`, `panic=`) and the counts a test reads. A kernel built for a
+# machine is built without it.
+[features]
+harness = ["kernel-core/harness"]
+
 [lints]
 workspace = true

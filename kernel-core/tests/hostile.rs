@@ -164,10 +164,14 @@ fn a_watch_does_not_reach_past_a_smaller_frame_put_in_its_slot() {
 }
 
 /// A program that makes its thread fault again and again, with nobody to
-/// tell, does not get a kernel console line per fault: the console is
-/// shared, and writing it is slow on real hardware.
+/// tell, writes nothing on the kernel's console: the fault stops the thread
+/// and stays in it for whoever holds it. (Before, each was a console line
+/// until one ration of ten a second for the machine ran out, so one
+/// program's faults took the lines another's would have had.) Only the
+/// thread the kernel started itself, which nobody holds, is spoken for by
+/// the kernel.
 #[test]
-fn faults_with_nobody_to_tell_are_not_logged_without_limit() {
+fn faults_with_nobody_to_tell_write_nothing_on_the_console() {
     let m = Machine::new(16);
     let (ut, _) = m.big_untyped();
     let t = m.spawn(ut, FREE);
@@ -180,18 +184,14 @@ fn faults_with_nobody_to_tell_are_not_logged_without_limit() {
         assert_ne!(m.k.thread_view(t).state, RUNNABLE);
         m.ok(S::ThreadStart, [FREE, 0x40_0000, 0, 0, 1, 0]);
     }
-    let log = String::from_utf8_lossy(&m.k.hal.console.borrow()).into_owned();
-    let lines = log.matches("no fault endpoint").count();
-    assert!((1..=20).contains(&lines), "{lines} lines for 1000 faults in no time");
-    // Time passing: the next is told, with how many were not.
-    m.k.hal.now.set(m.k.hal.now() + 2_000_000_000);
-    m.sys_as(t, S::Yield, [0; 6]);
-    while m.k.current() != t {
-        m.sys(S::Yield, [0; 6]);
+    let said = || String::from_utf8_lossy(&m.k.hal.console.borrow()).matches("no fault endpoint").count();
+    assert_eq!(said(), 0, "console lines for a program's faults");
+    // The root task's first thread: the kernel says it, at once.
+    while m.k.current() != m.root {
+        m.sys_as(t, S::Yield, [0; 6]);
     }
     m.fault(Fault::Exception, 0, 13);
-    let log = String::from_utf8_lossy(&m.k.hal.console.borrow()).into_owned();
-    assert!(log.contains("not logged"), "{log}");
+    assert_eq!(said(), 1, "the root task stopped and the kernel did not say so");
 }
 
 /// A thread object reused for a new program (`ThreadStart`) starts it with
@@ -226,10 +226,10 @@ fn thread_start_resets_the_extended_state() {
 }
 
 /// Processor time is authority (`SLOT_SCHED`, narrowed by processor): a
-/// scheduling context made from memory alone may lower its threads' share
-/// and not raise it, nor reserve a processor. Without this, any holder of
-/// an Untyped took 1,024 times a service's share, or 90% of the processor
-/// every service runs on.
+/// scheduling context is a share or a reservation of a processor only by
+/// a capability to that processor's time, and memory alone makes none.
+/// Without this, any holder of an Untyped took 1,024 times a service's
+/// share, or 90% of the processor every service runs on.
 #[test]
 fn processor_time_takes_a_capability_to_processor_time() {
     use silica_abi::{SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_MAX_WEIGHT};
@@ -238,23 +238,23 @@ fn processor_time_takes_a_capability_to_processor_time() {
     let (ut, _) = m.big_untyped();
     m.retype(ut, T::SchedContext, 0, FREE, 2);
     let (sc, other) = (FREE, FREE + 1);
-    // Memory alone: down, not up.
-    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, 0]), Error::NoRights);
-    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_DEFAULT_WEIGHT + 1, 0, 0, 0]), Error::NoRights);
+    // Memory alone: nothing, large or small.
+    for weight in [SCHED_MAX_WEIGHT, SCHED_DEFAULT_WEIGHT + 1, SCHED_DEFAULT_WEIGHT, 1] {
+        assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, weight, 0, 0, 0]), Error::NoRights);
+    }
     assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_DEADLINE, 9 * MS, 10 * MS, 0, 0]), Error::NoRights);
-    m.ok(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_DEFAULT_WEIGHT / 2, 0, 0, 0]);
-    m.ok(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, 0]);
     // Not any capability: one to processor time.
     assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, SLOT_IRQS]), Error::WrongType);
-    // Narrowed to processor 1: a reservation there, not on processor 0, and
-    // no weight above the default (a fair thread runs wherever it is moved).
+    // Narrowed to processor 1: a share or a reservation there, none on
+    // processor 0.
     m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2, SLOT_SCHED, 15, 1 | 2 << 32, 0]);
     assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_DEADLINE, 9 * MS, 10 * MS, 0, FREE + 2]), Error::NoRights);
-    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, FREE + 2]), Error::NoRights);
+    assert_eq!(m.err(S::SchedConfigure, [sc, SCHED_FAIR, 1, 0, 0, FREE + 2]), Error::NoRights);
+    m.ok(S::SchedConfigure, [sc, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 1, FREE + 2]);
     m.ok(S::SchedConfigure, [sc, SCHED_DEADLINE, 9 * MS, 10 * MS, 1, FREE + 2]);
     // The whole machine's: anything.
     m.ok(S::SchedConfigure, [other, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, SLOT_SCHED]);
-    m.ok(S::SchedConfigure, [other, SCHED_FAIR, 1, 0, 0, 0]);
+    m.ok(S::SchedConfigure, [other, SCHED_FAIR, 1, 0, 1, SLOT_SCHED]);
     // A capability without its write right is no authority.
     m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 3, SLOT_SCHED, Rights::READ.0 as u64, 0, 0]);
     assert_eq!(m.err(S::SchedConfigure, [other, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, FREE + 3]), Error::NoRights);
@@ -324,9 +324,30 @@ fn a_mapping_too_large_for_one_call_is_refused() {
 /// maps a peer's memory at a fresh address each time (as a service mapping
 /// what its clients lend it does) ran its address space out of tables:
 /// 120 lend-and-end cycles of a 1 MiB frame in an 18-bit space.
+/// One test per frame size and kind of space, so Miri runs them side by side
+/// (in one test, one after another, they were the longest of its run).
 #[test]
-fn page_tables_are_given_back_when_their_mappings_go() {
-    for (bits, io) in [(14u64, false), (20, false), (22, false), (20, true)] {
+fn page_tables_are_given_back_when_their_mappings_go_16k() {
+    tables_given_back(14, false);
+}
+
+#[test]
+fn page_tables_are_given_back_when_their_mappings_go_1m() {
+    tables_given_back(20, false);
+}
+
+#[test]
+fn page_tables_are_given_back_when_their_mappings_go_4m() {
+    tables_given_back(22, false);
+}
+
+#[test]
+fn page_tables_are_given_back_when_their_mappings_go_for_devices() {
+    tables_given_back(20, true);
+}
+
+fn tables_given_back(bits: u64, io: bool) {
+    {
         let m = Machine::new(if cfg!(miri) { 16 } else { 64 });
         let (ut, _) = m.big_untyped();
         m.retype(ut, T::AddressSpace, 18 | if io { silica_abi::ASPACE_IO } else { 0 }, FREE + 10, 1);
@@ -443,6 +464,7 @@ fn switching_into_and_out_of_an_isolated_address_space_flushes_predictors() {
         m.retype(ut, T::AddressSpace, bits, slot + 1, 1);
         m.retype(ut, T::Thread, 0, slot, 1);
         m.ok(S::ThreadConfigure, [slot, SLOT_CAPSPACE, slot + 1, 0, 0, 0]);
+        m.ok(S::ThreadControl, [slot, 2, silica_abi::root::SLOT_CONTEXT, 0, 0, 0]);
         m.ok(S::ThreadStart, [slot, 0x40_0000, 0, 0, 1, 0]);
         m.cap(slot).unwrap().obj
     };
@@ -471,4 +493,532 @@ fn switching_into_and_out_of_an_isolated_address_space_flushes_predictors() {
     m.sys_as(doomed, S::CapDelete, [FREE + 4, 0, 0, 0, 0, 0]);
     m.sys(S::Yield, [0; 6]);
     assert_eq!(isolations()[before..], ["isolate false"], "leaving a destroyed isolated space did not flush");
+}
+
+/// Threads are made from any memory, and a program may put as many as it
+/// has memory for on the processor every service runs on. Making one of
+/// them runnable placed it in a list kept in order of virtual runtime,
+/// walked with interrupts off, and blocking with a deadline did the same
+/// in the timer list: the more threads a program queued there, the longer
+/// every wake-up and every timed wait on that processor took. Both are
+/// trees now. Measured as the fastest of many operations beside 1,700
+/// threads (600 with deadlines) against beside ten.
+#[test]
+fn many_queued_threads_do_not_slow_a_processors_wake_ups_or_timed_waits() {
+    const SLEEPERS: u64 = 48;
+    /// The fastest wake-up of a thread that slept, beside `hogs` runnable
+    /// threads that have run more than it. Each woken sleeper wakes the
+    /// next, so the waker is always the processor's current thread.
+    fn fastest_wake_ns(hogs: u64) -> u128 {
+        let m = Machine::new(64);
+        let (ut, _) = m.big_untyped();
+        m.retype(ut, T::Notification, 0, FREE, SLEEPERS);
+        let sleepers: Vec<_> = (0..SLEEPERS)
+            .map(|i| {
+                let t = m.spawn(ut, FREE + 100 + i);
+                assert!(m.sys_as(t, S::Recv, [FREE + i, 0, 0, 0, 0, 0]).blocked);
+                t
+            })
+            .collect();
+        // The root runs 10 ms alone, so the threads made next start level
+        // with it, past where a sleeper is placed when it wakes (at most
+        // 3 ms behind the least-run thread).
+        m.k.hal.now.set(m.k.hal.now.get() + 10_000_000);
+        m.ok(S::Yield, [0; 6]);
+        for i in 0..hogs {
+            m.spawn(ut, FREE + 200 + i);
+        }
+        let (mut best, mut waker) = (u128::MAX, m.root);
+        for (i, s) in sleepers.into_iter().enumerate() {
+            let start = std::time::Instant::now();
+            let r = m.sys_as(waker, S::Send, [FREE + i as u64, 0, 0, 0, 0, 0]);
+            best = best.min(start.elapsed().as_nanos());
+            assert_eq!(r.status, 0);
+            waker = s;
+        }
+        m.k.check_runqueues().unwrap();
+        best
+    }
+    /// The fastest timed wait (a receive with a deadline after every
+    /// other) beside `hogs` threads blocked with deadlines.
+    fn fastest_timed_wait_ns(hogs: u64) -> u128 {
+        let m = Machine::new(64);
+        let (ut, _) = m.big_untyped();
+        m.retype(ut, T::Notification, 0, FREE, SLEEPERS);
+        let walkers: Vec<_> = (0..SLEEPERS).map(|i| m.spawn(ut, FREE + 100 + i)).collect();
+        let far = m.k.hal.now.get() + 1_000_000_000_000;
+        for i in 0..hogs {
+            let t = m.spawn(ut, FREE + 200 + i);
+            m.retype(ut, T::Notification, 0, FREE + 900 + i, 1);
+            assert!(m.sys_as(t, S::Recv, [FREE + 900 + i, far - 1_000_000 + i, 0, 0, 0, 0]).blocked);
+        }
+        let mut best = u128::MAX;
+        for (i, w) in walkers.into_iter().enumerate() {
+            let start = std::time::Instant::now();
+            assert!(m.sys_as(w, S::Recv, [FREE + i as u64, far, 0, 0, 0, 0]).blocked);
+            best = best.min(start.elapsed().as_nanos());
+        }
+        m.k.check_timers().unwrap();
+        best
+    }
+    // Under Miri (which checks the memory safety of the same paths) a few
+    // threads, and no time: its times are not the machine's.
+    if cfg!(miri) {
+        fastest_wake_ns(40);
+        fastest_timed_wait_ns(40);
+        return;
+    }
+    let (few, many) = (fastest_wake_ns(10), fastest_wake_ns(1700));
+    assert!(many < few * 3, "a wake-up beside 1,700 runnable threads took {many} ns, beside 10 {few} ns");
+    let (few, many) = (fastest_timed_wait_ns(10), fastest_timed_wait_ns(600));
+    assert!(many < few * 3, "a timed wait beside 600 others took {many} ns, beside 10 {few} ns");
+}
+
+/// A program reuses the addresses where lent memory was only once nothing
+/// is mapped there any more, including the page of zeros its supervisor
+/// mapped in place of memory the lender took back (whose capability is the
+/// supervisor's, not the program's). `Unmap` of an address space clears a
+/// range whole, whoever's frames are in it; it takes the write right.
+#[test]
+fn unmapping_a_range_clears_every_mapping_in_it_with_the_write_right_only() {
+    let m = Machine::new(64);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 18, FREE + 10, 1);
+    m.retype(ut, T::Frame, 12, FREE, 3);
+    m.retype(ut, T::Frame, 21, FREE + 3, 1);
+    let space = m.cap(FREE + 10).unwrap().obj;
+    let base: u64 = 0x80_0000_0000;
+    // Two pages inside the range, a 2 MiB frame overlapping its end, and a
+    // page past it.
+    m.ok(S::Map, [FREE + 10, FREE, base, 3, 0, 0]);
+    m.ok(S::Map, [FREE + 10, FREE + 1, base + 0x5000, 3, 0, 0]);
+    m.ok(S::Map, [FREE + 10, FREE + 3, base + 0x20_0000, 3, 0, 0]);
+    m.ok(S::Map, [FREE + 10, FREE + 2, base + 0x60_0000, 3, 0, 0]);
+    narrowed(&m, FREE + 10, FREE + 11, Rights::READ);
+    assert_eq!(m.err(S::Unmap, [FREE + 11, base, 0x30_0000, 0, 0, 0]), Error::NoRights);
+    assert_eq!(m.err(S::Unmap, [FREE + 10, u64::MAX, 2, 0, 0, 0]), Error::BadArg);
+    assert!(m.k.translate(space, base).is_some());
+    m.ok(S::Unmap, [FREE + 10, base, 0x30_0000, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 3, "three mappings overlapped the range");
+    for at in [base, base + 0x5000, base + 0x20_0000, base + 0x3F_F000] {
+        assert!(m.k.translate(space, at).is_none(), "{at:#x} still mapped");
+    }
+    assert!(m.k.translate(space, base + 0x60_0000).is_some(), "a page past the range went");
+    // The frames are unmapped, not gone: each maps again, at the same place.
+    m.ok(S::Map, [FREE + 10, FREE, base, 3, 0, 0]);
+    m.ok(S::Map, [FREE + 10, FREE + 3, base + 0x20_0000, 3, 0, 0]);
+    assert!(m.k.translate(space, base + 0x20_0000).is_some());
+}
+
+/// Processor time went by thread: each fair thread was a share, so a
+/// program with the memory for a hundred threads took a hundred shares of
+/// the processor every service runs on. Measured on the kernel before that
+/// was mended, a default-weight service beside a program of n threads (all
+/// on one processor, a second of time): n = 1, 501 ms and waits of at most
+/// 3 ms; n = 10, 93 ms and 30 ms; n = 100, 12 ms and 300 ms. Now time is a
+/// capability: a fair context (made with authority over the processor's
+/// time) is one share however many threads are bound to it, a thread runs
+/// only once it is bound, and a program has nothing to bind its threads to
+/// but the context it was given: not no context at all, not one it makes
+/// from its own memory.
+#[test]
+fn a_program_with_many_threads_takes_one_share() {
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    use std::collections::HashMap;
+    const MS: u64 = 1_000_000;
+    fn next_timer(m: &Machine) -> u64 {
+        let t = m.k.hal.timer();
+        if m.k.hal.armed[0].get() && t > m.k.hal.now.get() { t } else { u64::MAX }
+    }
+    let share = |n: u64| -> (u64, u64) {
+        let m = Machine::with_cpus(64, 2);
+        m.on(0);
+        let (ut, _) = m.big_untyped();
+        // Two contexts on processor 0, made by the holder of processor time.
+        m.retype(ut, T::SchedContext, 0, FREE, 2);
+        let (gs, gh) = (FREE, FREE + 1);
+        for g in [gs, gh] {
+            m.ok(S::SchedConfigure, [g, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+        }
+        let service = m.spawn(ut, FREE + 2);
+        m.ok(S::ThreadControl, [FREE + 2, 2, gs, 0, 0, 0]);
+        let first = m.spawn(ut, FREE + 3);
+        m.ok(S::ThreadControl, [FREE + 3, 2, gh, 0, 0, 0]);
+        // The program makes the rest itself, and tries every way to more
+        // than its share: a context of its own is no time, whatever it
+        // asks of it.
+        m.retype(ut, T::SchedContext, 0, FREE + 4, 1);
+        let own = FREE + 4;
+        for weight in [SCHED_DEFAULT_WEIGHT, 1] {
+            assert_eq!(m.sys_as(first, S::SchedConfigure, [own, SCHED_FAIR, weight, 0, 0, 0]).status, Error::NoRights as u64);
+        }
+        let mut threads = vec![first];
+        for i in 1..n {
+            let slot = FREE + 10 + i;
+            assert_eq!(m.sys_as(first, S::Retype, [ut, T::Thread as u64, 0, SLOT_CAPSPACE, slot, 1]).status, 0);
+            assert_eq!(m.sys_as(first, S::ThreadConfigure, [slot, SLOT_CAPSPACE, SLOT_ASPACE, 0, 0, 0]).status, 0);
+            // Bound to nothing, or to its own context, the thread has no
+            // time: it is not started, and not resumed.
+            let refused = match i % 3 {
+                0 => m.sys_as(first, S::ThreadStart, [slot, 0x40_0000, 0, 0, 1, 0]),
+                1 => m.sys_as(first, S::ThreadControl, [slot, 2, own, 0, 0, 0]),
+                _ => m.sys_as(first, S::ThreadControl, [slot, 1, 0, 0, 0, 0]),
+            };
+            assert_eq!(refused.status, Error::NoTime as u64);
+            // What is left is the context the program was given.
+            assert_eq!(m.sys_as(first, S::ThreadControl, [slot, 2, gh, 0, 0, 0]).status, 0);
+            assert_eq!(m.sys_as(first, S::ThreadStart, [slot, 0x40_0000, 0, 0, 1, 0]).status, 0);
+            threads.push(m.cap(slot).unwrap().obj);
+        }
+        assert!(m.sys(S::ThreadControl, [SLOT_THREAD, 0, 0, 0, 0, 0]).blocked);
+        m.k.check_runqueues().unwrap();
+        let (mut ran, mut last, mut worst) = (HashMap::<u64, u64>::new(), m.k.hal.now.get(), 0);
+        let until = m.k.hal.now.get() + 1000 * MS;
+        let mut steps = 0;
+        while m.k.hal.now.get() < until {
+            let now = m.k.hal.now.get();
+            let next = next_timer(&m).min(until);
+            let cur = m.k.current();
+            if cur == service {
+                worst = worst.max(now - last);
+                last = next;
+            }
+            *ran.entry(cur).or_insert(0) += next - now;
+            m.k.hal.now.set(next);
+            m.tick();
+            steps += 1;
+            assert!(steps < 1_000_000);
+        }
+        m.k.check_runqueues().unwrap();
+        (ran.get(&service).copied().unwrap_or(0) / MS, worst / MS)
+    };
+    for n in [1, 10, 100] {
+        let (ran, worst) = share(n);
+        println!("a service beside a program of {n} threads: {ran} ms of 1000, waits of at most {worst} ms");
+        assert!(ran >= 450, "beside a program of {n} threads the service ran {ran} ms of 1000");
+        assert!(worst <= 7, "beside a program of {n} threads the service waited {worst} ms");
+    }
+}
+
+/// A thread runs only on time it was bound to through a capability. One
+/// made and never bound cannot be started or resumed, and never runs; a
+/// context made from memory is nobody's time until a holder of a
+/// processor's time says so, for that processor only; and a program in a
+/// CapSpace of its own binds its threads to the context it holds and to no
+/// other: not one it cannot name, not one it holds without the read right,
+/// and it cannot raise the share it was given.
+#[test]
+fn a_thread_runs_only_on_time_it_was_bound_to_through_a_capability() {
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_MAX_WEIGHT};
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    // Made, configured, never bound.
+    m.retype(ut, T::Thread, 0, FREE, 1);
+    let t = m.cap(FREE).unwrap().obj;
+    m.ok(S::ThreadConfigure, [FREE, SLOT_CAPSPACE, SLOT_ASPACE, 0, 0, 0]);
+    assert_eq!(m.err(S::ThreadStart, [FREE, 0x40_0000, 0, 0, 1, 0]), Error::NoTime);
+    m.ok(S::ThreadStart, [FREE, 0x40_0000, 0, 0, 0, 0]);
+    assert_eq!(m.err(S::ThreadControl, [FREE, 1, 0, 0, 0, 0]), Error::NoTime);
+    // A context from memory alone: no time, and none to be had for it
+    // without the processor's (here, a capability to processor 1's only).
+    m.retype(ut, T::SchedContext, 0, FREE + 1, 2);
+    assert_eq!(m.err(S::ThreadControl, [FREE, 2, FREE + 1, 0, 0, 0]), Error::NoTime);
+    assert_eq!(m.err(S::SchedConfigure, [FREE + 1, SCHED_FAIR, 1, 0, 0, 0]), Error::NoRights);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 3, SLOT_SCHED, 15, 1 | 2 << 32, 0]);
+    assert_eq!(m.err(S::SchedConfigure, [FREE + 1, SCHED_FAIR, 1, 0, 0, FREE + 3]), Error::NoRights);
+    assert_eq!(m.k.thread_view(t).state, 0);
+    for _ in 0..50 {
+        m.k.hal.now.set(m.k.hal.now.get() + 1_000_000);
+        m.tick();
+        assert_ne!(m.k.current(), t, "a thread bound to no context ran");
+    }
+    m.k.check_runqueues().unwrap();
+    // A program: a CapSpace of its own holding its second thread (slot 1),
+    // its own context read-only (slot 2) and another's without the read
+    // right (slot 3).
+    let (own, others) = (FREE + 1, FREE + 2);
+    for g in [own, others] {
+        m.ok(S::SchedConfigure, [g, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    }
+    m.retype(ut, T::CapSpace, 8, FREE + 4, 1);
+    m.retype(ut, T::Thread, 0, FREE + 5, 2);
+    m.ok(S::CapCopy, [FREE + 4, 1, FREE + 6, 15, 0, 0]);
+    m.ok(S::CapCopy, [FREE + 4, 2, own, Rights::READ.0 as u64, 0, 0]);
+    m.ok(S::CapCopy, [FREE + 4, 3, others, Rights::WRITE.0 as u64, 0, 0]);
+    m.ok(S::ThreadConfigure, [FREE + 5, FREE + 4, SLOT_ASPACE, 0, 0, 0]);
+    m.ok(S::ThreadConfigure, [FREE + 6, FREE + 4, SLOT_ASPACE, 0, 0, 0]);
+    m.ok(S::ThreadControl, [FREE + 5, 2, own, 0, 0, 0]);
+    m.ok(S::ThreadStart, [FREE + 5, 0x40_0000, 0, 0, 1, 0]);
+    let p = m.cap(FREE + 5).unwrap().obj;
+    let second = m.cap(FREE + 6).unwrap().obj;
+    let as_p = |n: S, a: [u64; 6]| Error::result(m.sys_as(p, n, a).status);
+    assert_eq!(as_p(S::ThreadControl, [1, 2, others, 0, 0, 0]), Err(Error::BadCap), "bound to a context it cannot name");
+    assert_eq!(as_p(S::ThreadControl, [1, 2, SLOT_CONTEXT, 0, 0, 0]), Err(Error::BadCap), "bound to the root task's own context");
+    assert_eq!(as_p(S::ThreadControl, [1, 2, 3, 0, 0, 0]), Err(Error::NoRights), "bound to a context it holds without the read right");
+    assert_eq!(as_p(S::ThreadStart, [1, 0x40_0000, 0, 0, 1, 0]), Err(Error::NoTime));
+    assert_eq!(as_p(S::SchedConfigure, [2, SCHED_FAIR, SCHED_MAX_WEIGHT, 0, 0, 0]), Err(Error::NoRights), "raised its own share");
+    assert_eq!(as_p(S::ThreadControl, [1, 2, 2, 0, 0, 0]), Ok(()));
+    assert_eq!(as_p(S::ThreadStart, [1, 0x40_0000, 0, 0, 1, 0]), Ok(()));
+    assert_eq!(m.k.thread_view(second).state, RUNNABLE);
+    m.k.check_runqueues().unwrap();
+}
+
+/// Holding every processor's lock stops the machine, so the time a program
+/// spends so is bounded (the 2026-11-24 audit: a flood of capability
+/// operations took two thirds of other processors' round trips). The bound
+/// was each processor's: a program that used it up held back every other
+/// program on its processor, whose calls waited for a share they had not
+/// touched. It is the caller's scheduling context's: the flood waits, and
+/// a program beside it on the same processor carries on.
+#[test]
+fn a_flood_of_lock_taking_calls_holds_back_its_own_context_only() {
+    use kernel_core::thread::THROTTLED;
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    // A thread running on processor 1: what holding every lock costs.
+    m.spawn(ut, FREE + 20);
+    m.move_to(FREE + 20, 1);
+    m.settle(1);
+    m.on(0);
+    // The flood and its victim on processor 0, each on a context of its own.
+    m.retype(ut, T::SchedContext, 0, FREE, 2);
+    for g in [FREE, FREE + 1] {
+        m.ok(S::SchedConfigure, [g, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    }
+    let flood = m.spawn(ut, FREE + 2);
+    m.ok(S::ThreadControl, [FREE + 2, 2, FREE, 0, 0, 0]);
+    let victim = m.spawn(ut, FREE + 3);
+    m.ok(S::ThreadControl, [FREE + 3, 2, FREE + 1, 0, 0, 0]);
+    m.retype(ut, T::Endpoint, 0, FREE + 4, 1);
+    // Every reading of the clock is 10 us later than the last, so a call
+    // that takes every lock holds them at least that long.
+    m.k.hal.now_step.set(10_000);
+    // Capability copies and deletes until the flood is held back.
+    let mut calls = 0;
+    while m.k.thread_view(flood).state != THROTTLED {
+        let slot = FREE + 5;
+        let call = if m.cap(slot).is_none() {
+            (S::CapCopy, [SLOT_CAPSPACE, slot, FREE + 4, 15, 0, 0])
+        } else {
+            (S::CapDelete, [slot, 0, 0, 0, 0, 0])
+        };
+        let r = m.sys_as(flood, call.0, call.1);
+        assert!(r.blocked || r.status == 0, "{:?}", Error::result(r.status));
+        calls += 1;
+        assert!(calls < 100_000, "a flood of calls that take every lock was never held back");
+    }
+    // The victim makes the same calls beside it, and none of them waits.
+    for i in 0..100 {
+        let slot = FREE + 6;
+        let call = if i % 2 == 0 { (S::CapCopy, [SLOT_CAPSPACE, slot, FREE + 4, 15, 0, 0]) } else { (S::CapDelete, [slot, 0, 0, 0, 0, 0]) };
+        let r = m.sys_as(victim, call.0, call.1);
+        assert!(
+            !r.blocked,
+            "call {i} of a program on the flood's processor waited for the flood's share (after {calls} calls of the flood)"
+        );
+        assert_eq!(r.status, 0);
+    }
+    // The flood's share comes back with time, and it carries on.
+    m.k.hal.now_step.set(0);
+    m.k.hal.now.set(m.k.hal.now.get() + 1_000_000_000);
+    m.tick();
+    assert_eq!(m.k.thread_view(flood).state, RUNNABLE);
+    m.k.check_runqueues().unwrap();
+}
+
+/// What holding every lock costs a program on another processor is the
+/// whole time held, however many other processors are idle: a pair of
+/// programs calling each other across two processors has one of them
+/// running at a time, and each call of the pair waits for the locks. So a
+/// flood on a machine of four processors beside one busy one is held
+/// back after spending its burst, as on a machine of two (before: it was
+/// charged a third, and on eight processors a flood beside such a pair
+/// kept 69% of the pair's round trips; `smp_global_flood8`).
+#[test]
+fn a_flood_beside_idle_processors_pays_the_whole_time_it_holds_every_lock() {
+    use kernel_core::smp::GLOBAL_BURST_NS;
+    use kernel_core::thread::THROTTLED;
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    let m = Machine::with_cpus(64, 4);
+    let (ut, _) = m.big_untyped();
+    // One other processor has work; the other two are idle.
+    m.spawn(ut, FREE + 20);
+    m.move_to(FREE + 20, 1);
+    m.settle(1);
+    m.on(0);
+    m.retype(ut, T::SchedContext, 0, FREE, 1);
+    m.ok(S::SchedConfigure, [FREE, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    let flood = m.spawn(ut, FREE + 2);
+    m.ok(S::ThreadControl, [FREE + 2, 2, FREE, 0, 0, 0]);
+    m.retype(ut, T::Endpoint, 0, FREE + 4, 1);
+    // Every reading of the clock is 10 us later than the last, so a call
+    // that takes every lock holds them at least that long.
+    m.k.hal.now_step.set(10_000);
+    let mut calls = 0u64;
+    while m.k.thread_view(flood).state != THROTTLED {
+        let slot = FREE + 5;
+        let call = if m.cap(slot).is_none() {
+            (S::CapCopy, [SLOT_CAPSPACE, slot, FREE + 4, 15, 0, 0])
+        } else {
+            (S::CapDelete, [slot, 0, 0, 0, 0, 0])
+        };
+        let r = m.sys_as(flood, call.0, call.1);
+        assert!(r.blocked || r.status == 0, "{:?}", Error::result(r.status));
+        calls += 1;
+        assert!(calls < 100_000, "a flood of calls that take every lock was never held back");
+    }
+    assert!(
+        calls * 10_000 <= 2 * GLOBAL_BURST_NS,
+        "a flood beside two idle processors and one busy one held every lock for {} calls of at least 10 us before it was held back, its burst being {} us",
+        calls,
+        GLOBAL_BURST_NS / 1000
+    );
+}
+
+/// Binding takes a thread to its context's processor (the context's
+/// capability is the authority to), fair or reserved, and a context with
+/// threads bound keeps its processor. When a context's last capability
+/// goes, so does the time its threads ran on: they stop, bound to nothing,
+/// until they are bound to other time and resumed.
+#[test]
+fn a_context_holds_its_threads_on_its_processor() {
+    use silica_abi::{SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    let m = Machine::with_cpus(64, 2);
+    m.on(0);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::SchedContext, 0, FREE, 2);
+    m.ok(S::SchedConfigure, [FREE, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 1, SLOT_SCHED]);
+    let t = m.spawn(ut, FREE + 2);
+    m.ok(S::ThreadControl, [FREE + 2, 2, FREE, 0, 0, 0]);
+    assert_eq!(m.k.thread_view(t).cpu, 1, "binding took it to the context's processor");
+    m.k.check_runqueues().unwrap();
+    // A reservation is on its processor too, and a thread goes from one
+    // context to another wherever each is (suspended, it stays so).
+    m.ok(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 1_000_000, 10_000_000, 0, SLOT_SCHED]);
+    let d = m.spawn(ut, FREE + 3);
+    m.ok(S::ThreadControl, [FREE + 3, 2, FREE, 0, 0, 0]);
+    assert_eq!(m.k.thread_view(d).cpu, 1);
+    m.ok(S::ThreadControl, [FREE + 3, 0, 0, 0, 0, 0]);
+    m.ok(S::ThreadControl, [FREE + 3, 2, FREE + 1, 0, 0, 0]);
+    assert_eq!((m.k.thread_view(d).cpu, m.k.thread_view(d).state), (0, 0));
+    m.k.check_runqueues().unwrap();
+    // A context in use keeps its processor.
+    assert_eq!(m.err(S::SchedConfigure, [FREE, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]), Error::InUse);
+    assert_eq!(m.err(S::SchedConfigure, [FREE + 1, SCHED_DEADLINE, 1_000_000, 10_000_000, 1, SLOT_SCHED]), Error::InUse);
+    // Its last capability gone: its thread has no time.
+    m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
+    assert_eq!(m.k.thread_view(t).state, 0, "a thread whose context is gone still runs");
+    assert_eq!(m.err(S::ThreadControl, [FREE + 2, 1, 0, 0, 0, 0]), Error::NoTime);
+    m.k.check_runqueues().unwrap();
+    m.move_to(FREE + 2, 0);
+    m.ok(S::ThreadControl, [FREE + 2, 1, 0, 0, 0, 0]);
+    assert_eq!((m.k.thread_view(t).cpu, m.k.thread_view(t).state), (0, RUNNABLE));
+    m.k.check_runqueues().unwrap();
+}
+
+/// A device (or a driver programming one) that raises an edge or message
+/// line without end cost a processor: each interrupt was delivered whole.
+/// A line that fires while its notification bit is still pending brings no
+/// news, and the kernel knows it exactly, so that delivery holds the line
+/// off (masked, or its remapping entry sent to the discard vector) until
+/// the waiter receives: one interrupt per receive, whatever the device
+/// does. (Before, the hold began after 64 such deliveries in a row, a
+/// count standing in for the pending bit.)
+#[test]
+fn a_line_that_fires_with_its_news_pending_is_held_off_until_its_waiter_receives() {
+    let m = Machine::with_cpus(16, 1);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 2);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2, FREE, 15, 0b10, 0]);
+    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 5, FREE + 2, 0, 0, 0]);
+    let log = || m.k.hal.irq_log.borrow().clone();
+    let held = || log().iter().filter(|l| l.as_str() == "mask 5").count();
+    let let_go = || log().iter().filter(|l| l.as_str() == "unmask 5").count();
+    m.irq(5);
+    assert_eq!(held(), 0, "the first interrupt is news");
+    m.irq(5);
+    assert_eq!(held(), 1, "the second found the news pending: it holds the line off: {:?}", log());
+    for _ in 0..100 {
+        m.irq(5);
+    }
+    assert_eq!(held(), 1, "held once: {:?}", log());
+    // A receive on another notification lets nothing of this one go.
+    m.ok(S::Send, [FREE + 1, 0, 0, 0, 0, 0]);
+    m.ok(S::Recv, [FREE + 1, 1, 0, 0, 0, 0]);
+    assert_eq!(let_go(), 0);
+    m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 0b10);
+    assert_eq!((let_go(), m.k.line_held(5)), (1, false), "taking the news lets the line interrupt again");
+    // Heard and taken one at a time, it is never held.
+    let before = held();
+    for _ in 0..10 {
+        m.irq(5);
+        m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    }
+    assert_eq!(held(), before);
+    // Bound anew while held, the hold ends with the old binding.
+    m.irq(5);
+    m.irq(5);
+    assert_eq!(held(), before + 1);
+    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 5, FREE + 2, 0, 0, 0]);
+    assert!(!m.k.line_held(5));
+    m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    m.irq(5);
+    assert_eq!(held(), before + 1, "a hold of the old binding does not outlive it");
+    assert_eq!(let_go(), 1, "the new binding is not released twice");
+}
+
+/// A hold is its notification's: when the notification goes, no line stays
+/// held for it. (Before, a driver that let its line storm and then deleted
+/// the notification left the kernel's count of held lines above zero for
+/// good, and every receive on any notification of the machine walked all
+/// 192 lines from then on.)
+#[test]
+fn a_held_line_does_not_outlive_its_notification() {
+    let m = Machine::with_cpus(16, 1);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 5, FREE, 0, 0, 0]);
+    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 6, FREE, 0, 0, 0]);
+    for _ in 0..70 {
+        m.irq(5);
+        m.irq(6);
+    }
+    assert!(m.k.line_held(5) && m.k.line_held(6));
+    // One of them unbound: the other is still held, and let go by a receive.
+    m.ok(S::IrqBind, [silica_abi::root::SLOT_IRQS, 5, 0, 0, 0, 0]);
+    assert!(!m.k.line_held(5) && m.k.line_held(6));
+    m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
+    assert!(!m.k.line_held(6), "a line is still held off for a notification that is gone");
+}
+
+/// A watch is kept in its line's own entry: a driver can watch every line
+/// it holds, and no number of them takes another driver's. (Before, the
+/// kernel had sixteen watches for the machine and whoever asked first had
+/// them: the seventeenth `IrqWatch` was `NoMemory`, whoever made it.)
+#[test]
+fn watching_many_lines_takes_no_watch_from_anyone() {
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, SLOT_DEVICES, 15, 0x18 | 0x19 << 32, 0]);
+    m.retype(ut, T::Frame, 12, FREE + 2, 1);
+    let frame = m.cap(FREE + 2).unwrap().obj;
+    for line in 70..110u64 {
+        m.ok(S::IrqBind, [SLOT_IRQS, line, FREE, IRQ_MSI, FREE + 1, 0x18]);
+        m.ok(S::IrqWatch, [SLOT_IRQS, line, FREE + 2, (line - 70) * 4, 0xFFFF, 0]);
+    }
+    // Each still tells news from none: line 109's word changed, 70's not.
+    m.k.phys.write_val(frame + 39 * 4, &7u32);
+    m.irq(70);
+    assert_eq!(m.err(S::Recv, [FREE, 1, 0, 0, 0, 0]), Error::WouldBlock, "an interrupt with its word unchanged is no news");
+    m.irq(109);
+    m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    // Unwatched, a line's every interrupt is news again; the rest stay.
+    m.ok(S::IrqWatch, [SLOT_IRQS, 70, 0, 0, 0, 0]);
+    m.irq(70);
+    m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
+    m.irq(71);
+    assert_eq!(m.err(S::Recv, [FREE, 1, 0, 0, 0, 0]), Error::WouldBlock);
 }

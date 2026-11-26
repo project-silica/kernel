@@ -242,6 +242,17 @@ pub fn route(line: usize, mpidr: u64, level: bool) -> bool {
     true
 }
 
+/// Deliver device line `line`, routed already, to the processor with
+/// affinity `mpidr`: its routing register alone (GICD_IROUTER), one store.
+pub fn retarget(line: usize, mpidr: u64) -> bool {
+    let gicd = GICD.load(Ordering::Relaxed);
+    if gicd == 0 || !has_line(line) {
+        return false;
+    }
+    wr64(gicd + 0x6000 + (SPI_BASE as u64 + line as u64) * 8, affinity(mpidr));
+    true
+}
+
 /// Disable or enable device line `line`.
 pub fn mask(line: usize, masked: bool) {
     if line >= super::its::FIRST_LINE {

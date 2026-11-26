@@ -11,6 +11,8 @@
 
 mod cpu;
 mod gic;
+#[cfg(feature = "harness")]
+mod harness;
 mod its;
 mod smp;
 
@@ -20,7 +22,6 @@ use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cpu::{PerCpu, percpu};
-use kernel_core::ExitStatus;
 use kernel_core::Kernel;
 use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, Cmdline, PHYS_MAP_BASE, Region, RegionKind, RegionTable};
 use kernel_core::hal::Hal;
@@ -70,9 +71,6 @@ _start:
 
 /// The console UART's virtual address (0: none known).
 static UART: AtomicU64 = AtomicU64::new(0);
-/// The kernel was told a test harness listens for the exit status.
-static HARNESS: AtomicBool = AtomicBool::new(false);
-
 /// The console's lock, its bytes not yet sent (16 KiB), and when it must be
 /// fed again (`u64::MAX`: nothing waits): as on x86_64 (`serial.rs`), the
 /// UART is given what its FIFO takes and never waited for; every processor
@@ -137,23 +135,120 @@ struct Out;
 impl Write for Out {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         write_bytes(s.as_bytes());
+        record(s.as_bytes());
         Ok(())
     }
 }
 
-/// Stop this processor: tell a test harness the kernel failed, then wait.
-fn die() -> ! {
-    stop(ExitStatus::Failure)
+/// The crash record's region (`kernel_core::crash`, physical; 0: none), and
+/// this kernel's part in writing it. As on x86_64.
+static CRASH: AtomicU64 = AtomicU64::new(0);
+static RECORD: kernel_core::crash::Recorder = kernel_core::crash::Recorder::new();
+
+/// The crash record's region, mapped, when there is one.
+fn crash_region() -> Option<&'static mut [u8]> {
+    let at = CRASH.load(Ordering::Relaxed);
+    // SAFETY: the region the loader kept for the record, `REGION_BYTES`
+    // long, in the physical map; nothing else maps or uses it, and only the
+    // boot processor (at boot) or the first processor to panic touches it.
+    (at != 0)
+        .then(|| unsafe { core::slice::from_raw_parts_mut((PHYS_MAP_BASE + at) as *mut u8, kernel_core::crash::REGION_BYTES as usize) })
 }
 
-fn stop(status: ExitStatus) -> ! {
-    if HARNESS.load(Ordering::Relaxed) {
-        // Semihosting SYS_EXIT_EXTENDED, ADP_Stopped_ApplicationExit, with the
-        // status encoded as x86's debug-exit device reports it.
-        let block = [0x2_0026u64, (status.code() as u64) << 1 | 1];
-        // SAFETY: the call reads the two-word block and ends the emulation.
-        unsafe { asm!("hlt #0xf000", in("w0") 0x20u32, in("x1") block.as_ptr(), options(nostack)) }
+/// A panic begins its record: the console's last lines first.
+fn record_panic() {
+    RECORD.begin(crash_region(), |last| CONSOLE.recent(last));
+}
+
+/// What the panic says goes into its record as well.
+fn record(bytes: &[u8]) {
+    RECORD.say(crash_region, bytes);
+}
+
+/// The end of a panic: its record sealed, then the machine reset (PSCI, as
+/// the power capability's reset). Where the firmware has no PSCI the kernel
+/// stops with the record kept.
+fn after_panic() -> ! {
+    RECORD.seal(crash_region());
+    // A test image told that a harness listens stops for it to read.
+    #[cfg(feature = "harness")]
+    if harness::listens() {
+        die();
     }
+    let _ = write!(Out, "kernel: resetting the machine\r\n");
+    smp::system_reset();
+    die()
+}
+
+/// At boot: the last boot's crash record, if one survived, said on the
+/// console whole, kept for the root task (returned), and cleared.
+fn last_panic(at: u64) -> &'static [u8] {
+    struct Kept(core::cell::UnsafeCell<[u8; silica_abi::root::LAST_PANIC]>);
+    // SAFETY: written once by the boot processor before any other starts.
+    unsafe impl Sync for Kept {}
+    static KEPT: Kept = Kept(core::cell::UnsafeCell::new([0; silica_abi::root::LAST_PANIC]));
+    CRASH.store(at, Ordering::Relaxed);
+    let Some(region) = crash_region() else {
+        let _ = write!(Out, "kernel: no memory kept for a crash record: a panic halts this machine\r\n");
+        return &[];
+    };
+    // SAFETY: written once, by the boot processor, before the root task
+    // reads the copy the kernel makes of it.
+    let kept = unsafe { &mut *KEPT.0.get() };
+    RECORD.start(region, kept, |was, text| {
+        let _ = write!(Out, "kernel: the last boot (boot {was}) ended in a panic; its record:\r\n");
+        write_bytes(text);
+        let _ = write!(Out, "\r\nkernel: end of the last boot's record\r\n");
+    })
+}
+
+/// A panic is under way: a processor taking a kick stops for good.
+static PANICKING: AtomicBool = AtomicBool::new(false);
+/// Processors that stopped for the panic.
+static STOPPED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Stop every other processor (the kick SGI, which they take while a panic
+/// is under way as a stop), then say how many did, so the kernel's state is
+/// not changed further behind the panic. GICv3 without pseudo-NMIs has no
+/// interrupt that reaches a processor with interrupts masked: one spinning
+/// in the kernel with them off does not stop, and the count says so.
+fn stop_others() {
+    if PANICKING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let tpidr: u64;
+    // SAFETY: reading this processor's data pointer (0 before `install`).
+    unsafe { asm!("mrs {}, tpidr_el1", out(reg) tpidr, options(nomem, nostack, preserves_flags)) }
+    if tpidr == 0 {
+        return;
+    }
+    let me = percpu().index;
+    let mut others = 0;
+    for i in 0..kernel_core::smp::MAX_CPUS {
+        let Some(c) = cpu::percpu_of(i) else { break };
+        if i != me && c.online.load(Ordering::Acquire) {
+            gic::kick(c.mpidr.load(Ordering::Relaxed));
+            others += 1;
+        }
+    }
+    if others == 0 {
+        return;
+    }
+    // A bounded wait: each answers within microseconds if it can at all.
+    for _ in 0..50_000_000u64 {
+        if STOPPED.load(Ordering::Acquire) == others {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let _ = write!(Out, "kernel: {} of {others} other processors stopped\r\n", STOPPED.load(Ordering::Acquire));
+}
+
+/// Stop this processor for good (a test image first tells a listening
+/// harness that the kernel failed).
+fn die() -> ! {
+    #[cfg(feature = "harness")]
+    harness::exit(kernel_core::ExitStatus::Failure);
     loop {
         // SAFETY: masking interrupts and waiting change nothing else.
         unsafe { asm!("msr daifset, #0xf", "wfe", options(nomem, nostack)) }
@@ -393,24 +488,11 @@ fn backtrace(first: u64, mut fp: u64) {
     }
 }
 
-/// `panic=null`: reach a thread object through the null address, which must
-/// fault (physical page 0 is never mapped for the kernel), so the test sees
-/// a kernel exception with a backtrace through this function.
-#[inline(never)]
-fn deliberate_null_access(k: &'static Kernel<Arm>) -> ! {
-    let v = core::hint::black_box(k.regs(core::hint::black_box(0)))[0].get();
-    panic!("physical page 0 is mapped: read {v:#x} through a null object address");
-}
-
-#[inline(never)]
-fn deliberate_panic(cpu: usize) -> ! {
-    panic!("deliberate panic on processor {cpu}");
-}
-
 static SLIDE: AtomicU64 = AtomicU64::new(0);
 
 /// The kernel panicked: say why, show where, stop.
 pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    record_panic();
     let _ = write!(Out, "\r\nPANIC: {}\r\n", info.message());
     if let Some(l) = info.location() {
         let _ = write!(Out, "  at {}:{}\r\n", l.file(), l.line());
@@ -420,11 +502,13 @@ pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     // SAFETY: reads the program counter and the frame pointer.
     unsafe { asm!("adr {}, .", "mov {}, x29", out(reg) pc, out(reg) fp, options(nomem, nostack)) }
     backtrace(pc, fp);
-    die()
+    stop_others();
+    after_panic()
 }
 
 /// An exception taken in the kernel (the only kind there is so far).
 extern "C" fn kernel_fault(esr: u64, elr: u64, far: u64, entry: u64, fp: u64) -> ! {
+    record_panic();
     let _ = write!(
         Out,
         "\r\nPANIC: kernel exception through vector {} (syndrome {:#x}: class {:#x}) at {:#x}, address {:#x}\r\n  kernel slide {:#x}; backtrace (link addresses):\r\n",
@@ -436,7 +520,8 @@ extern "C" fn kernel_fault(esr: u64, elr: u64, far: u64, entry: u64, fp: u64) ->
         SLIDE.load(Ordering::Relaxed)
     );
     backtrace(elr, fp);
-    die()
+    stop_others();
+    after_panic()
 }
 
 // ---- the kernel's view of the machine ---------------------------------------
@@ -812,15 +897,26 @@ impl Hal for Arm {
             return;
         }
         gic::kick(them.mpidr.load(Ordering::Relaxed));
+        // Bounded as on x86_64: sent again after a second, then named.
+        let mut stall = kernel_core::smp::Stall::new();
+        let mut resent = false;
         while wait && them.mode.is_user() {
+            let now = self.now();
+            stall.turn(now, cpu, "entered the kernel when asked");
+            if !resent && stall.longer_than(now, 1_000_000_000) {
+                resent = true;
+                gic::kick(them.mpidr.load(Ordering::Relaxed));
+            }
             core::hint::spin_loop();
         }
     }
 
-    fn wait_left(&self, _cpu: usize, request: &kernel_core::lock::Leave) {
+    fn wait_left(&self, cpu: usize, request: &kernel_core::lock::Leave) {
         // Never asked here (`KERNEL_IN_ROOT` is false), but as on x86: it
         // answers while it waits for its lock.
+        let mut stall = kernel_core::smp::Stall::new();
         while !request.answered() {
+            stall.turn(self.now(), cpu, "left an address space being destroyed");
             core::hint::spin_loop();
         }
     }
@@ -849,6 +945,18 @@ impl Hal for Arm {
 
     fn irq_mask(&self, line: usize, masked: bool) {
         gic::mask(line, masked);
+    }
+
+    fn irq_hold(&self, line: usize, held: bool) {
+        // A level line is enabled again by its driver's acknowledgement only.
+        if held || !gic::is_level(line) {
+            gic::mask(line, held);
+        }
+    }
+
+    fn irq_move(&self, line: usize, cpu: usize) -> bool {
+        let Some(mpidr) = cpu::percpu_of(cpu).map(|c| c.mpidr.load(Ordering::Relaxed)) else { return false };
+        if line >= its::FIRST_LINE { its::retarget(line, cpu) } else { gic::retarget(line, mpidr) }
     }
 
     /// There is no I/O port space on aarch64; no port capability exists.
@@ -885,19 +993,17 @@ impl Hal for Arm {
     }
 
     fn power_off(&self, status: u64) {
-        let code = if status == 0 { ExitStatus::Success } else { ExitStatus::Failure };
-        if HARNESS.load(Ordering::Relaxed) {
-            stop(code);
-        }
+        #[cfg(feature = "harness")]
+        harness::exit(if status == 0 { kernel_core::ExitStatus::Success } else { kernel_core::ExitStatus::Failure });
+        let _ = status;
         // PSCI SYSTEM_OFF; it returns only if the firmware has no PSCI.
         smp::system_off();
     }
 
     fn reset(&self, status: u64) {
-        let code = if status == 0 { ExitStatus::Success } else { ExitStatus::Failure };
-        if HARNESS.load(Ordering::Relaxed) {
-            stop(code);
-        }
+        #[cfg(feature = "harness")]
+        harness::exit(if status == 0 { kernel_core::ExitStatus::Success } else { kernel_core::ExitStatus::Failure });
+        let _ = status;
         smp::system_reset();
     }
 }
@@ -911,6 +1017,24 @@ extern "C" fn user_trap(kind: u64) {
     // saved it (REG_BY_SVC).
     percpu().mode.enter_kernel();
     k.enter();
+    if kind == 2 {
+        // An SError from a program: its fault when the processor says the
+        // error was contained (as an x86 machine check in user mode is);
+        // the machine stops when nothing says so (`kernel_core::arm::serror`).
+        let esr: u64;
+        // SAFETY: reading the syndrome of this exception.
+        unsafe { asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack, preserves_flags)) }
+        match kernel_core::arm::serror(esr) {
+            kernel_core::arm::SError::Contained => k.fault(Fault::Exception, 0x2F, esr),
+            kernel_core::arm::SError::Corrected => {
+                let _ = write!(Out, "kernel: the processor corrected an error a program met (syndrome {esr:#x})\r\n");
+            }
+            kernel_core::arm::SError::Uncontainable => {
+                panic!("an SError a program met was not contained (syndrome {esr:#x}): the machine's state may be lost")
+            }
+        }
+        return;
+    }
     if kind != 0 {
         irq(true);
         return;
@@ -971,7 +1095,17 @@ fn irq(locked: bool) {
                     k.on_timer();
                 }
             }
-            gic::SGI_KICK => gic::end(id),
+            gic::SGI_KICK => {
+                gic::end(id);
+                // Another processor panicked: this one stops where it is.
+                if PANICKING.load(Ordering::Acquire) {
+                    STOPPED.fetch_add(1, Ordering::AcqRel);
+                    loop {
+                        // SAFETY: masking interrupts and waiting change nothing else.
+                        unsafe { asm!("msr daifset, #0xf", "wfe", options(nomem, nostack)) }
+                    }
+                }
+            }
             id if id >= gic::SPI_BASE => {
                 // An LPI is a message line; anything else a wire.
                 let line = its::line_of(id).unwrap_or((id - gic::SPI_BASE) as usize);
@@ -1027,10 +1161,15 @@ extern "C" fn kmain(info: u64) -> ! {
     // SAFETY: loader memory the physical map covers, read-only from here on.
     let cmdline = unsafe { core::slice::from_raw_parts((PHYS_MAP_BASE + bi.cmdline) as *const u8, bi.cmdline_len as usize) };
     let cmdline = Cmdline(cmdline);
-    HARNESS.store(cmdline.get("exit") == Some(b"semihosting"), Ordering::Relaxed);
+    #[cfg(feature = "harness")]
+    harness::words(cmdline);
     if let Some(uart) = spcr_uart(bi.rsdp).and_then(map_device) {
         UART.store(uart, Ordering::Relaxed);
     }
+    let last_panic = last_panic(bi.crash);
+    // Whether the firmware can reset the machine, known before anything
+    // can panic: a panic resets through it.
+    smp::detect_psci(bi.rsdp);
 
     // SAFETY: as for the command line.
     let regions = unsafe { core::slice::from_raw_parts((PHYS_MAP_BASE + bi.regions) as *const Region, bi.region_count as usize) };
@@ -1047,12 +1186,17 @@ extern "C" fn kmain(info: u64) -> ! {
         bi.kernel_slide
     );
     verify_stack(BOOT_STACK.0.get() as u64 + STACK_SIZE as u64);
-    if cmdline.get("panic") == Some(b"test") {
-        deliberate_panic(0);
+    // A test image's deliberate panic, once: a boot that follows a panic
+    // (its record is here) goes on, so its root task can be seen to be
+    // given the record.
+    #[cfg(feature = "harness")]
+    if last_panic.is_empty() {
+        harness::deliberate_early(cmdline);
     }
     let k = kernel();
-    if cmdline.get("panic") == Some(b"null") {
-        deliberate_null_access(k);
+    #[cfg(feature = "harness")]
+    if last_panic.is_empty() {
+        harness::deliberate(cmdline, k);
     }
     BOOT_CPU.kstack_top.store(BOOT_STACK.0.get() as u64 + STACK_SIZE as u64, Ordering::Relaxed);
     BOOT_CPU.mpidr.store(gic::my_affinity(), Ordering::Relaxed);
@@ -1144,9 +1288,19 @@ extern "C" fn kmain(info: u64) -> ! {
     let top = regions.last().map_or(0, |r| r.base + r.len).max(1 << width);
     let uart = spcr_uart(bi.rsdp).unwrap_or(0) & !0xFFF;
     let reserved = [(m.gicd, m.gicd + 0x1_0000), (m.gicr.0, m.gicr.0 + m.gicr.1), (uart, uart + 0x1000), (m.its, m.its + 0x2_0000)];
+    match kernel_core::boot::entropy_verdict(bi.entropy_sources, cmdline.get("entropy")) {
+        Err(why) => {
+            let _ = write!(Out, "{why}\r\n");
+            die();
+        }
+        Ok(Some(warning)) => {
+            let _ = write!(Out, "{warning}\r\n");
+        }
+        Ok(None) => {}
+    }
     // The other processors, started and counted (those that arrived)
     // before the root task is told how many there are.
-    let cpus = if cpus > 1 { smp::launch(cpus, cmdline.get("panic") == Some(b"secondary")) } else { 1 };
+    let cpus = if cpus > 1 { smp::launch(cpus) } else { 1 };
     k.set_cpu_count(cpus);
     let spec = RootSpec {
         regions,
@@ -1165,6 +1319,7 @@ extern "C" fn kmain(info: u64) -> ! {
         entropy_sources: bi.entropy_sources,
         cmdline: cmdline.0,
         cpus: cpus as u64,
+        last_panic,
     };
     if let Err(e) = k.boot_root(&spec) {
         let _ = write!(Out, "ERROR: kernel: cannot start the root task: {e:?}\r\n");

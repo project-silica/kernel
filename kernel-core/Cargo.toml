@@ -10,6 +10,13 @@ publish.workspace = true
 silica-abi = { path = "../abi" }
 silica-formats = { path = "../formats" }
 
+# What only a test image's kernel has: the counts a test reads (`Tally`).
+# The host tests are built with it (the crate as its own dev-dependency).
+[features]
+harness = []
+
+[dev-dependencies]
+kernel-core = { path = ".", features = ["harness"] }
 
 # The lock protocol is model-checked with loom (tests/loom_models.rs), built
 # only with RUSTFLAGS="--cfg loom".

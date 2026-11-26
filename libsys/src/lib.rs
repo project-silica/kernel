@@ -102,6 +102,18 @@ pub fn call(ep: Cap, info: MsgInfo, w: [u64; 4]) -> Result<Message> {
     sys(Syscall::Call, [ep.0, info.0, w[0], w[1], w[2], w[3]]).map(message)
 }
 
+/// [`call`], failing with `Timeout` if the reply has not come within
+/// `limit_ns` nanoseconds (rounded up to whole microseconds; at most some
+/// 35 minutes, beyond which it is that): whether the call still waits for a
+/// receiver or was received and waits for its answer. A reply sent after
+/// the limit goes nowhere. How a program calls one it trusts less than
+/// itself (a service calling a driver) without being held by it.
+pub fn call_within(ep: Cap, info: MsgInfo, w: [u64; 4], limit_ns: u64) -> Result<Message> {
+    let us = limit_ns.div_ceil(1000).clamp(1, (1 << 31) - 1);
+    let a0 = (ep.0 & silica_abi::CALL_SLOT) | us << silica_abi::CALL_TIMEOUT_SHIFT;
+    sys(Syscall::Call, [a0, info.0, w[0], w[1], w[2], w[3]]).map(message)
+}
+
 /// Send a message to an endpoint, waiting for a receiver; or signal a notification.
 pub fn send(to: Cap, info: MsgInfo, w: [u64; 4]) -> Result<()> {
     sys(Syscall::Send, [to.0, info.0, w[0], w[1], w[2], w[3]]).map(|_| ())
@@ -303,6 +315,18 @@ pub unsafe fn unmap(frame: Cap) -> Result<()> {
     sys(Syscall::Unmap, [frame.0, 0, 0, 0, 0, 0]).map(|_| ())
 }
 
+/// Remove every mapping in address space `space` (a capability with the
+/// write right) that overlaps the `len` bytes from `at`, each whole,
+/// whoever holds the frame: what a program does before it maps something
+/// where lent memory was. Returns how many mappings went.
+///
+/// # Safety
+/// Nothing the program still uses may be mapped in the range.
+#[allow(unsafe_code)]
+pub unsafe fn unmap_range(space: Cap, at: usize, len: usize) -> Result<u64> {
+    sys(Syscall::Unmap, [space.0, at as u64, len as u64, 0, 0, 0]).map(|r| r[0])
+}
+
 /// Be told when the capability in slot `watched` goes: whatever deletes it
 /// (its object's owner ending, a revocation of what it derives from, or
 /// this program's own delete) signals `notification` with `bits`, once.
@@ -337,17 +361,8 @@ pub fn thread_suspend(thread: Cap) -> Result<()> {
     sys(Syscall::ThreadControl, [thread.0, 0, 0, 0, 0, 0]).map(|_| ())
 }
 
-/// Move a thread to processor `cpu` (an index below `RootInfo::cpus`). It
-/// carries on there with what it was doing, so moving threads to balance
-/// load is invisible to them: a call waiting for its reply is answered
-/// there, a send or receive not yet delivered is made again there, and a
-/// suspended thread stays suspended. A thread may move itself. `InUse`
-/// while it is bound to a deadline context (which belongs to one processor).
-pub fn thread_set_cpu(thread: Cap, cpu: usize) -> Result<()> {
-    sys(Syscall::ThreadControl, [thread.0, 2, cpu as u64, 0, 0, 0]).map(|_| ())
-}
-
-/// Make a suspended thread runnable.
+/// Make a suspended thread runnable (`NoTime` for one bound to no
+/// scheduling context).
 pub fn thread_resume(thread: Cap) -> Result<()> {
     sys(Syscall::ThreadControl, [thread.0, 1, 0, 0, 0, 0]).map(|_| ())
 }
@@ -373,8 +388,9 @@ pub fn console_write(console: Cap, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Turn the machine off through a power capability, telling a test harness
-/// `status` (0: success). Returns only with the reason it could not.
+/// Turn the machine off through a power capability (`status`, 0: success, is
+/// what a test image's kernel tells a listening test harness instead).
+/// Returns only with the reason it could not.
 pub fn power_off(power: Cap, status: u64) -> Error {
     match sys(Syscall::PowerOff, [power.0, status, 0, 0, 0, 0]) {
         Ok(_) => Error::Unsupported,
@@ -382,7 +398,7 @@ pub fn power_off(power: Cap, status: u64) -> Error {
     }
 }
 
-/// Reset the machine (a test harness is told `status`). Returns only on
+/// Reset the machine (`status` as for [`power_off`]). Returns only on
 /// failure, with why.
 pub fn reboot(power: Cap, status: u64) -> Error {
     match sys(Syscall::PowerOff, [power.0, status, 1, 0, 0, 0]) {
@@ -453,6 +469,20 @@ pub fn device_attach(devices: Cap, device: u32, io_space: Cap) -> Result<()> {
     sys(Syscall::DeviceAttach, [devices.0, device as u64, io_space.0, 0, 0, 0]).map(|_| ())
 }
 
+/// [`device_attach`], and from now on every access of the space's devices
+/// the IOMMU refuses signals `faults` (a notification, write right; the
+/// last one given counts) and is counted in the space ([`inspect_io_space`]).
+pub fn device_attach_noting(devices: Cap, device: u32, io_space: Cap, faults: Cap) -> Result<()> {
+    sys(Syscall::DeviceAttach, [devices.0, device as u64, io_space.0, faults.0, 0, 0]).map(|_| ())
+}
+
+/// A device address space: how many devices are attached and how many of
+/// their accesses the IOMMU refused.
+pub fn inspect_io_space(space: Cap) -> Result<(u64, u64)> {
+    let r = sys(Syscall::Inspect, [space.0, 0, 0, 0, 0, 0])?;
+    Ok((r[1], r[2]))
+}
+
 /// From now on the device with identity `device` reaches no memory.
 pub fn device_detach(devices: Cap, device: u32) -> Result<()> {
     sys(Syscall::DeviceAttach, [devices.0, device as u64, 0, 0, 0, 0]).map(|_| ())
@@ -490,6 +520,8 @@ pub struct SlotInfo {
     pub badge: u64,
     /// Generations between this capability and the one it descends from.
     pub depth: u16,
+    /// An address space isolated against speculation (`ASPACE_ISOLATED`).
+    pub isolated: bool,
 }
 
 /// Whether a call is parked on `notification` (`recv_parking`), its caller
@@ -509,6 +541,7 @@ pub fn inspect_slot(space: Cap, index: u64) -> Result<Option<SlotInfo>> {
         object: r[3],
         badge: r[4],
         depth: r[5] as u16,
+        isolated: r[5] & silica_abi::INSPECT_ISOLATED != 0,
     }))
 }
 
@@ -527,20 +560,52 @@ pub struct ThreadInfo {
     pub waits_on: u64,
 }
 
+/// Where interrupt line `line` (of the interrupt-line capability `lines`)
+/// is routed (and, asked by a test image's program of its test kernel, how
+/// its deliveries went).
+pub fn inspect_irq(lines: Cap, line: u64) -> Result<IrqInfo> {
+    let r = sys(Syscall::Inspect, [lines.0, line, 0, 0, 0, 0])?;
+    Ok(IrqInfo {
+        cpu: r[0].checked_sub(1).map(|c| c as usize),
+        #[cfg(feature = "harness")]
+        delivered: r[1],
+        #[cfg(feature = "harness")]
+        from_afar: r[2],
+    })
+}
+
+/// What [`inspect_irq`] says of an interrupt line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IrqInfo {
+    /// The processor it is routed to (`None`: not bound). The kernel moves
+    /// a line to the processor of the thread waiting on its notification.
+    pub cpu: Option<usize>,
+    /// Interrupts it delivered since it was bound (a test image's kernel
+    /// counts them; one built for a machine does not).
+    #[cfg(feature = "harness")]
+    pub delivered: u64,
+    /// How many of them arrived on a processor other than their waiter's
+    /// and were delivered through every processor's lock.
+    #[cfg(feature = "harness")]
+    pub from_afar: u64,
+}
+
 /// The state of `thread`.
 pub fn inspect_thread(thread: Cap) -> Result<ThreadInfo> {
     let r = sys(Syscall::Inspect, [thread.0, 0, 0, 0, 0, 0])?;
     Ok(ThreadInfo { state: r[0], cpu: r[1] as usize, ip: r[2], sp: r[3], waits_on: r[4] })
 }
 
-/// Make `sc` a weighted fair share: threads bound to it share their
-/// processor with others in proportion to `weight` (an unbound thread
-/// weighs [`SCHED_DEFAULT_WEIGHT`]). A weight above the default needs
-/// `time`, a processor-time capability covering every processor
-/// (`root::SLOT_SCHED` or one narrowed from it; `Cap::NONE`: none, and
-/// `NoRights` for more than the default).
-pub fn sched_fair(sc: Cap, weight: u64, time: Cap) -> Result<()> {
-    sys(Syscall::SchedConfigure, [sc.0, SCHED_FAIR, weight, 0, 0, time.0]).map(|_| ())
+/// Make `sc` one fair share of processor `cpu`: among the fair contexts
+/// there it takes the processor in proportion to `weight`, and the
+/// threads bound to it divide that share equally, however many they are.
+/// What a parent gives each program it starts, so that no program's
+/// threads take more of a processor than one share. Needs `time`, a
+/// processor-time capability covering `cpu` (`root::SLOT_SCHED` or one
+/// narrowed from it; `NoRights` otherwise): a context made from memory
+/// alone is no time at all.
+pub fn sched_fair(sc: Cap, weight: u64, cpu: usize, time: Cap) -> Result<()> {
+    sys(Syscall::SchedConfigure, [sc.0, SCHED_FAIR, weight, 0, cpu as u64, time.0]).map(|_| ())
 }
 
 /// Make `sc` a reservation of `budget` nanoseconds in every `period` on
@@ -552,10 +617,16 @@ pub fn sched_deadline(sc: Cap, budget: u64, period: u64, cpu: usize, time: Cap) 
     sys(Syscall::SchedConfigure, [sc.0, SCHED_DEADLINE, budget, period, cpu as u64, time.0]).map(|_| ())
 }
 
-/// Run `thread` on the scheduling context `sc` (`Cap::NONE`: the default
-/// fair share). A deadline context must be on the thread's processor.
+/// Run `thread` on the scheduling context `sc` (readable), on that
+/// context's processor: a thread has no time, and cannot be started, until
+/// it is bound, and it leaves a context only for another. One taken to
+/// another processor carries on there with what it was doing, so moving
+/// threads is invisible to them: a call waiting for its reply is answered
+/// there, a send or receive not yet delivered is made again there, and a
+/// suspended thread stays suspended. A thread may bind itself. `NoTime`
+/// for a context nobody gave a processor's time.
 pub fn thread_bind(thread: Cap, sc: Cap) -> Result<()> {
-    sys(Syscall::ThreadControl, [thread.0, 3, sc.0, 0, 0, 0]).map(|_| ())
+    sys(Syscall::ThreadControl, [thread.0, 2, sc.0, 0, 0, 0]).map(|_| ())
 }
 
 /// A scheduling context, as [`inspect_sched`] reports it.
@@ -571,7 +642,7 @@ pub struct SchedInfo {
     pub remaining: u64,
     /// Nanoseconds charged to it so far.
     pub consumed: u64,
-    /// Deadline: its processor.
+    /// Its processor.
     pub cpu: usize,
 }
 

@@ -13,10 +13,11 @@
 //!   off it installs its MAIR, TCR and both roots, invalidates the TLB and
 //!   turns the MMU on, so no translation ever mixes the firmware's memory
 //!   attributes with Silica's.
-//! - Test status: a test harness (QEMU with semihosting) is told the exit
-//!   code through the semihosting exit call, with the same value encoding
-//!   as x86's debug-exit device; only when the command line asks for it,
-//!   because on hardware without a debugger the call is an exception.
+//! - Test status (test images only, the `harness` feature): a test harness
+//!   (QEMU with semihosting) is told the exit code through the semihosting
+//!   exit call, with the same value encoding as x86's debug-exit device;
+//!   only when the command line asks for it, because on hardware without a
+//!   debugger the call is an exception.
 
 use crate::efi;
 use core::arch::asm;
@@ -163,17 +164,20 @@ pub fn print(s: &str) {
     }
 }
 
-/// Report `code` and stop: through semihosting when `harness` says a test
-/// harness is listening, then wait for ever.
-pub fn stop(code: u8, harness: bool) -> ! {
-    if harness {
-        // SYS_EXIT_EXTENDED with ADP_Stopped_ApplicationExit; the status is
-        // encoded as x86's debug-exit device reports it, (code << 1) | 1.
-        let block = [0x2_0026u64, (code as u64) << 1 | 1];
-        // SAFETY: the semihosting call reads the two-word block and ends
-        // the emulation.
-        unsafe { asm!("hlt #0xf000", in("w0") 0x20u32, in("x1") block.as_ptr(), options(nostack)) }
-    }
+/// Tell a test harness `code` through semihosting (test images only, and
+/// only when the command line said one listens).
+#[cfg(feature = "harness")]
+pub fn tell(code: u8) {
+    // SYS_EXIT_EXTENDED with ADP_Stopped_ApplicationExit; the status is
+    // encoded as x86's debug-exit device reports it, (code << 1) | 1.
+    let block = [0x2_0026u64, (code as u64) << 1 | 1];
+    // SAFETY: the semihosting call reads the two-word block and ends
+    // the emulation.
+    unsafe { asm!("hlt #0xf000", in("w0") 0x20u32, in("x1") block.as_ptr(), options(nostack)) }
+}
+
+/// Wait for ever.
+pub fn halt() -> ! {
     loop {
         // SAFETY: waiting for an event changes nothing.
         unsafe { asm!("wfe", options(nomem, nostack)) }

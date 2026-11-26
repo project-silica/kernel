@@ -9,6 +9,8 @@
 
 mod cpu;
 mod fbcon;
+#[cfg(feature = "harness")]
+mod harness;
 mod ioapic;
 mod iommu;
 mod serial;
@@ -25,7 +27,7 @@ use kernel_core::hal::Hal;
 use kernel_core::mem::{Paddr, Phys};
 use kernel_core::root::RootSpec;
 use kernel_core::thread::FPU_OFFSET;
-use kernel_core::{ExitStatus, Kernel, klog};
+use kernel_core::{Kernel, klog};
 use silica_abi::Rights;
 
 const REG_RAX: usize = 0;
@@ -224,6 +226,9 @@ impl Hal for X86 {
     }
     fn io_release(&self, phys: &Phys, root: Paddr) {
         iommu::release(phys, root);
+    }
+    fn io_taken(&self, phys: &Phys, root: Paddr) {
+        iommu::taken(phys, root);
     }
     fn msi_first(&self) -> usize {
         ioapic::lines()
@@ -433,7 +438,8 @@ impl Hal for X86 {
 
     fn set_timer(&self, deadline: u64) {
         // No later than the console must be fed again (`serial::due`).
-        let tsc = self.tsc_at(deadline.min(serial::due()));
+        let deadline = deadline.min(serial::due());
+        let tsc = self.tsc_at(deadline);
         let per_ns = self.apic_per_ns.get();
         // Writing the timer leaves a virtual machine; writing what it holds
         // already (above all: disarming a timer that has fired, on every
@@ -621,14 +627,28 @@ impl Hal for X86 {
         // SAFETY: the x2APIC interrupt command register: a fixed interrupt
         // to one processor by its identifier.
         unsafe { wrmsr(0x830, (them.apic_id as u64) << 32 | KICK_VECTOR) };
+        // Bounded: a processor that never enters the kernel (its interrupt
+        // lost, or a firmware SMI holding it) is sent the kick once more
+        // after a second, then named (`kernel_core::smp::stalled`).
+        let mut stall = kernel_core::smp::Stall::new();
+        let mut resent = false;
         while wait && them.mode.is_user() {
+            let now = self.now();
+            stall.turn(now, cpu, "entered the kernel when asked");
+            if !resent && stall.longer_than(now, 1_000_000_000) {
+                resent = true;
+                // SAFETY: as above.
+                unsafe { wrmsr(0x830, (them.apic_id as u64) << 32 | KICK_VECTOR) };
+            }
             core::hint::spin_loop();
         }
     }
 
-    fn wait_left(&self, _cpu: usize, request: &kernel_core::lock::Leave) {
+    fn wait_left(&self, cpu: usize, request: &kernel_core::lock::Leave) {
         // It answers while it waits for its lock, which the caller holds.
+        let mut stall = kernel_core::smp::Stall::new();
         while !request.answered() {
+            stall.turn(self.now(), cpu, "left an address space being destroyed");
             core::hint::spin_loop();
         }
     }
@@ -659,6 +679,32 @@ impl Hal for X86 {
 
     fn irq_mask(&self, line: usize, masked: bool) {
         ioapic::mask(&kernel().phys, line, masked);
+    }
+
+    fn irq_hold(&self, line: usize, held: bool) {
+        if line < ioapic::lines() {
+            // A level line is unmasked by its driver's acknowledgement only.
+            if held || !ioapic::is_level(line) {
+                ioapic::mask(&kernel().phys, line, held);
+            }
+        } else {
+            // A message line: its remapping entry delivers to the discard
+            // vector while held. Without remapping the device holds the
+            // message and the kernel cannot hold it off.
+            iommu::hold(&kernel().phys, line, held);
+        }
+    }
+
+    fn irq_move(&self, line: usize, cpu: usize) -> bool {
+        let Some(apic) = cpu::percpu_of(cpu).map(|c| c.apic_id) else { return false };
+        // Remapped, every line (wire or message) is its remapping entry; a
+        // message line without remapping names its processor in the device,
+        // which only its driver writes.
+        if iommu::remapping() {
+            iommu::retarget(&kernel().phys, line, apic)
+        } else {
+            line < ioapic::lines() && ioapic::retarget(&kernel().phys, line, apic)
+        }
     }
 
     fn port_io(&self, port: u16, width: u8, write: bool, value: u32) -> u32 {
@@ -700,7 +746,9 @@ impl Hal for X86 {
     }
 
     fn power_off(&self, status: u64) {
-        harness_exit(status);
+        #[cfg(feature = "harness")]
+        harness::exit(status);
+        let _ = status;
         let Some(p) = power() else { return };
         let ([a, b], (ta, tb)) = (p.registers.pm1_control, p.s5);
         // The ports the firmware's FADT names for this; nothing the kernel
@@ -726,22 +774,16 @@ impl Hal for X86 {
     }
 
     fn reset(&self, status: u64) {
-        harness_exit(status);
-        if let Some((port, value)) = power().and_then(|p| p.registers.reset) {
-            serial::outb(port, value);
+        #[cfg(feature = "harness")]
+        harness::exit(status);
+        let _ = status;
+        if reset_register() {
             let t = rdtsc();
             while rdtsc() - t < self.tsc_hz.get() {
                 core::hint::spin_loop();
             }
         }
     }
-}
-
-/// QEMU's debug-exit device: a test harness learns the status from it. (On
-/// a machine without the device the write goes nowhere.)
-fn harness_exit(status: u64) {
-    let code = if status == 0 { kernel_core::ExitStatus::Success } else { kernel_core::ExitStatus::Failure }.code();
-    serial::outb(0xF4, code);
 }
 
 /// How to turn this machine off and reset it, read from its ACPI tables once
@@ -903,7 +945,24 @@ pub fn irq(vector: u64, locked: bool) {
             console_tick(k);
         }
         KICK_VECTOR => {}
-        iommu::FAULT_VECTOR => iommu::fault(&k.phys),
+        iommu::FAULT_VECTOR => {
+            let refused = iommu::fault(&k.phys, k.hal.now());
+            if refused.n != 0 {
+                // Whoever attached each device hears of it, through the
+                // kernel (which the idle wait has not entered).
+                let space_of = |sid| iommu::space_of(&k.phys, sid);
+                if locked {
+                    k.device_faults(&refused.sids[..refused.n], space_of);
+                } else {
+                    percpu().mode.enter_kernel();
+                    k.enter();
+                    k.device_faults(&refused.sids[..refused.n], space_of);
+                    percpu().mode.idle();
+                    k.leave();
+                }
+            }
+        }
+        iommu::DISCARD_VECTOR => iommu::discarded(),
         SPURIOUS_VECTOR => return,
         v if (ioapic::FIRST_VECTOR..ioapic::FIRST_VECTOR + silica_abi::IRQ_LINES).contains(&v) => {
             let line = (v - ioapic::FIRST_VECTOR) as usize;
@@ -960,12 +1019,92 @@ impl Write for Out {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         serial::write(s.as_bytes());
         fbcon::write(s.as_bytes());
+        record(s.as_bytes());
         Ok(())
     }
 }
 
+/// The crash record's region (`kernel_core::crash`, physical; 0: the loader
+/// could not keep one), and this kernel's part in writing it.
+static CRASH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RECORD: kernel_core::crash::Recorder = kernel_core::crash::Recorder::new();
+
+/// The crash record's region, mapped, when there is one.
+fn crash_region() -> Option<&'static mut [u8]> {
+    let at = CRASH.load(Ordering::Relaxed);
+    // SAFETY: the region the loader kept for the record, `REGION_BYTES`
+    // long, in the physical map; nothing else maps or uses it, and only the
+    // boot processor (at boot) or the one panicking processor (the others
+    // stopped) touches it.
+    (at != 0).then(|| unsafe { core::slice::from_raw_parts_mut(kernel().phys.ptr(at), kernel_core::crash::REGION_BYTES as usize) })
+}
+
+/// A panic begins its record: the console's last lines first.
+fn record_panic() {
+    RECORD.begin(crash_region(), serial::recent);
+}
+
+/// What the panic says goes into its record as well.
+fn record(bytes: &[u8]) {
+    RECORD.say(crash_region, bytes);
+}
+
+/// The end of a panic: its record sealed, then the machine reset, so that
+/// one nobody watches comes back and its next boot says why it went. The
+/// reset is the one the power capability makes (the register the firmware
+/// names); on a machine whose firmware names none the kernel stops here
+/// with the record kept, and the hardware watchdog the service manager
+/// armed is what resets it.
+fn after_panic() -> ! {
+    RECORD.seal(crash_region());
+    // A test image told that a harness listens stops for it to read.
+    #[cfg(feature = "harness")]
+    if harness::listens() {
+        die();
+    }
+    if power().is_some_and(|p| p.registers.reset.is_some()) {
+        let _ = write!(Out, "kernel: resetting the machine\r\n");
+        reset_register();
+    } else {
+        let _ = write!(Out, "kernel: the firmware names no reset register: stopped, the crash record kept for the boot after a reset\r\n");
+    }
+    die()
+}
+
+/// Write the reset register the firmware's FADT names (ACPI), if it names
+/// one: the machine resets a moment later.
+fn reset_register() -> bool {
+    let Some((port, value)) = power().and_then(|p| p.registers.reset) else { return false };
+    serial::outb(port, value);
+    true
+}
+
+/// At boot: the last boot's crash record, if one survived the reset, said
+/// on the console whole and kept for the root task (returned), and cleared;
+/// this boot's number taken.
+fn last_panic(at: u64) -> &'static [u8] {
+    struct Kept(core::cell::UnsafeCell<[u8; silica_abi::root::LAST_PANIC]>);
+    // SAFETY: written once by the boot processor before any other starts.
+    unsafe impl Sync for Kept {}
+    static KEPT: Kept = Kept(core::cell::UnsafeCell::new([0; silica_abi::root::LAST_PANIC]));
+    CRASH.store(at, Ordering::Relaxed);
+    let Some(region) = crash_region() else {
+        klog!(kernel(), "kernel: no memory kept for a crash record: a panic halts this machine");
+        return &[];
+    };
+    // SAFETY: written once, by the boot processor, before the root task
+    // reads the copy the kernel makes of it.
+    let kept = unsafe { &mut *KEPT.0.get() };
+    RECORD.start(region, kept, |was, text| {
+        let _ = write!(Out, "kernel: the last boot (boot {was}) ended in a panic; its record:\r\n");
+        serial::write(text);
+        let _ = write!(Out, "\r\nkernel: end of the last boot's record\r\n");
+    })
+}
+
 fn die() -> ! {
-    serial::outb(0xF4, ExitStatus::Failure.code());
+    #[cfg(feature = "harness")]
+    harness::exit(kernel_core::ExitStatus::Failure.code() as u64);
     loop {
         // SAFETY: stop this processor; interrupts are off.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) }
@@ -997,6 +1136,7 @@ fn backtrace(first: u64, mut rbp: u64) {
 /// The kernel panicked: say why, show where, stop.
 pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     stop_others();
+    record_panic();
     fbcon::panic();
     let _ = write!(Out, "\r\nPANIC: {}\r\n", info.message());
     if let Some(l) = info.location() {
@@ -1007,12 +1147,13 @@ pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     // SAFETY: reads the instruction and frame pointers.
     unsafe { asm!("lea {}, [rip]", "mov {}, rbp", out(reg) rip, out(reg) rbp, options(nomem, nostack)) }
     backtrace(rip, rbp);
-    die()
+    after_panic()
 }
 
 /// A processor exception in kernel mode: a kernel bug.
 pub fn kernel_fault(f: &cpu::KernelFrame) -> ! {
     stop_others();
+    record_panic();
     let cr2: u64;
     // SAFETY: reading CR2 in ring 0 has no side effect.
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) }
@@ -1028,7 +1169,7 @@ pub fn kernel_fault(f: &cpu::KernelFrame) -> ! {
         kernel().hal.slide.get()
     );
     backtrace(f.rip, f.gpr[6]);
-    die()
+    after_panic()
 }
 
 fn require(ok: bool, what: &str) {
@@ -1345,20 +1486,6 @@ pub(super) fn kernel_pte(phys: &Phys, vaddr: u64, level: u64) -> Option<*mut u64
     None
 }
 
-/// `panic=null`: reach a thread object through the null address, which must
-/// fault (physical page 0 is never mapped for the kernel), so the test sees
-/// a kernel exception with a backtrace through this function.
-#[inline(never)]
-fn deliberate_null_access(k: &'static Kernel<X86>) -> ! {
-    let v = core::hint::black_box(k.regs(core::hint::black_box(0)))[0].get();
-    panic!("physical page 0 is mapped: read {v:#x} through a null object address");
-}
-
-#[inline(never)]
-fn deliberate_panic() {
-    panic!("deliberate panic requested with panic=test");
-}
-
 /// Kernel entry from the boot stub, on the kernel stack, interrupts off.
 pub extern "C" fn kmain(info: u64) -> ! {
     let entered = rdtsc();
@@ -1407,7 +1534,9 @@ pub extern "C" fn kmain(info: u64) -> ! {
     }
     flush_all();
 
-    fbcon::init(&bi, &k.phys);
+    // SAFETY: loader memory, read-only during boot (as read below).
+    let firmware_regions = unsafe { core::slice::from_raw_parts(k.phys.ptr(bi.regions).cast::<Region>(), bi.region_count as usize) };
+    fbcon::init(&bi, &k.phys, firmware_regions);
     if !serial::present() {
         klog!(
             k,
@@ -1432,6 +1561,9 @@ pub extern "C" fn kmain(info: u64) -> ! {
         table.fill(from);
         (table, k.phys.bytes(bi.cmdline, bi.cmdline_len), k.phys.bytes(bi.ramdisk, bi.ramdisk_len))
     };
+    #[cfg(feature = "harness")]
+    harness::words(cmdline);
+    let last_panic = last_panic(bi.crash);
     // Physical page 0 is never an object (address 0 means "none" in the
     // kernel), so it is unmapped in the physical map: a kernel bug that
     // reaches an object through a null address faults at once, as on
@@ -1532,11 +1664,20 @@ pub extern "C" fn kmain(info: u64) -> ! {
             "WARNING: kernel: this processor is affected by Meltdown and Silica does not isolate kernel page tables; the owner accepted that any program can read all of memory (meltdown=accept)"
         );
     }
-    if Cmdline(cmdline).get("panic") == Some(b"test") {
-        deliberate_panic();
+    match kernel_core::boot::entropy_verdict(bi.entropy_sources, Cmdline(cmdline).get("entropy")) {
+        Err(why) => {
+            klog!(k, "{why}");
+            die();
+        }
+        Ok(Some(warning)) => klog!(k, "{warning}"),
+        Ok(None) => {}
     }
-    if Cmdline(cmdline).get("panic") == Some(b"null") {
-        deliberate_null_access(k);
+    // A test image's deliberate panic, once: a boot that follows a panic
+    // (its record is here) goes on, so its root task can be seen to be
+    // given the record.
+    #[cfg(feature = "harness")]
+    if last_panic.is_empty() {
+        harness::deliberate(cmdline, k);
     }
 
     // Nothing in the archive runs, the root task included, unless the whole
@@ -1569,6 +1710,7 @@ pub extern "C" fn kmain(info: u64) -> ! {
         entropy_sources: bi.entropy_sources,
         cmdline,
         cpus: cpus as u64,
+        last_panic,
     };
     if let Err(e) = k.boot_root(&spec) {
         klog!(k, "ERROR: kernel: cannot start the root task: {e:?}");
@@ -1636,7 +1778,8 @@ fn crc32c(state: u32, data: &[u8]) -> u32 {
 /// its own deadlines, and `set_timer` takes the console's into account).
 fn console_tick(k: &kernel_core::Kernel<X86>) {
     report_nmis(k);
-    serial::drain(k.hal.now());
+    let now = k.hal.now();
+    serial::drain(now);
     if serial::due() != u64::MAX {
         k.hal.set_timer(u64::MAX);
     }

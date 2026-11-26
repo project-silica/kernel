@@ -76,8 +76,40 @@ impl Blake2s {
         for (o, w) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
             o.copy_from_slice(&w.to_le_bytes());
         }
+        zero_words(&mut h);
+        zero(&mut buf);
         out
     }
+
+    /// Zero the state: what it holds of what was hashed (its last block,
+    /// which for a keyed hash or an HMAC is the key or the padded key) and
+    /// the chained value, as dropping it does.
+    fn forget(&mut self) {
+        zero_words(&mut self.h);
+        zero(&mut self.buf);
+        self.t = 0;
+        self.len = 0;
+    }
+}
+
+impl Drop for Blake2s {
+    /// A hash of a secret (a key, a MAC, the boot's entropy) leaves nothing
+    /// of it behind.
+    fn drop(&mut self) {
+        self.forget();
+    }
+}
+
+/// Overwrite `b` with zeros in a way the optimizer keeps.
+fn zero(b: &mut [u8]) {
+    b.fill(0);
+    core::hint::black_box(b);
+}
+
+/// [`zero`], for words.
+fn zero_words(w: &mut [u32]) {
+    w.fill(0);
+    core::hint::black_box(w);
 }
 
 impl Default for Blake2s {
@@ -122,11 +154,33 @@ fn compress(h: &mut [u32; 8], block: &[u8; 64], t: u64, last: bool) {
     for i in 0..8 {
         h[i] ^= v[i] ^ v[i + 8];
     }
+    // The message words and the working state are the block's, which may
+    // be a key.
+    zero_words(&mut m);
+    zero_words(&mut v);
 }
 
 #[cfg(test)]
 mod tests {
     use super::Blake2s;
+
+    /// A keyed hash (as HMAC and the boot secret's derivations use it)
+    /// holds its key in its last block until more comes, and the chained
+    /// value after: both are zero once it is done with (`forget`, which
+    /// its drop runs), and the digest is the same as before.
+    #[test]
+    fn its_key_and_state_are_zeroed_when_done_with() {
+        let mut s = Blake2s::keyed(&[0x5a; 32]);
+        assert_eq!(&s.buf[..32], &[0x5a; 32], "the key waits in the last block");
+        let digest = s.finish();
+        assert_ne!(digest, [0; 32]);
+        assert!(s.buf.contains(&0x5a) && s.h.iter().any(|w| *w != 0), "finish leaves the state as it was");
+        s.update(b"more than the key");
+        assert!(s.h.iter().any(|w| *w != 0));
+        s.forget();
+        assert!(s.buf.iter().all(|b| *b == 0) && s.h.iter().all(|w| *w == 0) && (s.t, s.len) == (0, 0));
+        assert_eq!(Blake2s::keyed(&[0x5a; 32]).finish(), digest, "wiping changes no digest");
+    }
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()

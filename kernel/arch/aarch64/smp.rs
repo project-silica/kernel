@@ -276,8 +276,7 @@ static ADMISSION: kernel_core::smp::Admission = kernel_core::smp::Admission::new
 /// they keep arriving (a second with none arriving ends it); a processor
 /// the firmware refused to start, or one that never arrived, is said and
 /// not counted.
-pub fn launch(slots: usize, panic_secondary: bool) -> usize {
-    PANIC_SECONDARY.store(panic_secondary, Ordering::Release);
+pub fn launch(slots: usize) -> usize {
     let entry_pa = image_phys(&raw const ap_entry as u64);
     let mut woken = 0;
     for slot in 1..slots {
@@ -312,7 +311,6 @@ pub fn launch(slots: usize, panic_secondary: bool) -> usize {
     cpus
 }
 
-static PANIC_SECONDARY: AtomicBool = AtomicBool::new(false);
 static GICR_REGION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// The redistributor region's physical address.
 pub static GICR_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
@@ -357,8 +355,9 @@ extern "C" fn ap_main(slot: usize) -> ! {
     // interrupts masked.
     unsafe { cpu::install(p) };
     super::verify_stack(p.kstack_top.load(Ordering::Relaxed));
-    if index == 1 && PANIC_SECONDARY.load(Ordering::Acquire) {
-        super::deliberate_panic(index);
+    #[cfg(feature = "harness")]
+    if index == 1 && super::harness::SECONDARY.load(Ordering::Acquire) {
+        super::harness::deliberate_panic(index);
     }
     super::reset_ttbr0(kernel().hal.empty_root());
     gic::init_processor(index, r);

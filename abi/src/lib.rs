@@ -23,8 +23,14 @@ pub mod root;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub enum Syscall {
-    /// `a0` endpoint, `a1` [`MsgInfo`], `a2..a5` message words 0..3. Sends
-    /// and blocks until the receiver replies. Returns the reply the same way.
+    /// `a0` endpoint (its low 32 bits), `a1` [`MsgInfo`], `a2..a5` message
+    /// words 0..3. Sends and blocks until the receiver replies. Returns the
+    /// reply the same way. Bits 32 to 62 of `a0` ([`CALL_TIMEOUT_SHIFT`]) are
+    /// the longest the whole call may take, in microseconds (0: no limit):
+    /// past it the call fails with `Timeout`, whether it still waits for a
+    /// receiver or was received and waits for its answer (which then goes
+    /// nowhere, as an answer to a caller that has gone does). How a program
+    /// calls one it trusts less than itself without being held by it.
     Call = 0,
     /// `a0` endpoint or notification, `a1` [`MsgInfo`], `a2..a5` words,
     /// `a0` bit 63 set: do not block. On a notification, ORs the capability's
@@ -89,7 +95,13 @@ pub enum Syscall {
     /// read it and `WRITE` write it; it must lie below the machine's
     /// `RootInfo::dma_top`.
     Map = 10,
-    /// `a0` frame. Removes this capability's mapping.
+    /// `a0` frame: removes this capability's mapping. Or `a0` an address
+    /// space (write), `a1` an address, `a2` a length in bytes: removes
+    /// every mapping in that space that overlaps the range, whole, whoever's
+    /// frame it is; returns how many in `a0`. What a program does before
+    /// it maps something new where lent memory was: a frame its lender
+    /// took back is unmapped already, but a page its supervisor mapped in
+    /// its place (`silica_rt::mem`) is not.
     Unmap = 11,
     /// `a0` thread (write), `a1` CapSpace, `a2` address space, `a3` fault
     /// endpoint, `a4` IPC buffer frame. [`KEEP`] leaves a field unchanged, 0
@@ -100,15 +112,20 @@ pub enum Syscall {
     /// otherwise, with nothing changed.
     ThreadConfigure = 12,
     /// `a0` thread, `a1` instruction pointer, `a2` stack pointer, `a3`
-    /// first argument, `a4` not 0: make the thread runnable.
+    /// first argument, `a4` not 0: make the thread runnable (`NoTime`, with
+    /// nothing changed, for a thread bound to no scheduling context: a new
+    /// thread has no time until its maker binds it, `ThreadControl`).
     ThreadStart = 13,
-    /// `a0` thread, `a1` 0 suspend, 1 resume, 2 move to processor `a2`
-    /// (it carries on there with what it was doing: a call waiting for its
-    /// reply is answered there, a send or receive not yet delivered is made
-    /// again there, a suspended thread stays suspended; `InUse` while it is
-    /// bound to a deadline context), 3 bind it to the SchedContext `a2`
-    /// (read; 0: unbind, back to the default fair share; a deadline context
-    /// must be on the thread's processor).
+    /// `a0` thread, `a1` 0 suspend, 1 resume (`NoTime` for a thread bound
+    /// to no context), 2 bind it to the SchedContext `a2` (read): from now
+    /// on it runs on that context's time, on that context's processor
+    /// (`NoTime` for a context nobody gave a processor's time). A thread
+    /// taken to another processor carries on there with what it was doing:
+    /// a call waiting for its reply is answered there, a send or receive
+    /// not yet delivered is made again there, a suspended thread stays
+    /// suspended. A thread leaves its context only for another; when a
+    /// context's last capability goes, its threads stop (suspended, bound
+    /// to nothing) until they are bound and resumed.
     ThreadControl = 14,
     /// `a0` port capability, `a1` port, `a2` width in bytes (1, 2, 4) with
     /// bit 8 set for a write, `a3` value. Returns `a0` value read.
@@ -137,7 +154,8 @@ pub enum Syscall {
     /// `a0` a CapSpace and `a1` a slot index: what that slot holds. Returns
     /// `a0` object type (0: empty), `a1` rights, `a2` size in bits, `a3` the
     /// object's identity (equal for capabilities to one object), `a4` badge,
-    /// `a5` depth in the derivation tree.
+    /// `a5` depth in the derivation tree (bits 0..16) and, from bit 16, whether an
+    /// address space is isolated against speculation (`INSPECT_ISOLATED`).
     /// `a0` a Thread and `a1` 0: returns `a0` state (the `THREAD_` values),
     /// `a1` processor, `a2` instruction pointer, `a3` stack pointer, `a4`
     /// the identity of what it waits on.
@@ -147,6 +165,12 @@ pub enum Syscall {
     /// at. `Unsupported` on a machine that confines DMA: there a device's
     /// addresses are the ones its driver mapped, and physical addresses are
     /// nobody's business.
+    /// `a0` an interrupt-line capability and `a1` a line it covers: returns
+    /// `a0` the processor the line is routed to plus one (0: not bound),
+    /// `a1` how many interrupts it delivered since it was bound, `a2` how
+    /// many of those arrived on a processor other than the one its waiter
+    /// runs on (each is delivered through every processor's lock, and the
+    /// kernel then moves the line to the waiter's processor).
     /// `a0` a SchedContext: returns `a0` class, `a1` weight (fair) or
     /// budget (deadline), `a2` period, `a3` budget left this period, `a4`
     /// nanoseconds charged to it so far, `a5` processor (deadline).
@@ -169,39 +193,44 @@ pub enum Syscall {
     Console = 19,
     /// `a0` power capability (the root task's [`root::SLOT_POWER`]), `a1`
     /// status (0: success), `a2` 0 to turn the machine off, 1 to reset it.
-    /// A test harness (QEMU's debug-exit device on x86_64, semihosting on
-    /// aarch64 with `exit=semihosting` on the kernel command line) is told
-    /// the status instead. Turning off is ACPI S5 on x86_64 (the FADT's
+    /// The status is for a test image: its kernel, told on its command line
+    /// that a test harness listens (`exit=port`, QEMU's debug-exit device,
+    /// on x86_64; `exit=semihosting` on aarch64), tells the harness the
+    /// status instead. A kernel built for a machine has neither word and
+    /// ignores the status. Turning off is ACPI S5 on x86_64 (the FADT's
     /// control registers and the DSDT's `\_S5` values) and PSCI SYSTEM_OFF
     /// on aarch64; resetting is the FADT's reset register on x86_64 and PSCI
     /// SYSTEM_RESET on aarch64. Returns `Unsupported` where the firmware
     /// describes no way to do it. Nothing is stopped or flushed first: that
     /// is the caller's business (the shutdown service's).
     PowerOff = 20,
-    /// `a0` SchedContext (write), `a1` class. [`SCHED_FAIR`]: `a2` weight
-    /// (1 to [`SCHED_MAX_WEIGHT`]; a thread with none weighs
-    /// [`SCHED_DEFAULT_WEIGHT`]): bound threads share the processor in
-    /// proportion to their weights. [`SCHED_DEADLINE`]: `a2` budget and `a3`
-    /// period in nanoseconds, `a4` processor: bound threads run before any
-    /// fair work, earliest deadline first, for `a2` of every `a3`, and are
-    /// held back once it is spent until the next period. `Overload` when the
-    /// processor's reservations would take more than 90% of it. `InUse` to
-    /// change the class, or a deadline context's processor, while threads
-    /// are bound to it.
+    /// `a0` SchedContext (write), `a1` class, `a4` processor, `a5` a
+    /// processor-time capability covering `a4` (write;
+    /// [`root::SLOT_SCHED`] or one narrowed from it to a range of
+    /// processors). Processor time is authority, as memory is: a context
+    /// is time on one processor, given by whoever holds that processor's
+    /// time. A context made from memory alone is none: nothing bound to it
+    /// runs, and no thread runs without one. `NoRights` without the
+    /// capability, `WrongType` for one that is not processor time.
     ///
-    /// Processor time is authority, as memory is: `a5` is a processor-time
-    /// capability (write; [`root::SLOT_SCHED`] or one narrowed from it to
-    /// a range of processors), or 0 for none. Without one a context may be
-    /// configured fair with at most [`SCHED_DEFAULT_WEIGHT`]: memory buys a
-    /// share no better than a thread without a context has. A greater
-    /// weight needs one covering every processor (a fair thread runs
-    /// wherever it is moved); a reservation, one covering `a4`. `NoRights`
-    /// otherwise, `WrongType` for a capability that is not processor time.
+    /// [`SCHED_FAIR`]: `a2` weight (1 to [`SCHED_MAX_WEIGHT`]): one share
+    /// of the processor, which the context takes among the other fair
+    /// contexts there in proportion to its weight and divides equally among
+    /// the threads bound to it, so a program's threads take one share
+    /// however many it makes. [`SCHED_DEADLINE`]: `a2` budget and `a3`
+    /// period in nanoseconds: bound threads run before any fair work,
+    /// earliest deadline first, for `a2` of every `a3`, and are held back
+    /// once it is spent until the next period. `Overload` when the
+    /// processor's reservations would take more than 90% of it. `InUse` to
+    /// change the class or the processor while threads are bound to it.
     SchedConfigure = 21,
     /// `a0` device-identity capability, `a1` a device's identity (its PCI
     /// segment, bus, device and function: `segment << 16 | bus << 8 |
     /// device << 3 | function`), `a2` an address space made for devices
-    /// ([`ASPACE_IO`]; write), or 0. From now on the device reaches exactly
+    /// ([`ASPACE_IO`]; write), or 0. With `a3` a notification (write; 0: none,
+    /// or keep the last one given), every access of the space's devices the
+    /// IOMMU refuses signals it, and the space counts them (`Inspect` of the
+    /// space: io, devices attached, refused accesses). From now on the device reaches exactly
     /// the frames mapped in that address space, at the addresses they are
     /// mapped at, and nothing else; with 0 it reaches nothing, which is how
     /// every device starts and what it returns to when the address space is
@@ -239,8 +268,8 @@ pub enum Syscall {
     /// line, or destroying the notification or the CapSpace, ends it. The word is watched by
     /// the processor of the calling thread: call it from the thread that
     /// bound the line, which is where the line is delivered. `BadArg` for a line that
-    /// is a wire or not bound, a word outside the frame, or a mask of 0;
-    /// `NoMemory` when the kernel's watches ([`IRQ_WATCHES`]) are all in use.
+    /// is a wire or not bound, a word outside the frame, or a mask of 0. A
+    /// watch is kept with its line: every line a driver holds can be watched.
     IrqWatch = 24,
     /// `a0` interrupt-line capability, `a1` a line watched with `IrqWatch`,
     /// `a2` a Frame (writable), `a3` the offset of a 32-bit word in it (a
@@ -273,9 +302,6 @@ pub enum Syscall {
     /// badged notification; `SlotFull` when `a2` is not empty.
     CapNotice = 26,
 }
-
-/// Interrupt lines that can be watched (`IrqWatch`) at once.
-pub const IRQ_WATCHES: usize = 16;
 
 impl Syscall {
     /// One past the highest syscall number.
@@ -336,6 +362,10 @@ pub const ASPACE_IO: u64 = 1 << 8;
 /// into and out of them a few microseconds, and others nothing. Not with
 /// [`ASPACE_IO`].
 pub const ASPACE_ISOLATED: u64 = 1 << 9;
+/// `Inspect` of a slot: set in `a5` when the slot holds an address space
+/// isolated against speculation (`ASPACE_ISOLATED`), so an owner can see
+/// which programs are.
+pub const INSPECT_ISOLATED: u64 = 1 << 16;
 /// `Console`: more of the same text follows this piece (bit 63 of `a1`).
 pub const CONSOLE_MORE: u64 = 1 << 63;
 
@@ -352,6 +382,10 @@ pub const THREAD_SENDING: u64 = 2;
 pub const THREAD_RECEIVING: u64 = 3;
 /// `Inspect` thread state: waiting for the answer to a call (or to a fault).
 pub const THREAD_REPLY: u64 = 4;
+/// `Inspect` thread state: waiting to make a system call again that would
+/// take every processor's lock, while its processor has used up its share
+/// of the machine's time spent so (the kernel's `Kernel::throttled`).
+pub const THREAD_THROTTLED: u64 = 5;
 
 /// `Recv`, `ReplyRecv`: the notification to listen on while receiving on an
 /// endpoint is named in `a0` from this bit up (31 bits).
@@ -360,6 +394,11 @@ pub const LISTEN_SHIFT: u32 = 32;
 pub const KEEP: u64 = u64::MAX;
 /// `Send`: flag in `a0` asking not to block.
 pub const NONBLOCK: u64 = 1 << 63;
+/// `Call`: the call's time limit, in microseconds, is in `a0` from this
+/// bit up (31 bits, about 35 minutes; 0: none).
+pub const CALL_TIMEOUT_SHIFT: u32 = 32;
+/// `Call`: the bits of `a0` that name the endpoint.
+pub const CALL_SLOT: u64 = (1 << CALL_TIMEOUT_SHIFT) - 1;
 
 /// The kernel object types (`spec/ARCHITECTURE.md` section 6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,12 +477,13 @@ pub const THREAD_BITS: u8 = 12;
 /// Size of an Endpoint or Notification in bits.
 pub const ENDPOINT_BITS: u8 = 6;
 /// Size in bits of a SchedContext object.
-pub const SCHED_BITS: u8 = 7;
-/// `SchedConfigure` class: weighted fair share.
+pub const SCHED_BITS: u8 = 8;
+/// `SchedConfigure` class: one weighted fair share of a processor.
 pub const SCHED_FAIR: u64 = 0;
 /// `SchedConfigure` class: a deadline reservation.
 pub const SCHED_DEADLINE: u64 = 1;
-/// The weight of a thread with no scheduling context, and of a new one.
+/// The weight shares are measured against: the root task's own context
+/// has it, and a service manager gives it to each service.
 pub const SCHED_DEFAULT_WEIGHT: u64 = 1024;
 /// The largest weight.
 pub const SCHED_MAX_WEIGHT: u64 = 1 << 20;
@@ -528,6 +568,9 @@ pub enum Error {
     /// The processor's time is already promised: a deadline reservation
     /// would take more than the share deadline work may have.
     Overload = 17,
+    /// The thread is bound to no scheduling context, or the context was
+    /// given no processor's time: nothing runs on time nobody granted.
+    NoTime = 18,
 }
 
 impl Error {
@@ -551,6 +594,7 @@ impl Error {
             15 => Error::Unsupported,
             16 => Error::TooDeep,
             17 => Error::Overload,
+            18 => Error::NoTime,
             _ => Error::BadSyscall,
         })
     }

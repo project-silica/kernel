@@ -13,8 +13,10 @@ macro_rules! ctor {
     };
 }
 
+pub mod arm;
 pub mod boot;
 pub mod cap;
+pub mod crash;
 /// The image format readers (their own crate, shared with the loader and userspace).
 pub use silica_formats::{acpi, elf, ramdisk};
 #[cfg(test)]
@@ -25,11 +27,13 @@ pub mod kernel;
 pub mod lock;
 pub mod log;
 pub mod mem;
+mod order;
 #[cfg(kani)]
 mod proofs;
 pub mod root;
 pub mod sched;
 pub mod smp;
+mod tally;
 pub mod thread;
 pub mod untyped;
 pub mod vm;

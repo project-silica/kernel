@@ -56,6 +56,23 @@ fn root_task_starts_with_documented_layout() {
     assert!(m.k.translate(asp, 0x60_3000).is_none());
 }
 
+/// The root task's own memory comes from the smallest aligned block that
+/// holds it, so the large blocks a big service needs stay whole. Taken from
+/// the lowest aligned address of memory that starts on a 64 MiB boundary
+/// (an aarch64 machine's), it split that block, and on a 256 MB machine the
+/// device manager could not be given its 64 MiB.
+#[test]
+fn the_root_task_leaves_the_largest_blocks_whole() {
+    // Usable: a 64 MiB block at 64 MiB, a 128 MiB one at 128 MiB, an 8 MiB
+    // one at 256 MiB and less than 1 MiB after it.
+    let m = Machine::with_usable_from(264, 64 << 20);
+    let big: Vec<_> = m.untyped().into_iter().filter(|(_, d)| d.kind == KIND_RAM && d.bits >= 26).map(|(_, d)| (d.base, d.bits)).collect();
+    assert_eq!(big, [(64 << 20, 26), (128 << 20, 27)], "a block of 64 MiB or more was split");
+    // And when only the large blocks are there, it still starts.
+    let m = Machine::with_usable_from(256, 64 << 20);
+    assert!(m.untyped().iter().any(|(_, d)| d.kind == KIND_RAM && d.bits == 27));
+}
+
 #[test]
 fn bad_syscalls_and_capabilities_are_errors() {
     let m = Machine::new(16);
@@ -272,8 +289,8 @@ fn an_address_space_is_reused_only_after_every_processor_has_left_it() {
     // A thread in it, moved to processor 1 and running there.
     m.retype(ut, T::Thread, 0, FREE + 2, 1);
     m.ok(S::ThreadConfigure, [FREE + 2, SLOT_CAPSPACE, FREE + 1, 0, 0, 0]);
+    m.move_to(FREE + 2, 1);
     m.ok(S::ThreadStart, [FREE + 2, 0x40_0000, 0, 0, 1, 0]);
-    m.ok(S::ThreadControl, [FREE + 2, 2, 1, 0, 0, 0]);
     m.settle(1);
     assert_eq!(m.k.hal.roots[1].get(), root, "processor 1 runs on the new address space");
     // Processor 0 destroys it, then builds a new one in the same memory.
@@ -436,7 +453,7 @@ fn time_slices_rotate_runnable_threads() {
     m.ok(S::ThreadControl, [FREE, 1, 0, 0, 0, 0]);
     assert_eq!(m.k.thread_view(t).state, RUNNABLE);
     assert_eq!(m.err(S::ThreadControl, [FREE, 9, 0, 0, 0, 0]), Error::BadArg);
-    assert_eq!(m.err(S::ThreadControl, [FREE, 2, 1, 0, 0, 0]), Error::BadArg, "there is no processor 1");
+    assert_eq!(m.err(S::ThreadControl, [FREE, 2, 0, 0, 0, 0]), Error::BadCap, "binding takes a scheduling context");
     assert_eq!(m.err(S::ThreadStart, [FREE, 0xFFFF_8000_0000_0000, 0, 0, 1, 0]), Error::BadArg);
 }
 
@@ -479,7 +496,7 @@ fn fault_is_delivered_as_a_call_and_the_reply_decides() {
 }
 
 #[test]
-fn fault_without_an_endpoint_stops_the_thread_and_is_logged() {
+fn fault_without_an_endpoint_stops_the_thread_and_only_the_root_tasks_is_said() {
     let m = Machine::new(16);
     let (ut, _) = m.big_untyped();
     let t = m.spawn(ut, FREE);
@@ -491,8 +508,11 @@ fn fault_without_an_endpoint_stops_the_thread_and_is_logged() {
     m.k.schedule();
     assert_eq!(m.k.thread_view(t).state, INACTIVE);
     assert_eq!(m.k.current(), m.root);
-    let log = String::from_utf8_lossy(&m.k.hal.console.borrow()).into_owned();
-    assert!(log.contains("Exception fault") && log.contains("no fault endpoint"), "{log}");
+    let log = || String::from_utf8_lossy(&m.k.hal.console.borrow()).into_owned();
+    assert!(!log().contains("no fault endpoint"), "a program's fault on the kernel's console: {}", log());
+    // The root task's first thread is nobody's to hold: the kernel says it.
+    m.k.fault(Fault::Exception, 0, 13);
+    assert!(log().contains("Exception fault") && log().contains("no fault endpoint"), "{}", log());
 }
 
 #[test]
@@ -509,6 +529,7 @@ fn thread_configure_validates_before_changing_anything() {
     assert_eq!(m.k.view(m.k.thread_view(t).slots[3]).unwrap().cap.ty, T::Frame);
     m.ok(S::ThreadConfigure, [FREE, 0, KEEP, KEEP, KEEP, 0]);
     assert!(m.k.view(m.k.thread_view(t).slots[0]).is_none());
+    m.move_to(FREE, 0);
     // A thread without a CapSpace gets BadCap for everything.
     m.ok(S::ThreadStart, [FREE, 0x40_0000, 0, 0, 1, 0]);
     let r = m.sys_as(t, S::Send, [FREE, 0, 0, 0, 0, 0]);
@@ -689,7 +710,7 @@ fn two_processors() -> (Machine, u64) {
     m.retype(ut, T::Endpoint, 0, FREE, 1);
     m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 15, 77, 0]);
     let t = m.spawn(ut, FREE + 2);
-    m.ok(S::ThreadControl, [FREE + 2, 2, 1, 0, 0, 0]);
+    m.move_to(FREE + 2, 1);
     assert_eq!(m.k.thread_view(t).state, RUNNABLE, "a moved runnable thread stays runnable");
     assert_eq!(m.k.hal.kicks.borrow().last(), Some(&(1, false)), "the other processor is told it has work");
     m.settle(1);
@@ -710,7 +731,7 @@ fn a_thread_moved_while_it_waits_for_a_reply_is_answered_on_its_new_processor() 
     m.settle(0);
     assert_eq!((m.k.current(), m.arg(m.root, 2)), (m.root, 10));
     // Moved while it waits: still waiting, now on processor 0.
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     let v = m.k.thread_view(t);
     assert_eq!((v.state, v.cpu), (REPLY, 0), "the call survives the move");
     // The answer reaches it there.
@@ -728,7 +749,7 @@ fn a_thread_moved_while_it_waits_to_receive_makes_its_receive_again_there() {
     assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
     let ip = m.k.regs(t)[0].get();
     m.on(0);
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     let v = m.k.thread_view(t);
     assert_eq!((v.state, v.cpu, v.blocked_on), (RUNNABLE, 0, 0), "off the endpoint, runnable on its new processor");
     assert_eq!(m.k.regs(t)[0].get(), ip - 2, "set to make the same system call again");
@@ -753,7 +774,7 @@ fn a_server_stopped_in_reply_recv_after_replying_only_receives_when_it_runs_agai
     assert_eq!((m.k.current(), m.status(m.root), m.arg(m.root, 2)), (m.root, 0, 11));
     // Stopped there (here: moved), the reply is not made again: what runs
     // again is the receive.
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     let r = m.k.regs(t);
     assert_eq!(r[0].get(), ip - 2);
     assert_eq!((r[3].get(), m.arg(t, 0), m.arg(t, 1), m.arg(t, 2)), (S::Recv as u64, FREE, 0, 0));
@@ -772,7 +793,7 @@ fn a_signal_recv_made_again_only_receives() {
     m.ok(S::Recv, [FREE + 3, 1, 0, 0, 0, 0]);
     assert_eq!(m.arg(m.root, 0), 1, "signalled once");
     // Moved while it waits, its call is made again: as a receive alone.
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     let r = m.k.regs(t);
     assert_eq!((r[0].get(), r[3].get(), m.arg(t, 0)), (ip - 2, S::Recv as u64, FREE));
     assert_eq!(m.arg(t, 3), FREE + 3, "the notification is still in its registers");
@@ -825,11 +846,12 @@ fn a_suspended_thread_moved_stays_suspended_and_a_thread_may_move_itself() {
     let (m, t) = two_processors();
     m.on(0);
     m.ok(S::ThreadControl, [FREE + 2, 0, 0, 0, 0, 0]);
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     let v = m.k.thread_view(t);
     assert_eq!((v.state, v.cpu), (INACTIVE, 0));
     // The root moves itself to processor 1 and carries on there.
-    let r = m.raw(S::ThreadControl as u64, [SLOT_THREAD, 2, 1, 0, 0, 0]);
+    let time = m.time_on(1);
+    let r = m.raw(S::ThreadControl as u64, [SLOT_THREAD, 2, time, 0, 0, 0]);
     assert_eq!(r.status, 0);
     assert_ne!(m.k.current(), m.root, "processor 0 no longer runs it");
     let v = m.k.thread_view(m.root);
@@ -870,7 +892,7 @@ fn a_receive_timing_out_on_a_queue_another_processor_owns_takes_every_lock() {
     let (ut, _) = m.big_untyped();
     m.spawn(ut, FREE + 3);
     m.spawn(ut, FREE + 4);
-    m.ok(S::ThreadControl, [FREE + 4, 2, 1, 0, 0, 0]);
+    m.move_to(FREE + 4, 1);
     m.ok(S::ThreadControl, [FREE + 4, 1, 0, 0, 0, 0]);
     m.settle(1);
     assert_eq!(m.k.current(), t);
@@ -908,7 +930,7 @@ fn a_call_is_parked_on_a_notification_last_used_from_a_third_processor() {
     m.retype(ut, T::Notification, 0, FREE + 9, 1);
     let place = |slot: u64, cpu: u64| {
         let t = m.spawn(ut, slot);
-        m.ok(S::ThreadControl, [slot, 2, cpu, 0, 0, 0]);
+        m.move_to(slot, cpu);
         m.ok(S::ThreadControl, [slot, 1, 0, 0, 0, 0]);
         m.settle(cpu as usize);
         assert_eq!(m.k.current(), t);
@@ -952,7 +974,7 @@ fn calls_between_threads_of_one_processor_take_only_that_processors_lock() {
     // A second endpoint served and called on processor 1 only.
     m.retype(ut, T::Endpoint, 0, FREE + 5, 1);
     let c = m.spawn(ut, FREE + 6);
-    m.ok(S::ThreadControl, [FREE + 6, 2, 1, 0, 0, 0]);
+    m.move_to(FREE + 6, 1);
     m.ok(S::ThreadControl, [FREE + 6, 1, 0, 0, 0, 0]);
     m.on(1);
     // The first wait gives the endpoint to processor 1 (a global step).
@@ -1186,7 +1208,7 @@ fn an_interrupt_line_signals_the_notification_it_is_bound_to() {
     assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "unmask 5");
     // A waiter on another processor is woken there.
     let t = m.spawn(ut, FREE + 3);
-    m.ok(S::ThreadControl, [FREE + 3, 2, 1, 0, 0, 0]);
+    m.move_to(FREE + 3, 1);
     m.ok(S::ThreadControl, [FREE + 3, 1, 0, 0, 0, 0]);
     m.settle(1);
     assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
@@ -1200,6 +1222,71 @@ fn an_interrupt_line_signals_the_notification_it_is_bound_to() {
     assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "mask 5");
     m.irq(5);
     assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "mask 5");
+}
+
+/// An interrupt line is delivered where the thread waiting on its
+/// notification runs, and follows it when it moves. Before (the 2026-11-24
+/// audit), a line went to the processor of whoever bound it, for good: a
+/// driver whose thread ran elsewhere, or was moved, had every interrupt
+/// taken on the old processor and delivered through every processor's lock.
+#[test]
+fn an_interrupt_line_follows_the_thread_waiting_on_it() {
+    let m = Machine::with_cpus(16, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    // A driver's thread waits on processor 1; the line is bound from 0.
+    let t = m.spawn(ut, FREE + 3);
+    m.move_to(FREE + 3, 1);
+    m.settle(1);
+    assert_eq!(m.k.current(), t);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(0);
+    m.ok(S::IrqBind, [SLOT_IRQS, 5, FREE, 0, 0, 0]);
+    assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "route 5 cpu1 level=false low=false", "bound where its waiter is");
+    let stat = |m: &Machine| {
+        m.on(0);
+        m.ok(S::Inspect, [SLOT_IRQS, 5, 0, 0, 0, 0]);
+        [m.arg(m.root, 0), m.arg(m.root, 1), m.arg(m.root, 2)]
+    };
+    assert_eq!(stat(&m), [2, 0, 0], "routed to processor 1, nothing delivered yet");
+    // Delivered there under that processor's lock alone.
+    m.on(1);
+    let globals = m.k.global_entries();
+    m.irq(5);
+    assert_eq!(m.k.global_entries(), globals, "an interrupt on its waiter's processor took every lock");
+    assert_eq!(m.k.thread_view(t).state, RUNNABLE);
+    m.settle(1);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    // The thread is moved to processor 0 and waits there again.
+    m.on(0);
+    m.move_to(FREE + 3, 0);
+    m.ok(S::Yield, [0; 6]);
+    assert_eq!(m.k.current(), t);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    assert_eq!(m.k.thread_view(t).cpu, 0);
+    // The next interrupt still arrives where the line was: it reaches its
+    // waiter through every lock once, and the line moves to processor 0.
+    m.on(1);
+    let globals = m.k.global_entries();
+    m.irq(5);
+    assert_eq!(m.k.global_entries(), globals + 1);
+    assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "move 5 cpu0", "the line did not follow its waiter");
+    assert_eq!(stat(&m), [1, 2, 1], "routed to processor 0; two delivered, one of them from afar");
+    // From then on it is delivered there alone.
+    m.settle(0);
+    m.on(0);
+    if m.k.current() == t {
+        assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    }
+    let globals = m.k.global_entries();
+    m.irq(5);
+    assert_eq!(m.k.global_entries(), globals, "after following its waiter, the line still took every lock");
+    assert_eq!(stat(&m), [1, 3, 1]);
+    // Unbound, it is routed nowhere; a line outside the capability is refused.
+    m.ok(S::IrqBind, [SLOT_IRQS, 5, 0, 0, 0, 0]);
+    assert_eq!(stat(&m)[0], 0);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 4, SLOT_IRQS, 15, 4 | 6 << 32, 0]);
+    assert_eq!(m.err(S::Inspect, [FREE + 4, 6, 0, 0, 0, 0]), Error::BadArg);
 }
 
 #[test]
@@ -1712,7 +1799,7 @@ fn a_server_loop_replies_receives_and_hears_interrupts_in_one_call() {
     m.settle(1);
     assert!(m.raw(S::Recv as u64, [listening(ep, n), 0, 0, 0, 0, 0]).blocked);
     m.on(0);
-    m.ok(S::ThreadControl, [FREE + 2, 2, 0, 0, 0, 0]);
+    m.move_to(FREE + 2, 0);
     m.ok(S::Send, [n + 1, 0, 0, 0, 0, 0]);
     let r = m.sys_as(t, S::Recv, [listening(ep, n), 0, 0, 0, 0, 0]);
     assert!(!r.blocked);
@@ -1846,4 +1933,94 @@ fn a_notice_is_signalled_once_whenever_its_capability_goes_and_never_otherwise()
     assert_eq!(m.err(S::CapNotice, [notice, n, FREE + 12, 1, 0, 0]), Error::InUse, "a notice is not watched");
     assert_eq!(m.err(S::CapCopy, [SLOT_CAPSPACE, FREE + 12, notice, 15, 0, 0]), Error::InUse, "a notice is not copied");
     assert_eq!(pending(), 0, "nothing signalled by any refusal");
+}
+
+/// `Call` with a time limit (`a0` bits 32 to 62, microseconds): a call
+/// nobody answers in time fails with `Timeout`, wherever it waits; the
+/// server's late answer goes nowhere; the limit follows a moved caller;
+/// an answer in time is unchanged. How a service calls a driver it trusts
+/// less than itself without being held by it.
+#[test]
+fn a_call_with_a_time_limit_ends_at_it() {
+    use silica_abi::CALL_TIMEOUT_SHIFT;
+    let within = |slot: u64, us: u64| slot | us << CALL_TIMEOUT_SHIFT;
+    let check = |m: &Machine| {
+        assert_eq!(m.k.check_runqueues(), Ok(()));
+        assert_eq!(m.k.check_timers(), Ok(()));
+        assert_eq!(m.k.check_queue(m.cap(FREE).unwrap().obj, false), Ok(()));
+    };
+    // Received and never answered, the server on another processor.
+    let (m, t) = two_processors();
+    m.on(0);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(1);
+    let called = m.k.hal.now.get();
+    assert!(m.raw(S::Call as u64, [within(FREE + 1, 1000), MsgInfo::new(3, 1).0, 10, 0, 0, 0]).blocked);
+    m.settle(0);
+    assert_eq!((m.k.current(), m.arg(m.root, 2)), (m.root, 10), "the call was delivered");
+    m.k.hal.now.set(m.k.hal.now.get().max(called + 1_000_000));
+    m.on(1);
+    m.tick();
+    m.settle(1);
+    assert_eq!(m.k.current(), t);
+    assert_eq!(Error::result(m.status(t)), Err(Error::Timeout));
+    assert!(m.k.hal.now.get() >= called + 1_000_000, "it ended before its limit");
+    check(&m);
+    // The late answer goes nowhere, and the server carries on.
+    m.on(0);
+    let r = m.raw(S::ReplyRecv as u64, [0, MsgInfo::new(0, 1).0, 11, 0, 0, 0]);
+    assert_eq!((Error::result(r.status), r.blocked), (Err(Error::NoCaller), false));
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked, "the server takes its next call");
+    check(&m);
+
+    // Never received.
+    let (m, t) = two_processors();
+    m.on(1);
+    assert!(m.raw(S::Call as u64, [within(FREE + 1, 50), MsgInfo::new(3, 1).0, 10, 0, 0, 0]).blocked);
+    m.k.hal.now.set(m.k.hal.now.get() + 51_000);
+    m.tick();
+    m.settle(1);
+    assert_eq!(Error::result(m.status(t)), Err(Error::Timeout));
+    check(&m);
+    m.on(0);
+    assert_eq!(m.err(S::Recv, [FREE, 1, 0, 0, 0, 0]), Error::WouldBlock, "the call that timed out is still queued");
+
+    // Received, then the caller moved: its limit moves with it.
+    let (m, t) = two_processors();
+    m.on(0);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(1);
+    assert!(m.raw(S::Call as u64, [within(FREE + 1, 1000), MsgInfo::new(3, 1).0, 10, 0, 0, 0]).blocked);
+    m.settle(0);
+    m.move_to(FREE + 2, 0);
+    check(&m);
+    m.k.hal.now.set(m.k.hal.now.get() + 1_001_000);
+    m.on(0);
+    m.tick();
+    assert_eq!(m.k.thread_view(t).state, RUNNABLE);
+    assert_eq!(Error::result(m.status(t)), Err(Error::Timeout));
+    check(&m);
+
+    // Answered in time: the reply, and no timer left behind. (A thread
+    // that keeps processor 1 busy, or its idle wait would skip ahead to
+    // the caller's limit.)
+    let (m, t) = two_processors();
+    let (ut, _) = m.big_untyped();
+    m.spawn(ut, FREE + 3);
+    m.move_to(FREE + 3, 1);
+    m.on(0);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(1);
+    assert!(m.raw(S::Call as u64, [within(FREE + 1, 1000), MsgInfo::new(3, 1).0, 10, 0, 0, 0]).blocked);
+    m.settle(0);
+    assert!(m.raw(S::ReplyRecv as u64, [FREE, MsgInfo::new(0, 1).0, 11, 0, 0, 0]).blocked);
+    m.settle(1);
+    assert_eq!((m.status(t), m.arg(t, 2)), (0, 11));
+    check(&m);
+    m.k.hal.now.set(m.k.hal.now.get() + 2_000_000);
+    m.tick();
+    assert_eq!((m.status(t), m.arg(t, 2)), (0, 11));
+    // The flag that asks not to block is not a call's.
+    let r = m.sys_as(t, S::Call, [(FREE + 1) | NONBLOCK, MsgInfo::new(3, 0).0, 0, 0, 0, 0]);
+    assert_eq!((Error::result(r.status), r.blocked), (Err(Error::BadArg), false));
 }

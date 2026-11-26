@@ -82,11 +82,29 @@ fn memory() -> (Cap, usize) {
     (f, at)
 }
 
+/// Time on each processor for the tests' threads: one fair context of the
+/// default weight a processor, made on first use (processor 0's is the
+/// root task's own). A thread runs only once it is bound to one, on that
+/// context's processor; binding it to another's takes it there.
+static CONTEXTS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+fn time_on(cpu: usize) -> Cap {
+    if cpu == 0 {
+        return Cap(SLOT_CONTEXT);
+    }
+    if CONTEXTS[cpu].load(SeqCst) == 0 {
+        let sc = new(ObjectType::SchedContext, 0);
+        sched_fair(sc, SCHED_DEFAULT_WEIGHT, cpu, TIME).expect("a share of a processor");
+        CONTEXTS[cpu].store(sc.0, SeqCst);
+    }
+    Cap(CONTEXTS[cpu].load(SeqCst))
+}
+
 /// A thread in this address space running `entry(arg)`, reporting faults to `fault`.
 fn spawn(entry: extern "C" fn(u64) -> !, arg: u64, fault: Cap) -> (Cap, usize) {
     let t = new(ObjectType::Thread, 0);
     let (_, stack) = memory();
     thread_configure(t, SPACE, ASPACE, fault, Cap::NONE).expect("configure");
+    thread_bind(t, time_on(0)).expect("bind");
     // SAFETY: `entry` is a function of this program; the stack was just mapped.
     unsafe { thread_start(t, entry as usize, stack + (1 << 16) - 8, arg | t.0 << 32, true) }.expect("start");
     (t, stack)
@@ -321,6 +339,7 @@ fn t_w_xor_x() -> T {
     let t = new(ObjectType::Thread, 0);
     let (_, stack) = memory();
     thread_configure(t, SPACE, ASPACE, ep, Cap::NONE).map_err(|_| "configure")?;
+    thread_bind(t, time_on(0)).map_err(|_| "bind")?;
     // SAFETY: the thread is expected to fault on its first instruction.
     unsafe { thread_start(t, at, stack + 0xFFF8, 0, true) }.map_err(|_| "start")?;
     let m = recv(ep, Wait::Until(CLOCK.now() + 2_000_000_000)).map_err(|_| "executing a data page did not fault")?;
@@ -628,6 +647,7 @@ fn spawn_with_buffer(entry: extern "C" fn(u64) -> !, arg: u64) -> (Cap, usize) {
     thread_configure(t, SPACE, ASPACE, Cap::NONE, frame).expect("configure");
     // SAFETY: `entry` is a function of this program; the stack was just mapped.
     SERVER_BUFFER.store(at as u64, SeqCst);
+    thread_bind(t, time_on(0)).expect("bind");
     unsafe { thread_start(t, entry as usize, stack + (1 << 16) - 8, arg | t.0 << 32, true) }.expect("start");
     (t, at)
 }
@@ -753,6 +773,79 @@ fn t_irq() -> T {
     let quiet = recv(n, Wait::Until(CLOCK.now() + 20_000_000)) == Err(Error::Timeout);
     port_out(PORTS, 0x3F9, 1, 0).map_err(|_| "port")?;
     quiet.then_some(()).ok_or("an unbound interrupt line still signalled")
+}
+
+/// An interrupt line follows the thread that waits on it: bound here on
+/// processor 0, it is moved by the kernel to processor 1 once this thread
+/// waits there, and back when it returns. The first interrupt after a move
+/// arrives where the line was and reaches the waiter through every lock;
+/// the next ones arrive where the waiter is (`inspect_irq`). Before (the
+/// 2026-11-24 audit), the line stayed where it was bound, and every
+/// interrupt of a moved driver took every processor's lock. The serial
+/// port's "transmitter empty" interrupt is the device (as in [`t_irq`]).
+#[cfg(target_arch = "x86_64")]
+fn t_irq_follow() -> T {
+    need_cpus(2)?;
+    const LINES: Cap = Cap(SLOT_IRQS);
+    const LINE: u32 = 4;
+    let n = new(ObjectType::Notification, 0);
+    irq_bind(LINES, LINE, n, 0).map_err(|_| "cannot bind interrupt line 4")?;
+    let mcr = port_in(PORTS, 0x3FC, 1).unwrap_or(0);
+    port_out(PORTS, 0x3FC, 1, mcr | 0x08).map_err(|_| "port")?;
+    // One interrupt: "transmitter empty" enabled, waited for, disabled and
+    // cleared. The UART asks at once, possibly before this thread waits:
+    // a short wait first makes it the notification's waiter on the
+    // processor it is on, as a driver is by the time its device interrupts.
+    let once = || -> T {
+        let _ = recv(n, Wait::Until(CLOCK.now() + 1_000_000));
+        port_out(PORTS, 0x3F9, 1, 0x02).map_err(|_| "port")?;
+        let m = recv(n, Wait::Until(CLOCK.now() + 1_000_000_000));
+        port_out(PORTS, 0x3F9, 1, 0).map_err(|_| "port")?;
+        let _ = port_in(PORTS, 0x3FA, 1);
+        irq_ack(LINES, LINE).map_err(|_| "ack")?;
+        m.map(|_| ()).map_err(|_| "the serial port's interrupt never arrived")
+    };
+    let info = || inspect_irq(LINES, LINE as u64).map_err(|_| "cannot inspect the interrupt line");
+    let on = |cpu: usize| -> T {
+        thread_bind(Cap(SLOT_THREAD), time_on(cpu)).map_err(|_| "cannot move this thread")?;
+        (inspect_thread(Cap(SLOT_THREAD)).map_err(|_| "inspect")?.cpu == cpu).then_some(()).ok_or("this thread did not move")
+    };
+    let result = (|| -> T {
+        if info()?.cpu != Some(0) {
+            return Err("a line bound by a thread on processor 0 is not routed there");
+        }
+        once()?;
+        if info()?.from_afar != 0 {
+            return Err("an interrupt for a waiter on its own processor took every lock");
+        }
+        // Moved: the line follows after one interrupt from afar.
+        on(1)?;
+        once()?;
+        let i = info()?;
+        if i.cpu != Some(1) || i.from_afar != 1 {
+            println!("irq_follow: after the move to processor 1: {i:?}");
+            return Err("the line did not follow its waiter to processor 1");
+        }
+        for _ in 0..8 {
+            once()?;
+        }
+        let i = info()?;
+        if i.from_afar != 1 || i.delivered != 10 {
+            println!("irq_follow: on processor 1: {i:?}");
+            return Err("interrupts kept arriving away from their waiter after the line followed it");
+        }
+        // And back.
+        on(0)?;
+        once()?;
+        once()?;
+        let i = info()?;
+        println!("irq_follow: {} interrupts, {} of them from afar, the line now on processor {:?}", i.delivered, i.from_afar, i.cpu);
+        (i.cpu == Some(0) && i.from_afar == 2).then_some(()).ok_or("the line did not follow its waiter back to processor 0")
+    })();
+    let _ = on(0);
+    port_out(PORTS, 0x3FC, 1, mcr).map_err(|_| "port")?;
+    irq_unbind(LINES, LINE).map_err(|_| "unbind")?;
+    result
 }
 
 /// [`t_irq`] where devices are in memory space: a PL011 UART the firmware
@@ -948,7 +1041,7 @@ fn spawn_on(cpu: usize, entry: extern "C" fn(u64) -> !, arg: u64, fault: Cap) ->
     thread_configure(t, SPACE, ASPACE, fault, Cap::NONE).expect("configure");
     // SAFETY: `entry` is a function of this program; the stack was just mapped.
     unsafe { thread_start(t, entry as usize, stack + (1 << 16) - 8, arg | t.0 << 32, false) }.expect("start");
-    thread_set_cpu(t, cpu).expect("move to processor");
+    thread_bind(t, time_on(cpu)).expect("time on its processor");
     thread_resume(t).expect("resume");
     (t, stack)
 }
@@ -1432,9 +1525,7 @@ fn foreign_thread_on(cpu: usize, code: &[u8], arg: u64) -> Cap {
     thread_configure(t, SPACE, aspace, Cap::NONE, Cap::NONE).expect("configure");
     // SAFETY: the code was written for exactly this: it runs at any address without a stack.
     unsafe { thread_start(t, 0x10_0000, 0, arg, false) }.expect("start");
-    if cpu != 0 {
-        thread_set_cpu(t, cpu).expect("move to processor");
-    }
+    thread_bind(t, time_on(cpu)).expect("time on its processor");
     thread_resume(t).expect("resume");
     t
 }
@@ -1662,6 +1753,167 @@ fn bench_pairs(pairs: usize, cross: bool) -> u64 {
     (total as u128 * 1_000_000_000 / took as u128) as u64
 }
 
+/// The flood's state: 0 waiting, 1 running, 2 stopping.
+#[cfg(target_arch = "x86_64")]
+static FLOOD: AtomicU64 = AtomicU64::new(0);
+/// Operations each flooding thread made.
+#[cfg(target_arch = "x86_64")]
+static FLOODED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Where each flooding thread maps its frame.
+#[cfg(target_arch = "x86_64")]
+static FLOOD_AT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// The measured pairs: 0 waiting, 1 measuring, 2 stopping.
+#[cfg(target_arch = "x86_64")]
+static LAT_GO: AtomicU64 = AtomicU64::new(0);
+/// Round trips and the slowest one (ns) of each measured pair.
+#[cfg(target_arch = "x86_64")]
+static LAT_COUNT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+#[cfg(target_arch = "x86_64")]
+static LAT_WORST: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Round trips slower than 50 us, each pair.
+#[cfg(target_arch = "x86_64")]
+static LAT_SLOW: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// A thread that does nothing but what takes every processor's lock:
+/// derive a capability and delete it, inspect a slot, map a frame and unmap
+/// it, as fast as it can. `arg`: its index, and from bit 8 the first of two
+/// slots of its own (a free one to derive into, then its frame), the
+/// endpoint to derive from in the slot before them.
+#[cfg(target_arch = "x86_64")]
+extern "C" fn flood_thread(arg: u64) -> ! {
+    let (i, base) = ((arg & 0xFF) as usize, (arg >> 8) & 0xFF_FFFF);
+    let (src, dst, frame) = (Cap(base - 1), base, Cap(base + 1));
+    let at = FLOOD_AT[i].load(SeqCst) as usize;
+    while FLOOD.load(SeqCst) == 0 {
+        core::hint::spin_loop();
+    }
+    let mut n = 0u64;
+    while FLOOD.load(SeqCst) == 1 {
+        let _ = cap_derive(SPACE, dst, src, Rights::WRITE, 0);
+        // SAFETY: a copy this thread just made, used by nothing.
+        let _ = unsafe { cap_delete(Cap(dst)) };
+        let _ = inspect_slot(SPACE, src.0);
+        let _ = map(ASPACE, frame, at, RW);
+        // SAFETY: this thread's own frame, which nothing reads.
+        let _ = unsafe { unmap(frame) };
+        n += 5;
+        FLOODED[i].store(n, SeqCst);
+    }
+    finish(arg)
+}
+
+/// A client that times each round trip.
+#[cfg(target_arch = "x86_64")]
+extern "C" fn lat_client(arg: u64) -> ! {
+    let (pair, ep) = ((arg & 0xFF) as usize, Cap((arg >> 8) & 0xFF_FFFF));
+    while LAT_GO.load(SeqCst) == 0 {
+        core::hint::spin_loop();
+    }
+    let (mut n, mut worst, mut slow) = (0u64, 0u64, 0u64);
+    while LAT_GO.load(SeqCst) == 1 {
+        let t = CLOCK.now();
+        let _ = call(ep, MsgInfo::new(1, 4), [n, 2, 3, 4]);
+        let took = CLOCK.now() - t;
+        worst = worst.max(took);
+        slow += (took > 50_000) as u64;
+        n += 1;
+    }
+    LAT_COUNT[pair].store(n, SeqCst);
+    LAT_WORST[pair].store(worst, SeqCst);
+    LAT_SLOW[pair].store(slow, SeqCst);
+    finish(arg)
+}
+
+/// Round trips a second, the slowest (ns) and how many took over 50 us,
+/// of a pair with its client on `client` and its server on `server`, over
+/// 300 ms.
+#[cfg(target_arch = "x86_64")]
+fn timed_pair(client: usize, server: usize) -> (u64, u64, u64) {
+    LAT_GO.store(0, SeqCst);
+    LAT_COUNT[0].store(u64::MAX, SeqCst);
+    let ep = new(ObjectType::Endpoint, 0);
+    let s = foreign_thread_on(server, stub(&raw const stub_echo, &raw const stub_echo_end), ep.0);
+    let c = spawn_on(client, lat_client, ep.0 << 8, Cap::NONE).0;
+    sleep_ms(20);
+    let start = CLOCK.now();
+    LAT_GO.store(1, SeqCst);
+    sleep_ms(300);
+    LAT_GO.store(2, SeqCst);
+    let took = CLOCK.now() - start;
+    for _ in 0..1000 {
+        if LAT_COUNT[0].load(SeqCst) != u64::MAX {
+            break;
+        }
+        sleep_ms(1);
+    }
+    for t in [s, c] {
+        // SAFETY: the test's own threads, finished or blocked.
+        let _ = unsafe { cap_delete(t) };
+    }
+    let n = LAT_COUNT[0].load(SeqCst);
+    ((n as u128 * 1_000_000_000 / took as u128) as u64, LAT_WORST[0].load(SeqCst), LAT_SLOW[0].load(SeqCst))
+}
+
+/// A hostile program on processors of its own floods the kernel with what
+/// takes every processor's lock (capability derive and delete, inspect,
+/// map and unmap): how much slower are a pair's round trips on other
+/// processors, and how much later the slowest? (The 2026-11-24 audit:
+/// "capability operations, Unmap, Inspect and IrqAck take every processor's
+/// lock".) On two processors the pair shares processor 0 and the flood has
+/// processor 1; on eight the pair spans processors 1 and 2 and the flood
+/// has the other five. Judges a time: quiet.
+#[cfg(target_arch = "x86_64")]
+fn t_smp_global_flood() -> T {
+    need_cpus(2)?;
+    let cpus = CPUS.load(SeqCst) as usize;
+    let (client, server, flooders): (usize, usize, &[usize]) = if cpus >= 8 { (1, 2, &[3, 4, 5, 6, 7]) } else { (0, 0, &[1]) };
+    let (rate0, worst0, slow0) = timed_pair(client, server);
+    FLOOD.store(0, SeqCst);
+    let mut threads = [Cap::NONE; 8];
+    for (i, &cpu) in flooders.iter().enumerate() {
+        FLOODED[i].store(0, SeqCst);
+        let src = new(ObjectType::Endpoint, 0);
+        let dst = slot();
+        let frame = new(ObjectType::Frame, 12);
+        if src.0 + 1 != dst || dst + 1 != frame.0 {
+            return Err("the flood's slots are not consecutive");
+        }
+        FLOOD_AT[i].store(region(4096) as u64, SeqCst);
+        threads[i] = spawn_on(cpu, flood_thread, i as u64 | dst << 8, Cap::NONE).0;
+    }
+    sleep_ms(20);
+    let start = CLOCK.now();
+    FLOOD.store(1, SeqCst);
+    let (rate1, worst1, slow1) = timed_pair(client, server);
+    let took = CLOCK.now() - start;
+    FLOOD.store(2, SeqCst);
+    sleep_ms(20);
+    let ops: u64 = (0..flooders.len()).map(|i| FLOODED[i].load(SeqCst)).sum();
+    for t in &threads[..flooders.len()] {
+        // SAFETY: the test's own threads, finished or blocked.
+        let _ = unsafe { cap_delete(*t) };
+    }
+    println!(
+        "smp_global_flood: {cpus} processors: alone {rate0} round trips/s, slowest {} us, {slow0} over 50 us; beside {} flooding threads ({} lock-taking operations/s): {rate1}/s ({}%), slowest {} us, {slow1} over 50 us",
+        worst0 / 1000,
+        flooders.len(),
+        ops as u128 * 1_000_000_000 / took as u128,
+        rate1 * 100 / rate0.max(1),
+        worst1 / 1000
+    );
+    if ops == 0 {
+        return Err("the flood made no operation");
+    }
+    // Each processor may hold every lock a tenth of the machine's time
+    // divided among the processors, after a burst of 5 ms (`GLOBAL_SHARE`):
+    // over these 300 ms five flooders get at most 44 ms of it, one 20 ms.
+    // Before that bound the pair kept 27% (eight processors) and 37% (two).
+    if rate1 * 100 < rate0 * 70 {
+        return Err("a program flooding the kernel with what takes every lock took more than 30% of other processors' round trips");
+    }
+    Ok(())
+}
+
 fn bench() -> ! {
     bench_null_syscall();
     bench_ipc();
@@ -1758,7 +2010,7 @@ extern "C" fn sched_sleeper(arg: u64) -> ! {
     finish(arg)
 }
 
-/// Run `spinners` (index, scheduling context or Cap::NONE) on processor
+/// Run `spinners` (index, scheduling context or Cap::NONE: the tests' own on that processor) on processor
 /// `cpu` for `ms` and return what each counted.
 fn spin_on(cpu: usize, spinners: &[(usize, Cap)], ms: u64) -> core::result::Result<[u64; 8], &'static str> {
     SPIN.store(0, SeqCst);
@@ -1791,16 +2043,26 @@ fn t_sched() -> T {
     // main thread sleeps while the others run.
     let cpus = CPUS.load(SeqCst) as usize;
     let cpu = cpus - 1;
-    // 1. Weights 1024 and 3072 share the processor about 1:3.
-    let heavy = new(ObjectType::SchedContext, 0);
-    // Without processor time, memory buys no more than the default share.
-    if sched_fair(heavy, 3072, Cap::NONE) != Err(Error::NoRights)
+    // 1. Contexts of weights 1024 and 3072 share the processor about 1:3.
+    let (light, heavy) = (new(ObjectType::SchedContext, 0), new(ObjectType::SchedContext, 0));
+    // Memory alone is no time: a context is a share or a reservation of a
+    // processor only by a capability to that processor's time, and a
+    // thread cannot be bound to one that is neither.
+    if sched_fair(heavy, 3072, cpu, Cap::NONE) != Err(Error::NoRights)
+        || sched_fair(heavy, 1, cpu, Cap::NONE) != Err(Error::NoRights)
         || sched_deadline(heavy, 1_000_000, 10_000_000, cpu, Cap::NONE) != Err(Error::NoRights)
     {
-        return Err("a scheduling context was given more than the default share without processor time");
+        return Err("a scheduling context was given a processor's time without a capability to it");
     }
-    sched_fair(heavy, 3072, TIME).map_err(|_| "cannot configure a fair context")?;
-    let c = spin_on(cpu, &[(0, Cap::NONE), (1, heavy)], 300)?;
+    let unbound = new(ObjectType::Thread, 0);
+    // SAFETY: the thread is never started: it has no time to run on.
+    let started = unsafe { thread_start(unbound, 0x10_0000, 0, 0, true) };
+    if started != Err(Error::NoTime) || thread_bind(unbound, heavy) != Err(Error::NoTime) || thread_resume(unbound) != Err(Error::NoTime) {
+        return Err("a thread bound to no scheduling context, or to one nobody gave time, was let run");
+    }
+    sched_fair(light, SCHED_DEFAULT_WEIGHT, cpu, TIME).map_err(|_| "cannot configure a fair context")?;
+    sched_fair(heavy, 3072, cpu, TIME).map_err(|_| "cannot configure a fair context")?;
+    let c = spin_on(cpu, &[(0, light), (1, heavy)], 300)?;
     let ratio = c[1] as f64 / c[0].max(1) as f64;
     println!("sched: weights 1024 and 3072 counted {} and {} (ratio {:.2})", c[0], c[1], ratio);
     if !(2.5..=3.5).contains(&ratio) {
@@ -1828,6 +2090,8 @@ fn t_sched() -> T {
     unsafe {
         let _ = cap_delete(dl);
         let _ = cap_delete(heavy);
+        let _ = cap_delete(light);
+        let _ = cap_delete(unbound);
     }
     sched_deadline(more, 8_000_000, 10_000_000, cpu, TIME).map_err(|_| "a reservation's share was not given back when it was destroyed")?;
     // SAFETY: nothing is bound to it.
@@ -1945,6 +2209,7 @@ fn t_isolated() -> T {
     map(Cap(s), frame, 0x10_0000, Rights(5)).map_err(|_| "map code in the isolated space")?;
     let t = new(ObjectType::Thread, 0);
     thread_configure(t, SPACE, Cap(s), Cap::NONE, Cap::NONE).map_err(|_| "configure")?;
+    thread_bind(t, time_on(0)).map_err(|_| "bind")?;
     // SAFETY: the code runs at any address without a stack.
     unsafe { thread_start(t, 0x10_0000, 0, 0, true) }.map_err(|_| "start")?;
     for _ in 0..100 {
@@ -1985,6 +2250,8 @@ const TESTS: &[(&str, fn() -> T)] = &[
     ("untyped", t_untyped),
     ("caps", t_caps),
     ("irq", t_irq),
+    #[cfg(target_arch = "x86_64")]
+    ("irq_follow", t_irq_follow),
     ("inspect", t_inspect),
     ("ipc_caps", t_ipc_caps),
     ("ipc_parked", t_ipc_parked),
@@ -1994,6 +2261,11 @@ const TESTS: &[(&str, fn() -> T)] = &[
     ("smp_stress", t_smp_stress),
     ("smp_revoke", t_smp_revoke),
     ("smp_timeouts", t_smp_timeouts),
+    // A time judged under emulation is the emulator's: x86_64 runs on KVM.
+    #[cfg(target_arch = "x86_64")]
+    ("smp_global_flood", t_smp_global_flood),
+    #[cfg(target_arch = "x86_64")]
+    ("smp_global_flood8", t_smp_global_flood),
 ];
 
 /// Program entry, called by libsys's `_start`.

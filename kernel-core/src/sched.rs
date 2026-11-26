@@ -1,16 +1,21 @@
 //! Scheduling: scheduling contexts, the fair and deadline classes, and
 //! accounting (`spec/ARCHITECTURE.md`, Scheduler; component C06).
 //!
-//! Each processor has two run queues of its own threads:
+//! Processor time is a capability: a thread runs only on the scheduling
+//! context it is bound to, and a context is time on one processor because
+//! a holder of that processor's time made it so. Each processor has two
+//! run queues of its own threads:
 //!
 //! - *Deadline*: threads bound to a deadline context with budget left run
 //!   first, earliest deadline first. A context's budget is spent by every
 //!   thread bound to it and refilled each period (a constant-bandwidth
 //!   server); once spent, its threads wait for the next period. Admission
 //!   control keeps the reservations on a processor below `DEADLINE_CAP`.
-//! - *Fair*: every other runnable thread, in order of virtual runtime, which
-//!   advances by the real time it ran scaled by the default weight over its
-//!   weight. The one that has run least (relative to its weight) runs; it is
+//! - *Fair*: the fair contexts with threads waiting, in order of virtual
+//!   runtime, which advances by the real time the context's threads ran
+//!   scaled by the default weight over its weight; and in each context its
+//!   waiting threads in order of their own, which share it equally. The
+//!   context that has run least runs its thread that has run least; it is
 //!   preempted once it is `GRANULE` ahead of the next, and a waking thread
 //!   that is well behind the running one preempts it.
 //!
@@ -44,6 +49,12 @@ const SLEEPER_CREDIT: u64 = crate::tuned(option_env!("SILICA_TUNE_SLEEPER_CREDIT
 const WAKE_GRANULE: u64 = crate::tuned(option_env!("SILICA_TUNE_WAKE_GRANULE"), 1_000_000);
 /// The shortest time a fair thread runs before it can be preempted again.
 const MIN_RUN: u64 = crate::tuned(option_env!("SILICA_TUNE_MIN_RUN"), 100_000);
+
+/// `ran` nanoseconds of real time in the virtual time of weight `w`.
+#[inline(always)]
+fn scaled(ran: u64, w: u64) -> u64 {
+    if w == SCHED_DEFAULT_WEIGHT { ran } else { (ran as u128 * SCHED_DEFAULT_WEIGHT as u128 / w.max(1) as u128) as u64 }
+}
 /// How long a processor with nothing to run watches for work before it
 /// halts (`Presence::watch`): while it watches, a processor with work for
 /// it says so with one store instead of an interrupt, and a deadline that
@@ -114,34 +125,79 @@ pub(crate) const DEADLINE_CAP: u64 = ((1 << 20) * 9u64).div_ceil(10);
 /// The shortest deadline period.
 const MIN_PERIOD: u64 = 100_000;
 
-/// A scheduling context.
+/// A scheduling context: time on one processor, given by whoever holds
+/// that processor's time (`SchedConfigure`). Processor time is a
+/// capability: a thread runs only on the context it is bound to, and a
+/// context nobody configured is no time at all. A fair context is one
+/// share of its processor, divided equally among the threads bound to it;
+/// a deadline context is a reservation they spend together.
 #[repr(C, align(128))]
 pub struct SchedCtx {
     /// `SCHED_FAIR` or `SCHED_DEADLINE`.
     pub(crate) class: Cell<u64>,
     /// Fair: the weight.
     pub(crate) weight: Cell<u64>,
-    /// Deadline: budget and period in nanoseconds, and the processor (plus
-    /// one; 0 none yet) whose reservation it is.
+    /// Deadline: budget and period in nanoseconds.
     pub(crate) budget: Cell<u64>,
     pub(crate) period: Cell<u64>,
+    /// The processor (plus one) whose time it is; 0: nobody's yet.
     pub(crate) cpu: Cell<u64>,
     /// Deadline: what is left of this period's budget, and when the period ends.
     pub(crate) remaining: Cell<u64>,
     pub(crate) deadline: Cell<u64>,
     /// Nanoseconds charged to it, ever.
     pub(crate) consumed: Cell<u64>,
-    /// The threads bound to it (linked through `Thread::sc_next`).
+    /// Time its threads may still spend holding every lock, in nanoseconds
+    /// (negative: overdrawn), and when that was last refilled
+    /// (`Kernel::throttled`). Both zero in a new context: its first such
+    /// call starts it with the burst.
+    pub(crate) global_budget: Cell<i64>,
+    pub(crate) global_at: Cell<u64>,
+    /// The threads bound to it, linked through `Thread::sc_next`.
     pub(crate) threads: Cell<Paddr>,
+    /// Fair: its place on its processor.
+    pub(crate) share: Share,
 }
 impl KObj for SchedCtx {}
+const _: () = assert!(core::mem::size_of::<SchedCtx>() <= 1 << silica_abi::SCHED_BITS);
+
+/// A fair context's place on its processor.
+///
+/// Sharing a processor between threads, each its own share, let a program
+/// take as much of it as it had memory for threads: a service beside a
+/// program of 100 threads had 12 ms of each second and waited 300 ms for
+/// its turn (the 2026-11-24 audit; `hostile.rs`). So the fair run queue
+/// has two levels: the processor's contexts that have threads waiting, in
+/// order of the context's virtual runtime (which advances by the time any
+/// of its threads ran, scaled by its weight), and in each its waiting
+/// threads in order of their own. The context that has run least runs its
+/// thread that has run least. A context is in its processor's tree exactly
+/// while it has threads waiting.
+#[repr(C)]
+pub struct Share {
+    /// Links in its processor's tree of contexts (`order.rs`).
+    pub(crate) left: Cell<Paddr>,
+    pub(crate) right: Cell<Paddr>,
+    pub(crate) up: Cell<Paddr>,
+    pub(crate) meta: Cell<u64>,
+    /// Its virtual runtime.
+    pub(crate) vr: Cell<u64>,
+    /// The least virtual runtime among its threads (only grows): where a
+    /// waking one is placed.
+    pub(crate) min_vr: Cell<u64>,
+    /// Its waiting threads, a tree in order of virtual runtime: the tree,
+    /// its first and last.
+    pub(crate) top: crate::order::Root,
+    pub(crate) first: Cell<Paddr>,
+    pub(crate) last: Cell<Paddr>,
+}
 
 impl<H: Hal> Kernel<H> {
     pub(crate) fn sched(&self, s: Paddr) -> &SchedCtx {
         self.phys.obj(s)
     }
 
-    /// A new context: fair, with the default weight.
+    /// A new context: no processor's time yet (`SchedCtx::cpu` is 0).
     pub(crate) fn init_sched(&self, s: Paddr) {
         self.sched(s).weight.set(SCHED_DEFAULT_WEIGHT);
     }
@@ -152,40 +208,57 @@ impl<H: Hal> Kernel<H> {
         (s != 0 && self.sched(s).class.get() == SCHED_DEADLINE).then(|| self.sched(s))
     }
 
-    fn weight_of(&self, t: Paddr) -> u64 {
-        match self.thread(t).sc.get() {
-            0 => SCHED_DEFAULT_WEIGHT,
-            s => self.sched(s).weight.get(),
+    /// Put runnable thread `t` (not running) on its processor's run queue:
+    /// the deadline queue, or among its context's waiting threads in order
+    /// of virtual runtime (its context joining the processor's if none of
+    /// its threads waited), after any equal (so equals take turns), or with
+    /// `first` before them (a thread whose waking took the processor).
+    pub(crate) fn enqueue_at(&self, cpu: &Cpu, t: Paddr, first: bool) {
+        let s = self.thread(t).sc.get();
+        let sc = self.sched(s);
+        if sc.class.get() == SCHED_DEADLINE {
+            return self.q_push(&cpu.dl_head, &cpu.dl_tail, t);
+        }
+        let joins = sc.share.first.get() == 0;
+        crate::order::insert(&Members(self, &sc.share), t, first);
+        if joins {
+            crate::order::insert(&Shares(self, cpu), s, first);
         }
     }
 
-    /// Put runnable thread `t` (not running) on its processor's run queue:
-    /// the deadline queue, or the fair queue in order of virtual runtime,
-    /// after any equal (so equals take turns), or with `first` before them
-    /// (a thread whose waking took the processor).
-    pub(crate) fn enqueue_at(&self, cpu: &Cpu, t: Paddr, first: bool) {
-        if self.dl_of(t).is_some() {
-            return self.q_push(&cpu.dl_head, &cpu.dl_tail, t);
-        }
-        let vr = self.thread(t).vr.get();
-        // From the back: a thread that yields, or has just run, goes last.
-        let mut at = cpu.rq_tail.get();
-        while at != 0 && (self.thread(at).vr.get() > vr || (first && self.thread(at).vr.get() == vr)) {
-            at = self.thread(at).qprev.get();
-        }
+    /// Queue fair thread `t`, running on `cpu` and yielding, behind every
+    /// thread of its context waiting, and its context behind every context
+    /// waiting (some is: the caller saw one), without comparing.
+    #[inline(always)]
+    pub(crate) fn requeue_yielded(&self, cpu: &Cpu, t: Paddr) {
         let th = self.thread(t);
-        let next = if at == 0 { cpu.rq_head.get() } else { self.thread(at).qnext.get() };
-        th.qprev.set(at);
-        th.qnext.set(next);
-        if at == 0 {
-            cpu.rq_head.set(t);
-        } else {
-            self.thread(at).qnext.set(t);
+        let s = th.sc.get();
+        let sh = &self.sched(s).share;
+        if sh.last.get() != 0 {
+            th.vr.set(th.vr.get().max(self.thread(sh.last.get()).vr.get()));
         }
-        if next == 0 {
-            cpu.rq_tail.set(t);
-        } else {
-            self.thread(next).qprev.set(t);
+        let waiting = sh.first.get() != 0;
+        crate::order::push_last(&Members(self, sh), t);
+        // Alone among the contexts waiting, it is in place already.
+        let last = cpu.fq_last.get();
+        if waiting && last == s && cpu.fq_first.get() == s {
+            return;
+        }
+        if last != s {
+            sh.vr.set(sh.vr.get().max(self.sched(last).share.vr.get()));
+        }
+        let shares = Shares(self, cpu);
+        if waiting {
+            crate::order::remove(&shares, s);
+        }
+        crate::order::push_last(&shares, s);
+    }
+
+    /// The first thread of the least-run context waiting (0: none).
+    pub(crate) fn fair_first(&self, cpu: &Cpu) -> Paddr {
+        match cpu.fq_first.get() {
+            0 => 0,
+            s => self.sched(s).share.first.get(),
         }
     }
 
@@ -196,36 +269,53 @@ impl<H: Hal> Kernel<H> {
 
     /// Take runnable thread `t` (queued, not running) off its run queue.
     pub(crate) fn dequeue(&self, cpu: &Cpu, t: Paddr) {
-        if self.dl_of(t).is_some() {
-            self.q_remove(&cpu.dl_head, &cpu.dl_tail, t);
-        } else {
-            self.q_remove(&cpu.rq_head, &cpu.rq_tail, t);
+        let s = self.thread(t).sc.get();
+        let sc = self.sched(s);
+        if sc.class.get() == SCHED_DEADLINE {
+            return self.q_remove(&cpu.dl_head, &cpu.dl_tail, t);
+        }
+        crate::order::remove(&Members(self, &sc.share), t);
+        if sc.share.first.get() == 0 {
+            crate::order::remove(&Shares(self, cpu), s);
         }
     }
 
     /// A fair thread that becomes runnable is placed no further back than
-    /// the least-run thread minus a bounded credit, so a long sleep does not
-    /// buy a long monopoly. A thread that has never run (virtual runtime 0)
-    /// gets no credit: it starts level with the least-run thread, so a burst
-    /// of new threads does not push aside the ones already waiting.
+    /// the least-run thread of its context minus a bounded credit, so a
+    /// long sleep does not buy a long monopoly; and a context none of whose
+    /// threads waited or ran, no further back than the least-run context
+    /// likewise. A thread or context that has never run (virtual runtime
+    /// 0) gets no credit: it starts level with the least-run one, so a
+    /// burst of new threads does not push aside the ones already waiting.
     pub(crate) fn place(&self, cpu: &Cpu, t: Paddr) {
-        // The least-run fair time (only grows): of the running thread and
-        // the head of the queue.
-        let mut least = u64::MAX;
+        let floor = |vr: u64, min: u64| vr.max(if vr == 0 { min } else { min.saturating_sub(SLEEPER_CREDIT) }).max(1);
+        let th = self.thread(t);
+        let s = th.sc.get();
+        let sh = &self.sched(s).share;
         let cur = cpu.cur.get();
-        if cur != 0 && self.dl_of(cur).is_none() {
-            least = self.thread(cur).vr.get();
-        }
-        let head = cpu.rq_head.get();
-        if head != 0 {
-            least = least.min(self.thread(head).vr.get());
+        // The running thread's context, when it is a fair one.
+        let cur_s = if cur != 0 && self.dl_of(cur).is_none() { self.thread(cur).sc.get() } else { 0 };
+        // Within its context: the least-run time (only grows) of the
+        // context's running thread and its first waiting one.
+        let mut least = if cur_s == s { self.thread(cur).vr.get() } else { u64::MAX };
+        if sh.first.get() != 0 {
+            least = least.min(self.thread(sh.first.get()).vr.get());
         }
         if least != u64::MAX {
-            cpu.min_vr.set(cpu.min_vr.get().max(least));
+            sh.min_vr.set(sh.min_vr.get().max(least));
         }
-        let th = self.thread(t);
-        let floor = if th.vr.get() == 0 { cpu.min_vr.get() } else { cpu.min_vr.get().saturating_sub(SLEEPER_CREDIT) };
-        th.vr.set(th.vr.get().max(floor).max(1));
+        th.vr.set(floor(th.vr.get(), sh.min_vr.get()));
+        // Among the contexts, when this one comes back to the processor.
+        if sh.first.get() == 0 && cur_s != s {
+            let mut least = if cur_s != 0 { self.sched(cur_s).share.vr.get() } else { u64::MAX };
+            if cpu.fq_first.get() != 0 {
+                least = least.min(self.sched(cpu.fq_first.get()).share.vr.get());
+            }
+            if least != u64::MAX {
+                cpu.min_vr.set(cpu.min_vr.get().max(least));
+            }
+            sh.vr.set(floor(sh.vr.get(), cpu.min_vr.get()));
+        }
     }
 
     /// Whether `t`, just made runnable on processor `cpu`, should take the
@@ -243,11 +333,23 @@ impl<H: Hal> Kernel<H> {
             (Some(n), Some(c)) => n.remaining.get() > 0 && n.deadline.get() < c.deadline.get(),
             (Some(n), None) => n.remaining.get() > 0 || n.deadline.get() <= self.hal.now(),
             (None, Some(_)) => false,
-            (None, None) => self.thread(t).vr.get().saturating_add(WAKE_GRANULE) <= self.thread(cur).vr.get(),
+            (None, None) => {
+                // Within one context, by the threads' standing; else by the
+                // contexts'.
+                let (st, sc) = (self.thread(t).sc.get(), self.thread(cur).sc.get());
+                let (a, b) = if st == sc {
+                    (self.thread(t).vr.get(), self.thread(cur).vr.get())
+                } else {
+                    (self.sched(st).share.vr.get(), self.sched(sc).share.vr.get())
+                };
+                a.saturating_add(WAKE_GRANULE) <= b
+            }
         }
     }
 
-    /// Charge the time since the last charge to processor `cpu`'s account.
+    /// Charge the time since the last charge to processor `cpu`'s account:
+    /// to its context, and (fair) to its own standing among the context's
+    /// threads, which share equally.
     pub(crate) fn charge(&self, cpu: &Cpu, now: u64) {
         let ran = now.saturating_sub(cpu.since.get());
         cpu.since.set(now);
@@ -257,23 +359,26 @@ impl<H: Hal> Kernel<H> {
         }
         let th = self.thread(a);
         let s = th.sc.get();
-        // The common case: the default share. (Virtual runtime counts
-        // nanoseconds: 2^64 of them are 584 years.)
-        if s == 0 {
-            th.vr.set(th.vr.get().wrapping_add(ran));
+        let sc = self.sched(s);
+        // (Nanoseconds: 2^64 of them are 584 years.)
+        sc.consumed.set(sc.consumed.get().wrapping_add(ran));
+        if sc.class.get() == SCHED_DEADLINE {
+            sc.remaining.set(sc.remaining.get().saturating_sub(ran));
             return;
         }
-        {
-            let sc = self.sched(s);
-            sc.consumed.set(sc.consumed.get().saturating_add(ran));
-            if sc.class.get() == SCHED_DEADLINE {
-                sc.remaining.set(sc.remaining.get().saturating_sub(ran));
-                return;
-            }
+        th.vr.set(th.vr.get().wrapping_add(ran));
+        let sh = &sc.share;
+        let delta = scaled(ran, sc.weight.get());
+        // A context in the processor's tree moves to its new place (alone
+        // there, it is in place whatever its key).
+        if sh.first.get() != 0 && !(cpu.fq_first.get() == s && cpu.fq_last.get() == s) {
+            let shares = Shares(self, cpu);
+            crate::order::remove(&shares, s);
+            sh.vr.set(sh.vr.get().saturating_add(delta));
+            crate::order::insert(&shares, s, false);
+        } else {
+            sh.vr.set(sh.vr.get().wrapping_add(delta));
         }
-        let w = self.weight_of(a);
-        let delta = if w == SCHED_DEFAULT_WEIGHT { ran } else { (ran as u128 * SCHED_DEFAULT_WEIGHT as u128 / w as u128) as u64 };
-        th.vr.set(th.vr.get().saturating_add(delta));
     }
 
     /// A deadline context whose period has ended gets its budget back.
@@ -307,9 +412,25 @@ impl<H: Hal> Kernel<H> {
     pub(crate) fn pick(&self, cpu: &Cpu, now: u64) -> Paddr {
         // The common case: no deadline work on this processor.
         if cpu.dl_head.get() == 0 {
-            return self.q_pop(&cpu.rq_head, &cpu.rq_tail);
+            return self.pick_fair(cpu);
         }
         self.pick_deadline(cpu, now)
+    }
+
+    /// The first waiting thread of the least-run context, taken off the
+    /// queue (the context with it, if it was its last). 0: none.
+    #[inline(always)]
+    fn pick_fair(&self, cpu: &Cpu) -> Paddr {
+        let s = cpu.fq_first.get();
+        if s == 0 {
+            return 0;
+        }
+        let sh = &self.sched(s).share;
+        let t = crate::order::pop(&Members(self, sh));
+        if sh.first.get() == 0 {
+            crate::order::pop(&Shares(self, cpu));
+        }
+        t
     }
 
     #[inline(never)]
@@ -329,7 +450,7 @@ impl<H: Hal> Kernel<H> {
             self.q_remove(&cpu.dl_head, &cpu.dl_tail, best);
             return best;
         }
-        self.q_pop(&cpu.rq_head, &cpu.rq_tail)
+        self.pick_fair(cpu)
     }
 
     /// When processor `cpu`, running its current thread, must next look at
@@ -338,13 +459,17 @@ impl<H: Hal> Kernel<H> {
     /// spent deadline context's next period. `u64::MAX`: never.
     #[inline]
     pub(crate) fn preempt_at(&self, cpu: &Cpu, now: u64) -> u64 {
-        // The common case: no deadline work and a thread with the default
-        // share. The one picked has run least, so it cannot be GRANULE ahead
-        // of the next sooner than GRANULE from now: look again then (and
-        // the pick decides who runs).
+        // The common case: no deadline work and a thread on a fair context
+        // of the default weight. The one picked has run least, in its
+        // context and its context among the contexts, so neither can be
+        // GRANULE ahead of the next sooner than GRANULE from now: look
+        // again then (and the pick decides who runs).
         let a = cpu.account.get();
-        if cpu.dl_head.get() == 0 && cpu.cur.get() != 0 && a != 0 && self.thread(a).sc.get() == 0 {
-            return if cpu.rq_head.get() == 0 { u64::MAX } else { now.wrapping_add(GRANULE) };
+        if cpu.dl_head.get() == 0 && cpu.cur.get() != 0 && a != 0 {
+            let sc = self.sched(self.thread(a).sc.get());
+            if sc.class.get() == SCHED_FAIR && sc.weight.get() == SCHED_DEFAULT_WEIGHT {
+                return if cpu.fq_first.get() == 0 { u64::MAX } else { now.wrapping_add(GRANULE) };
+            }
         }
         self.preempt_at_exactly(cpu, now)
     }
@@ -376,11 +501,19 @@ impl<H: Hal> Kernel<H> {
         if let Some(sc) = self.dl_of(a) {
             return at.min(now.saturating_add(sc.remaining.get().max(1)));
         }
-        let head = cpu.rq_head.get();
+        // Within its context: GRANULE ahead of its first waiting thread.
+        let s = self.thread(a).sc.get();
+        let sc = self.sched(s);
+        let head = sc.share.first.get();
         if head != 0 {
             let ahead = (self.thread(head).vr.get() + GRANULE).saturating_sub(self.thread(a).vr.get());
-            let w = self.weight_of(a);
-            let real = (ahead as u128 * w as u128 / SCHED_DEFAULT_WEIGHT as u128) as u64;
+            at = at.min(now.saturating_add(ahead.max(MIN_RUN)));
+        }
+        // Among the contexts: its own GRANULE ahead of the least-run other one.
+        let other = if cpu.fq_first.get() == s { crate::order::next(&Shares(self, cpu), s) } else { cpu.fq_first.get() };
+        if other != 0 {
+            let ahead = (self.sched(other).share.vr.get() + GRANULE).saturating_sub(sc.share.vr.get());
+            let real = (ahead as u128 * sc.weight.get() as u128 / SCHED_DEFAULT_WEIGHT as u128) as u64;
             at = at.min(now.saturating_add(real.max(MIN_RUN)));
         }
         at
@@ -388,59 +521,48 @@ impl<H: Hal> Kernel<H> {
 
     /// `SchedConfigure` on the context at `s`, by a caller with authority
     /// over the time of processors `time` (empty: none). Processor time is
-    /// a capability like any other resource: memory alone buys a context
-    /// that shares no better than a thread without one (the default weight,
-    /// or less); more weight needs authority over every processor (a fair
-    /// thread runs wherever it is moved), a reservation authority over its
-    /// processor.
+    /// a capability like any other resource: a context is time on
+    /// processor `cpu` only because a holder of that processor's time made
+    /// it so, and memory alone buys none.
     pub(crate) fn sched_configure(&self, s: Paddr, class: u64, a: u64, b: u64, cpu: u64, time: core::ops::Range<u64>) -> Result<(), Error> {
         let sc = self.sched(s);
         let bound = sc.threads.get() != 0;
-        match class {
-            SCHED_FAIR => {
-                if !(1..=SCHED_MAX_WEIGHT).contains(&a) {
-                    return Err(Error::BadArg);
-                }
-                if a > SCHED_DEFAULT_WEIGHT && !(time.start == 0 && time.end >= self.ncpu() as u64) {
-                    return Err(Error::NoRights);
-                }
-                if bound && sc.class.get() != SCHED_FAIR {
-                    return Err(Error::InUse);
-                }
-                self.release_reservation(sc);
-                sc.class.set(SCHED_FAIR);
-                sc.weight.set(a);
-                Ok(())
-            }
-            SCHED_DEADLINE => {
-                if a == 0 || b < MIN_PERIOD || a > b || cpu >= self.ncpu() as u64 {
-                    return Err(Error::BadArg);
-                }
-                if !time.contains(&cpu) {
-                    return Err(Error::NoRights);
-                }
-                if bound && (sc.class.get() != SCHED_DEADLINE || sc.cpu.get() != cpu + 1) {
-                    return Err(Error::InUse);
-                }
-                let share = |budget: u64, period: u64| ((budget as u128) << 20).div_ceil(period as u128) as u64;
-                let home = self.cpus.get(cpu as usize);
-                let mine =
-                    if sc.class.get() == SCHED_DEADLINE && sc.cpu.get() == cpu + 1 { share(sc.budget.get(), sc.period.get()) } else { 0 };
-                let total = home.reserved.get() - mine + share(a, b);
-                if total > DEADLINE_CAP {
-                    return Err(Error::Overload);
-                }
-                self.release_reservation(sc);
-                home.reserved.set(home.reserved.get() + share(a, b));
-                sc.class.set(SCHED_DEADLINE);
-                sc.budget.set(a);
-                sc.period.set(b);
-                sc.cpu.set(cpu + 1);
-                sc.remaining.set(sc.remaining.get().min(a));
-                Ok(())
-            }
-            _ => Err(Error::BadArg),
+        let ok = match class {
+            SCHED_FAIR => (1..=SCHED_MAX_WEIGHT).contains(&a),
+            SCHED_DEADLINE => a != 0 && b >= MIN_PERIOD && a <= b,
+            _ => false,
+        };
+        if !ok || cpu >= self.ncpu() as u64 {
+            return Err(Error::BadArg);
         }
+        if !time.contains(&cpu) {
+            return Err(Error::NoRights);
+        }
+        // Its threads are where it is and queued as what it is.
+        if bound && (sc.class.get() != class || sc.cpu.get() != cpu + 1) {
+            return Err(Error::InUse);
+        }
+        let share = |budget: u64, period: u64| ((budget as u128) << 20).div_ceil(period as u128) as u64;
+        if class == SCHED_DEADLINE {
+            let home = self.cpus.get(cpu as usize);
+            let mine =
+                if sc.class.get() == SCHED_DEADLINE && sc.cpu.get() == cpu + 1 { share(sc.budget.get(), sc.period.get()) } else { 0 };
+            if home.reserved.get() - mine + share(a, b) > DEADLINE_CAP {
+                return Err(Error::Overload);
+            }
+            self.release_reservation(sc);
+            home.reserved.set(home.reserved.get() + share(a, b));
+            sc.budget.set(a);
+            sc.period.set(b);
+            sc.remaining.set(sc.remaining.get().min(a));
+        } else {
+            // A new weight changes its pace, not its place.
+            self.release_reservation(sc);
+            sc.weight.set(a);
+        }
+        sc.class.set(class);
+        sc.cpu.set(cpu + 1);
+        Ok(())
     }
 
     /// Give back the processor share a deadline context reserved.
@@ -453,33 +575,54 @@ impl<H: Hal> Kernel<H> {
         }
     }
 
-    /// Bind thread `t` to the context at `s` (0: none). The caller holds
-    /// every lock, or the thread's processor's lock.
+    /// Bind thread `t` to the context at `s`: from now on it runs on that
+    /// context's time, on that context's processor (holding the context's
+    /// capability is the authority to take it there), carrying its standing
+    /// over to the new context's scale. A context nobody gave a processor's
+    /// time is none (`NoTime`). The caller holds every lock.
     pub(crate) fn sched_bind(&self, t: Paddr, s: Paddr) -> Result<(), Error> {
+        let sc = self.sched(s);
+        if sc.cpu.get() == 0 {
+            return Err(Error::NoTime);
+        }
         let th = self.thread(t);
+        let was = th.sc.get();
+        if was == s {
+            return Ok(());
+        }
+        let to = sc.cpu.get() as usize - 1;
         let home = self.home(t);
-        if s != 0 {
-            let sc = self.sched(s);
-            if sc.class.get() == SCHED_DEADLINE && sc.cpu.get() != th.cpu.get() + 1 {
-                return Err(Error::BadArg);
+        let moving = to as u64 != th.cpu.get();
+        // Off the run queue it waits on (its place there is its context's);
+        // bound for another processor, off whatever it does on this one.
+        let again = if moving {
+            self.depart(t)
+        } else {
+            // What it ran until now is the old context's to pay.
+            if home.account.get() == t {
+                self.charge(home, self.hal.now());
             }
-        }
-        let queued = th.state.get() == RUNNABLE && home.cur.get() != t && home.direct.get() != t;
-        if queued {
-            self.dequeue(home, t);
-        }
+            let queued = th.state.get() == RUNNABLE && home.cur.get() != t && home.direct.get() != t;
+            if queued {
+                self.dequeue(home, t);
+            }
+            queued
+        };
+        let floor = |s: Paddr| if s != 0 && self.sched(s).class.get() == SCHED_FAIR { self.sched(s).share.min_vr.get() } else { 0 };
+        let (from, onto) = (floor(was), floor(s));
         self.sched_unlink(t);
-        if s != 0 {
-            let sc = self.sched(s);
-            th.sc_prev.set(0);
-            th.sc_next.set(sc.threads.get());
-            if sc.threads.get() != 0 {
-                self.thread(sc.threads.get()).sc_prev.set(t);
-            }
-            sc.threads.set(t);
+        th.sc_next.set(sc.threads.get());
+        if sc.threads.get() != 0 {
+            self.thread(sc.threads.get()).sc_prev.set(t);
         }
+        sc.threads.set(t);
         th.sc.set(s);
-        if queued {
+        if th.vr.get() != 0 {
+            th.vr.set(th.vr.get().saturating_sub(from).saturating_add(onto).max(1));
+        }
+        if moving {
+            self.arrive(t, to, again);
+        } else if again {
             self.enqueue(home, t);
         }
         home.dirty.set(true);
@@ -507,27 +650,93 @@ impl<H: Hal> Kernel<H> {
         th.sc_prev.set(0);
     }
 
-    /// The last capability to the context at `s` is gone: its threads go
-    /// back to the default fair share and its reservation is given back.
-    /// The caller holds every lock.
+    /// The last capability to the context at `s` is gone, and with it the
+    /// time its threads ran on: each stops where it is (suspended, a system
+    /// call that had not taken effect set up to be made again) and runs
+    /// again once it is bound to other time and resumed. Its reservation
+    /// is given back. The caller holds every lock.
     pub(crate) fn finalise_sched(&self, s: Paddr) {
         loop {
             let t = self.sched(s).threads.get();
             if t == 0 {
                 break;
             }
-            let _ = self.sched_bind(t, 0);
+            self.cancel(t, true);
+            let home = self.home(t);
+            if home.account.get() == t {
+                self.charge(home, self.hal.now());
+                home.account.set(0);
+                home.resched.set(true);
+            }
+            for c in [&home.cur, &home.direct] {
+                if c.get() == t {
+                    c.set(0);
+                }
+            }
+            self.sched_unlink(t);
         }
         self.release_reservation(self.sched(s));
     }
 }
 
 impl<H: Hal> Kernel<H> {
-    /// Thread `t`'s virtual runtime, and its processor's least virtual
-    /// runtime and running thread: the scheduler's view, for tests and the
+    /// Thread `t`'s virtual runtime and its fair context's, and its
+    /// processor's running thread: the scheduler's view, for tests and the
     /// debug console.
     pub fn sched_view(&self, t: Paddr) -> (u64, u64, Paddr) {
-        let cpu = self.home(t);
-        (self.thread(t).vr.get(), cpu.min_vr.get(), cpu.cur.get())
+        let s = self.thread(t).sc.get();
+        (self.thread(t).vr.get(), if s == 0 { 0 } else { self.sched(s).share.vr.get() }, self.home(t).cur.get())
+    }
+}
+
+/// A processor's fair contexts with threads waiting, as `order.rs` sees
+/// them: in order of the context's virtual runtime, linked through the
+/// context's own links.
+pub(crate) struct Shares<'a, H: Hal>(pub(crate) &'a Kernel<H>, pub(crate) &'a Cpu);
+
+impl<H: Hal> crate::order::Tree for Shares<'_, H> {
+    #[inline(always)]
+    fn node(&self, s: Paddr) -> crate::order::Node<'_> {
+        let sh = &self.0.sched(s).share;
+        crate::order::Node { left: &sh.left, right: &sh.right, up: &sh.up, meta: &sh.meta }
+    }
+    #[inline(always)]
+    fn key(&self, s: Paddr) -> u64 {
+        self.0.sched(s).share.vr.get()
+    }
+    fn root(&self) -> &crate::order::Root {
+        &self.1.fq_tree
+    }
+    fn first(&self) -> &Cell<Paddr> {
+        &self.1.fq_first
+    }
+    fn last(&self) -> &Cell<Paddr> {
+        &self.1.fq_last
+    }
+}
+
+/// A fair context's waiting threads, as `order.rs` sees them: in order of
+/// virtual runtime, linked through `qprev` (left), `qnext` (right) and
+/// `rq_up`.
+pub(crate) struct Members<'a, H: Hal>(pub(crate) &'a Kernel<H>, pub(crate) &'a Share);
+
+impl<H: Hal> crate::order::Tree for Members<'_, H> {
+    #[inline(always)]
+    fn node(&self, t: Paddr) -> crate::order::Node<'_> {
+        let th = self.0.thread(t);
+        crate::order::Node { left: &th.qprev, right: &th.qnext, up: &th.rq_up, meta: &th.rq_meta }
+    }
+    #[inline(always)]
+    fn key(&self, t: Paddr) -> u64 {
+        self.0.thread(t).vr.get()
+    }
+    fn root(&self) -> &crate::order::Root {
+        &self.1.top
+    }
+    fn first(&self) -> &Cell<Paddr> {
+        &self.1.first
+    }
+    fn last(&self) -> &Cell<Paddr> {
+        &self.1.last
     }
 }

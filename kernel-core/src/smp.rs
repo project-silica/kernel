@@ -45,8 +45,78 @@ pub use crate::lock::{Lock, Word};
 use crate::mem::Paddr;
 use core::cell::Cell;
 
+/// The time a scheduling context's threads may spend holding every
+/// processor's lock, in parts per thousand, divided among the processors
+/// (so that a context on each, all flooding, take this much of the
+/// machine's time together: `Kernel::throttled`).
+pub const GLOBAL_SHARE: u64 = crate::tuned(option_env!("SILICA_TUNE_GLOBAL_SHARE"), 100);
+/// What a context may spend holding every lock at once, in nanoseconds,
+/// before its share holds it back: a program's start, the boot.
+pub const GLOBAL_BURST_NS: u64 = crate::tuned(option_env!("SILICA_TUNE_GLOBAL_BURST"), 5_000_000);
+
 /// Most processors the kernel will run.
 pub const MAX_CPUS: usize = 256;
+
+/// How long one processor waits for another (its lock, its entry into the
+/// kernel, its leaving a root) before the machine stops, naming it. Every
+/// wait between processors is bounded: a processor that never answers (an
+/// interrupt lost, a firmware SMI that does not return, a core hung in
+/// hardware) would otherwise hold the whole machine with every lock taken
+/// and say nothing. Ten seconds is far beyond any wait the kernel makes
+/// itself (a global entry is bounded in its work and its share of time).
+pub const STALL_NS: u64 = 10_000_000_000;
+
+/// One wait for another processor, timed from its first turn: what
+/// [`STALL_NS`] bounds. Reads the clock only while it waits.
+pub struct Stall {
+    since: u64,
+}
+
+impl Stall {
+    /// A wait not yet begun.
+    pub const fn new() -> Stall {
+        Stall { since: 0 }
+    }
+
+    /// One turn of waiting, at `now`, for processor `cpu` to do `what`.
+    /// Past [`STALL_NS`] the machine stops (see [`stalled`]).
+    #[inline]
+    pub fn turn(&mut self, now: u64, cpu: usize, what: &str) {
+        if self.over(now) {
+            stalled(cpu, what);
+        }
+    }
+
+    /// One turn of waiting, at `now`: whether it has gone past [`STALL_NS`].
+    #[inline]
+    pub fn over(&mut self, now: u64) -> bool {
+        if self.since == 0 {
+            self.since = now.max(1);
+            return false;
+        }
+        now.saturating_sub(self.since) > STALL_NS
+    }
+
+    /// Whether the wait has gone on longer than `ns` (for one retry before
+    /// giving up, as a kick sent again).
+    pub fn longer_than(&self, now: u64, ns: u64) -> bool {
+        self.since != 0 && now.saturating_sub(self.since) > ns
+    }
+}
+
+impl Default for Stall {
+    fn default() -> Stall {
+        Stall::new()
+    }
+}
+
+/// Processor `cpu` did not `what` within [`STALL_NS`]: stop the machine,
+/// naming it, rather than hang with every lock held.
+#[cold]
+#[inline(never)]
+pub fn stalled(cpu: usize, what: &str) -> ! {
+    panic!("processor {cpu} has not {what} in 10 s: the machine stops")
+}
 const _: () = assert!(MAX_CPUS.is_power_of_two());
 
 /// Every processor's [`Cpu`], laid out so that no processor's state shares
@@ -99,16 +169,20 @@ impl CpuTable {
     pub(crate) fn at_slot(&self, s: usize) -> &Cpu {
         &self.0[s & (CPU_SLOTS - 1)]
     }
-    /// The first `n` processors' states, in order.
+    /// The first `n` processors' states, in order. By slot, masked
+    /// ([`CpuTable::at_slot`]): every global transition walks this, and a
+    /// bounds check on each processor cost it two instructions apiece.
     pub(crate) fn iter(&self, n: usize) -> impl Iterator<Item = &Cpu> {
-        (0..n).map(move |i| self.get(i))
+        (0..n).map(move |i| self.at_slot(cpu_slot(i)))
     }
 }
 
 /// One processor's lock and scheduling state (protected by the lock). Each
 /// has its own cache lines: processors working independently must not make
-/// each other's memory bounce.
-#[repr(align(128))]
+/// each other's memory bounce. Its size is a power of two that divides a
+/// page ([`CpuTable`]): 512 bytes since the scheduling groups and the share
+/// of time holding every lock took it past 256.
+#[repr(align(512))]
 pub struct Cpu {
     pub(crate) lock: Lock,
     /// The thread it runs (0 while idle).
@@ -122,10 +196,17 @@ pub struct Cpu {
     /// is forgotten (`forget_root`): the next switch, whatever it loads,
     /// still leaves the isolated space's predictions behind.
     pub(crate) isolated: Cell<u8>,
-    pub(crate) rq_head: Cell<Paddr>,
-    pub(crate) rq_tail: Cell<Paddr>,
-    /// Threads with deadlines, soonest first.
+    /// The fair run queue: the fair contexts with threads waiting, a tree
+    /// in order of the context's virtual runtime (`order.rs`,
+    /// `sched::Share`): its first (least-run) and last, and the tree.
+    pub(crate) fq_first: Cell<Paddr>,
+    pub(crate) fq_last: Cell<Paddr>,
+    pub(crate) fq_tree: crate::order::Root,
+    /// Threads with deadlines, a tree in deadline order: the soonest, the
+    /// latest, and the tree.
     pub(crate) timers: Cell<Paddr>,
+    pub(crate) timers_last: Cell<Paddr>,
+    pub(crate) timer_tree: crate::order::Root,
     /// When the timer is set to fire (`u64::MAX`: not armed).
     pub(crate) timer_at: Cell<u64>,
     /// When the running thread must next be looked at again (its share or
@@ -134,7 +215,7 @@ pub struct Cpu {
     /// Runnable threads bound to deadline contexts.
     pub(crate) dl_head: Cell<Paddr>,
     pub(crate) dl_tail: Cell<Paddr>,
-    /// The least virtual runtime among this processor's fair threads (only grows).
+    /// The least virtual runtime among this processor's fair contexts (only grows).
     pub(crate) min_vr: Cell<u64>,
     /// When time was last charged, and to which thread (0: none).
     pub(crate) since: Cell<u64>,
@@ -161,13 +242,21 @@ pub struct Cpu {
     pub(crate) pair: Cell<u64>,
     /// How many of this processor's kernel entries took a second lock.
     pub(crate) pairs: Cell<u64>,
+    /// When the global entry under way took the locks ([`Kernel::throttled`]).
+    pub(crate) global_from: Cell<u64>,
     /// A global entry's request that this processor stop running on a root
     /// it is about to reuse ([`Kernel::evict`]), answered while this
     /// processor waits for a lock without holding its own.
     /// Last: read only when a lock is contended, so it moves nothing the
     /// entry paths use.
     pub(crate) leave: crate::lock::Leave,
+    /// When the lock wait under way began ([`Kernel::lock_wait_turn`]).
+    /// Touched only by this processor, also while it does not hold its own
+    /// lock; after `leave` for the same reason.
+    pub(crate) wait_since: Cell<u64>,
 }
+
+const _: () = assert!(core::mem::size_of::<Cpu>() == 512);
 
 /// The processors whose locks a kernel entry holds.
 #[derive(Clone, Copy)]
@@ -193,9 +282,12 @@ impl Cpu {
             loaded: Cell::new(0),
             loaded_root: Cell::new(0),
             isolated: Cell::new(0),
-            rq_head: Cell::new(0),
-            rq_tail: Cell::new(0),
+            fq_first: Cell::new(0),
+            fq_last: Cell::new(0),
+            fq_tree: crate::order::Root::new(),
             timers: Cell::new(0),
+            timers_last: Cell::new(0),
+            timer_tree: crate::order::Root::new(),
             timer_at: Cell::new(u64::MAX),
             preempt_at: Cell::new(u64::MAX),
             dl_head: Cell::new(0),
@@ -213,7 +305,9 @@ impl Cpu {
             flush: Cell::new(false),
             pair: Cell::new(0),
             pairs: Cell::new(0),
+            global_from: Cell::new(0),
             leave: crate::lock::Leave::new(),
+            wait_since: Cell::new(0),
         }
     }
 
@@ -273,7 +367,7 @@ impl<H: Hal> Kernel<H> {
         // cannot see past), and finding it again after the wait cost every
         // entry an instruction.
         let me = self.me();
-        me.lock.lock_while(|| self.answer_leave(me));
+        me.lock.lock_while(|began| self.lock_wait_turn(me, &me.lock, began));
         self.catch_up(me);
     }
 
@@ -299,6 +393,44 @@ impl<H: Hal> Kernel<H> {
                 leave.answer();
             }
         }
+    }
+
+    /// One turn of this processor's wait for lock `l` (its own, entering
+    /// the kernel, or another's, taking more locks than its own:
+    /// [`crate::lock::go_global`], [`crate::lock::go_pair`]): answer what
+    /// other processors ask of it ([`Kernel::answer_leave`]), and once the
+    /// lock has not been seen free for [`STALL_NS`] stop the machine,
+    /// naming the processor whose lock it is (`began`: the lock was just
+    /// found held, [`Lock::lock_while`]).
+    ///
+    /// The wait is timed in the processor's own record, not on the stack,
+    /// so a transition that finds every lock free sets nothing up, and the
+    /// wait's only call is one that does not return: the entry paths keep
+    /// the frame they had without the bound (a bound kept on the stack, or
+    /// a call that returns, cost a page fault 16 to 23 instructions in
+    /// saved registers).
+    #[inline(always)]
+    fn lock_wait_turn(&self, me: &Cpu, l: &Lock, began: bool) {
+        self.answer_leave(me);
+        let now = self.hal.now();
+        if began {
+            me.wait_since.set(now);
+        } else if now.saturating_sub(me.wait_since.get()) > STALL_NS {
+            self.stalled_on(l);
+        }
+    }
+
+    /// The machine stops: lock `l` was not seen free within [`STALL_NS`].
+    #[cold]
+    #[inline(never)]
+    fn stalled_on(&self, l: &Lock) -> ! {
+        let cpu = (0..self.ncpu()).find(|&i| core::ptr::eq(&self.cpus.get(i).lock, l)).unwrap_or(usize::MAX);
+        if cpu == self.hal.cpu() {
+            // Its own lock, held by a processor taking every lock (which
+            // one is not recorded): that processor is the one stalled.
+            stalled(cpu, "had its lock back from a processor holding every lock")
+        }
+        stalled(cpu, "let go of its lock")
     }
 
     /// Enter the kernel on this processor, whose lock the architecture's
@@ -336,10 +468,87 @@ impl<H: Hal> Kernel<H> {
     /// everything it looked at before.
     pub(crate) fn go_global(&self) {
         let me = self.me();
-        crate::lock::go_global(&me.lock, self.cpus.iter(self.ncpu()).map(|c| &c.lock), || self.answer_leave(me));
+        crate::lock::go_global(&me.lock, self.cpus.iter(self.ncpu()).map(|c| &c.lock), |l, began| self.lock_wait_turn(me, l, began));
         self.global.set(true);
         self.globals.set(self.globals.get() + 1);
         self.catch_up(me);
+    }
+
+    /// Whether system call `t` made, about to take every lock (holding only
+    /// this processor's), must wait for its scheduling context's share of
+    /// the time spent so: then it is set up to be made again and waits, and
+    /// this returns true. Taking every lock stops the whole machine, so a
+    /// program on processors of its own that did nothing else (capability
+    /// copies and deletes, maps and unmaps, inspections) took two thirds
+    /// of the round trips of programs on the others (the 2026-11-24 audit;
+    /// `smp_global_flood`). The time spent holding every lock is a resource
+    /// like processor time, and whoever spends it pays: each scheduling
+    /// context may hold them for [`GLOBAL_SHARE`] parts per thousand of the
+    /// time, divided among the processors, with [`GLOBAL_BURST_NS`] in hand
+    /// for bursts (a program's start, the boot). The calls of a context
+    /// that has used its share wait until it has some again; nobody else's
+    /// do, on its processor or any other. In line: two loads and a branch
+    /// unless the share is used up.
+    #[inline(always)]
+    pub(crate) fn throttled(&self, me: &Cpu, t: Paddr) -> bool {
+        let sc = self.sched(self.thread(t).sc.get());
+        if sc.global_budget.get() > 0 {
+            me.global_from.set(self.hal.now());
+            return false;
+        }
+        self.throttle(me, sc, t)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn throttle(&self, me: &Cpu, sc: &crate::sched::SchedCtx, t: Paddr) -> bool {
+        let now = self.hal.now();
+        let n = self.ncpu() as u128;
+        // A context never charged starts with the burst; configuring it
+        // again does not refill it.
+        let earned = if sc.global_at.get() == 0 {
+            GLOBAL_BURST_NS as u128
+        } else {
+            (now.saturating_sub(sc.global_at.get()) as u128 * GLOBAL_SHARE as u128 / (1000 * n)).min(GLOBAL_BURST_NS as u128)
+        };
+        let budget = (sc.global_budget.get() + earned as i64).min(GLOBAL_BURST_NS as i64);
+        sc.global_at.set(now);
+        sc.global_budget.set(budget);
+        if budget > 0 {
+            me.global_from.set(now);
+            return false;
+        }
+        // Until the share is back: then the call is made again.
+        let wait = ((-budget) as u128 * 1000 * n / GLOBAL_SHARE as u128) as u64 + 1;
+        let r = &self.thread(t).regs;
+        r[H::IP].set(r[H::IP].get().wrapping_sub(H::SYSCALL_LEN));
+        self.block(t, crate::thread::THROTTLED, 0, now.saturating_add(wait));
+        true
+    }
+
+    /// The global entry under way, which [`Kernel::throttled`] let through
+    /// for thread `t`, is over: what it cost comes out of the share of the
+    /// context `t` runs on now. Its length, from before it took the first
+    /// lock (waiting for the others it held some), is what it cost each
+    /// other processor that had a thread to run; an idle one loses nothing
+    /// to its lock being held. So it is charged whole when any other
+    /// processor had work, and not at all on a machine where none did (a
+    /// pager alone, mapping and unmapping on every fault). Not scaled by
+    /// how many had work: a pair of programs calling each other across two
+    /// processors has one running at a time, and every call of the pair
+    /// waits out the whole of it. Read holding every lock: what each
+    /// processor runs is a fact, not an estimate.
+    #[inline(always)]
+    pub(crate) fn spent_global(&self, me: &Cpu, t: Paddr) {
+        let s = self.thread(t).sc.get();
+        // (A call may have taken the caller's own context away.)
+        if s == 0 || !self.others().any(|(_, c)| c.cur.get() != 0) {
+            return;
+        }
+        let held = self.hal.now().saturating_sub(me.global_from.get());
+        let cost = held.min(i64::MAX as u64) as i64;
+        let sc = self.sched(s);
+        sc.global_budget.set(sc.global_budget.get().saturating_sub(cost));
     }
 
     /// How many times a kernel entry has taken every lock (a statistic
@@ -353,7 +562,7 @@ impl<H: Hal> Kernel<H> {
     /// re-examines everything it looked at before.
     pub(crate) fn go_pair(&self, other: usize) {
         let cpu = self.me();
-        crate::lock::go_pair(&cpu.lock, &self.cpus.get(other).lock, other < self.hal.cpu(), || self.answer_leave(cpu));
+        crate::lock::go_pair(&cpu.lock, &self.cpus.get(other).lock, other < self.hal.cpu(), |l, began| self.lock_wait_turn(cpu, l, began));
         cpu.pair.set(other as u64 + 1);
         cpu.pairs.set(cpu.pairs.get() + 1);
         self.catch_up(cpu);

@@ -103,7 +103,7 @@ pub fn run(data: &[u8]) {
         m.ok(S::ThreadConfigure, [THREADS + i, KEEP, KEEP, KEEP, THREADS + 4 + i, 0]);
     }
     // One of them starts out on the second processor.
-    m.ok(S::ThreadControl, [THREADS + 2, 2, 1, 0, 0, 0]);
+    m.move_to(THREADS + 2, 1);
     m.ok(S::ThreadControl, [THREADS + 2, 1, 0, 0, 0, 0]);
     let ut_addr = m.k.slot_addr(&m.cs, ut).unwrap();
     let mut src = Src(data);
@@ -178,6 +178,17 @@ pub fn run(data: &[u8]) {
             let Some(v) = src.arg(ut) else { break };
             *x = v;
         }
+        // The corpus was written when a thread was moved by naming a
+        // processor, bound with the next operation, and shared a group
+        // (class 2): each seed does the same in today's terms. A move
+        // is a bind to time on that processor, a group a fair context.
+        if n == S::ThreadControl as u64 && a[1] == 2 {
+            a[2] = if a[2] & 1 == 0 { SLOT_CONTEXT } else { 1901 };
+        } else if n == S::ThreadControl as u64 && a[1] == 3 {
+            a[1] = 2;
+        } else if n == S::SchedConfigure as u64 && a[1] == 2 {
+            a[1] = 0;
+        }
         if t == m.root {
             // The root task is the supervisor that cleans up at the end: it
             // never waits, and it does not stop or restart itself.
@@ -214,7 +225,10 @@ pub fn run(data: &[u8]) {
         && m.k.view(ut_addr).is_some_and(|v| v.cap.ty == T::Untyped && v.cap.obj == d.base)
         && m.cap(SLOT_BOOT_UNTYPED).is_some()
         && m.cap(SLOT_CAPSPACE).is_some_and(|c| c.obj == m.cs.obj && c.rights.0 & 2 != 0)
-        && rv.state == 1;
+        && rv.state == 1
+        // Bound to time made from the Untyped it is about to revoke, it
+        // would stop itself half way.
+        && (rv.sched < d.base || rv.sched >= d.base + (1u64 << d.bits));
     if !root_ok {
         return;
     }

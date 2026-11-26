@@ -254,7 +254,7 @@ impl<H: Hal> Kernel<H> {
                 s0.badge.set(cap.bits as u64);
                 self.reap.set(cap.obj);
                 // A watch names its frames by slots of a CapSpace (`watch.rs`).
-                if self.nwatches.get() != 0 {
+                if self.watched.get() != 0 {
                     self.unwatch_space(cap.obj, cap.obj + ((1u64 << cap.bits) << silica_abi::SLOT_BITS));
                 }
             }
@@ -381,6 +381,11 @@ impl<H: Hal> Kernel<H> {
     #[inline(always)]
     pub(crate) fn reap_pending(&self) -> bool {
         self.reaping.get() != 0 || self.reap.get() != 0
+    }
+
+    /// [`Kernel::delete_shallow`], for an object's embedded slot.
+    pub(crate) fn delete_slot_shallow(&self, s: Paddr) {
+        self.delete_shallow(s);
     }
 
     /// Delete the capability in `s` and everything derived from it.

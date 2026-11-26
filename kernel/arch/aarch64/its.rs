@@ -342,6 +342,32 @@ fn route_locked(s: &mut State, n: usize, cpu: usize, device: u64) -> Option<(u64
     Some((s.translater, n as u64))
 }
 
+/// Deliver message line `line`, mapped already, to processor `cpu` from now
+/// on: its event moved to that processor's collection (MOVI), mapped the
+/// first time it is used, and the move waited for. The device's message is
+/// unchanged.
+pub fn retarget(line: usize, cpu: usize) -> bool {
+    let Some(n) = line.checked_sub(FIRST_LINE).filter(|n| *n < LINES && ready()) else { return false };
+    LOCK.lock();
+    // SAFETY: under `LOCK`.
+    let s = unsafe { &mut *STATE.0.get() };
+    let device = s.line_device[n];
+    let moved = match target(s, cpu) {
+        Some(rd) if device != u64::MAX => {
+            if !s.collections[cpu] {
+                command(s, [0x09, 0, 1 << 63 | rd | cpu as u64, 0]); // MAPC
+                s.collections[cpu] = true;
+            }
+            command(s, [0x01 | device << 32, n as u64, cpu as u64, 0]); // MOVI
+            sync(s, cpu);
+            true
+        }
+        _ => false,
+    };
+    LOCK.unlock();
+    moved
+}
+
 /// Hold message line `line` off, or let it interrupt again.
 pub fn mask(line: usize, masked: bool) {
     let Some(n) = line.checked_sub(FIRST_LINE).filter(|n| *n < LINES && ready()) else { return };

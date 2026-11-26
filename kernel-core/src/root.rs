@@ -61,6 +61,8 @@ pub struct RootSpec<'a> {
     pub cmdline: &'a [u8],
     /// Number of processors.
     pub cpus: u64,
+    /// The last boot's crash record, as the kernel found it (empty: none).
+    pub last_panic: &'a [u8],
 }
 
 /// Why the root task could not be created.
@@ -100,16 +102,25 @@ impl<H: Hal> Kernel<H> {
         let need = (1u64 << (CS_BITS + SLOT_BITS)) + (1 << AS_BITS) + image + (1 << STACK_BITS) + (1 << INFO_BITS) + (4 << PAGE_BITS);
         let bits = (64 - (2 * need - 1).leading_zeros()).max(22) as u8;
         let size = 1u64 << bits;
-        let base = spec
-            .regions
-            .iter()
-            .filter(|r| r.kind == RegionKind::Usable as u32)
-            .filter_map(|r| {
-                let b = (r.base.max(1 << 20) + size - 1) & !(size - 1);
-                (b.checked_add(size)? <= r.base + r.len).then_some(b)
-            })
-            .next_back()
-            .ok_or(BootError::NoMemory)?;
+        // Where it costs least: usable memory cut into the largest aligned
+        // blocks (as the root task's Untypeds are cut below), and the
+        // smallest of them that holds it taken, the highest of equals. A
+        // larger block, the only kind a big service's memory can come from
+        // on a small machine, stays whole (taking the region's lowest
+        // aligned address once split the one 64 MiB block of a 256 MB
+        // aarch64 machine, and its device manager could not start).
+        let mut base = None::<(u8, u64)>;
+        for r in spec.regions.iter().filter(|r| r.kind == RegionKind::Usable as u32) {
+            let (mut a, end) = (r.base.max(1 << 20), r.base.saturating_add(r.len));
+            while a < end {
+                let b = (a.trailing_zeros().min(63 - (end - a).leading_zeros()) as u8).min(silica_abi::UNTYPED_MAX_BITS);
+                if b >= bits && base.is_none_or(|(best, _)| b <= best) {
+                    base = Some((b, a));
+                }
+                a += 1 << b;
+            }
+        }
+        let base = base.ok_or(BootError::NoMemory)?.1;
 
         // The CapSpace comes first, by hand: until it exists there is no slot
         // to hold the Untyped it is made from.
@@ -125,6 +136,7 @@ impl<H: Hal> Kernel<H> {
         self.boot_retype(us, ObjectType::Thread, 0, &cs, SLOT_THREAD, 1)?;
         self.boot_retype(us, ObjectType::AddressSpace, AS_BITS, &cs, SLOT_ASPACE, 1)?;
         self.boot_retype(us, ObjectType::Frame, PAGE_BITS, &cs, SLOT_IPCBUF, 1)?;
+        self.boot_retype(us, ObjectType::SchedContext, 0, &cs, SLOT_CONTEXT, 1)?;
         let hw = |flags, end| Cap { ty: ObjectType::Hw, rights: Rights::ALL, bits: 0, flags, obj: 0, badge: end };
         if spec.ports {
             self.insert_root(slot(SLOT_PORTS), &hw(FLAG_PORTS, 1 << 16));
@@ -171,7 +183,7 @@ impl<H: Hal> Kernel<H> {
         };
         let mut cursor = 0u64;
         for r in spec.regions {
-            let (a, b) = (r.base, r.base + r.len);
+            let (a, b) = (r.base, r.base.saturating_add(r.len));
             if a > cursor {
                 device(cursor, a, &mut emit);
             }
@@ -250,6 +262,9 @@ impl<H: Hal> Kernel<H> {
         put(offset_of!(RootInfo, cmdline_len), &[cmd.len() as u64]);
         put(offset_of!(RootInfo, cpus), &[spec.cpus, self.hal.io_top(), (self.hal.msi_first() as u64).min(silica_abi::IRQ_LINES)]);
         self.phys.write_bytes(info + offset_of!(RootInfo, cmdline) as u64, cmd);
+        let last = &spec.last_panic[..spec.last_panic.len().min(silica_abi::root::LAST_PANIC)];
+        put(offset_of!(RootInfo, last_panic_len), &[last.len() as u64]);
+        self.phys.write_bytes(info + offset_of!(RootInfo, last_panic) as u64, last);
 
         // The thread: its CapSpace, address space and IPC buffer, then go.
         let t = self.slot(slot(SLOT_THREAD)).obj.get();
@@ -270,7 +285,14 @@ impl<H: Hal> Kernel<H> {
             r[H::ARG[1 + i]].set(u64::from_le_bytes(*w));
         }
         r[H::FLAGS].set(H::FLAGS_INIT);
+        // The first time there is: one fair share of this processor, which
+        // the root task holds like any context it will make for others.
+        let sc = self.slot(slot(SLOT_CONTEXT)).obj.get();
+        let here = self.hal.cpu() as u64;
+        self.sched_configure(sc, silica_abi::SCHED_FAIR, silica_abi::SCHED_DEFAULT_WEIGHT, 0, here, here..here + 1)?;
+        self.sched_bind(t, sc)?;
         self.make_runnable(t);
+        self.root_thread.set(t);
         Ok(t)
     }
 }

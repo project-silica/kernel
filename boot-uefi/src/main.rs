@@ -21,7 +21,6 @@ mod arch;
 
 use core::ffi::c_void;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, KERNEL_BASE, PHYS_MAP_BASE, Region, RegionKind};
 use kernel_core::elf::{Elf, PF_W, PF_X};
 use silica_abi::root::{ENTROPY_CPU, ENTROPY_FIRMWARE};
@@ -30,9 +29,22 @@ use silica_formats::blake2s::Blake2s;
 const PAGE: u64 = 4096;
 const HUGE: u64 = 2 << 20;
 
-/// A test harness is listening for the exit status (command line
-/// `exit=semihosting`; aarch64 only, see `arch/aarch64.rs`).
-static HARNESS: AtomicBool = AtomicBool::new(false);
+/// A test image's loader (the `harness` feature) was told a test harness
+/// listens for the exit status: the command line says how (`exit=semihosting`
+/// on aarch64, see `arch/aarch64.rs`; `exit=port`, QEMU's debug-exit device,
+/// on x86_64). A loader built for a machine has neither word nor call.
+#[cfg(feature = "harness")]
+static HARNESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Stop for good after a failure; a test image's loader first tells a
+/// listening harness.
+fn stop() -> ! {
+    #[cfg(feature = "harness")]
+    if HARNESS.load(core::sync::atomic::Ordering::Relaxed) {
+        arch::tell(kernel_core::ExitStatus::Failure.code());
+    }
+    arch::halt()
+}
 
 fn print(s: &str) {
     arch::print(s);
@@ -53,13 +65,12 @@ fn print_u64(mut v: u64) {
     print(core::str::from_utf8(&b[i..]).unwrap_or("?"));
 }
 
-/// Report a fatal error and stop: status through the emulator's exit device
-/// when there is one, then halt.
+/// Report a fatal error and stop.
 fn fail(what: &str) -> ! {
     print("ERROR: loader: ");
     print(what);
     print("\r\n");
-    arch::stop(kernel_core::ExitStatus::Failure.code(), HARNESS.load(Ordering::Relaxed))
+    stop()
 }
 
 struct Boot {
@@ -80,6 +91,23 @@ impl Boot {
         // SAFETY: the firmware just gave us these pages.
         unsafe { ptr::write_bytes(addr as *mut u8, 0, n.max(1) * PAGE as usize) };
         addr
+    }
+
+    /// The crash record's region (`kernel_core::crash`): the first of a few
+    /// fixed addresses the firmware lets this loader have, neither zeroed
+    /// nor ever given to anyone else, so a panic's record outlives a warm
+    /// reset at an address the next boot finds again. 0 when none is free.
+    fn crash_region(&self, ram: u64) -> u64 {
+        let pages = (kernel_core::crash::REGION_BYTES / PAGE) as usize;
+        for at in CRASH_AT {
+            let mut addr = ram + at;
+            // SAFETY: valid boot services; `addr` outlives the call. Type 2
+            // is AllocateAddress: exactly these pages or nothing.
+            if unsafe { ((*self.bs).allocate_pages)(2, efi::MEM_SILICA_CRASH, pages, &mut addr) } == efi::SUCCESS {
+                return addr;
+            }
+        }
+        0
     }
 
     fn protocol<T>(&self, handle: efi::Handle, guid: &efi::Guid) -> Option<*mut T> {
@@ -298,6 +326,8 @@ fn kind_of(ty: u32) -> RegionKind {
         efi::MEM_LOADER_DATA => RegionKind::Loader,
         efi::MEM_SILICA_KERNEL => RegionKind::Kernel,
         efi::MEM_SILICA_RAMDISK => RegionKind::Ramdisk,
+        // The crash record: the kernel's, never handed out.
+        efi::MEM_SILICA_CRASH => RegionKind::Kernel,
         efi::MEM_MMIO | efi::MEM_MMIO_PORT | efi::MEM_RESERVED => RegionKind::Firmware,
         // ACPI tables and NVS, runtime services, persistent memory and the
         // like: memory, the firmware's.
@@ -308,6 +338,12 @@ fn kind_of(ty: u32) -> RegionKind {
 const MAX_REGIONS: usize = 1024;
 const MAP_BYTES: u64 = 256 * 1024;
 
+/// Where the crash record may live, in order, from the start of memory: low
+/// enough for the smallest machine (256 MB), above what the firmware uses
+/// early in its boot, and all inside the 16 MiB below the 64 MiB mark, so
+/// the 64 MiB block above stays whole for a service that needs it.
+const CRASH_AT: [u64; 3] = [0x0300_0000, 0x0380_0000, 0x03C0_0000];
+
 /// UEFI image entry point.
 // SAFETY: `efi_main` is the entry symbol the UEFI target's linker expects;
 // only the firmware calls it.
@@ -315,12 +351,6 @@ const MAP_BYTES: u64 = 256 * 1024;
 pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable) -> efi::Status {
     let loader_tsc = arch::counter();
     arch::console(st);
-    if let Some(what) = arch::unsupported() {
-        print("ERROR: loader: this processor lacks ");
-        print(what);
-        print(", which Silica requires\r\n");
-        arch::stop(kernel_core::ExitStatus::Failure.code(), HARNESS.load(Ordering::Relaxed))
-    }
     // SAFETY: the firmware passes a valid system table; boot services are
     // usable until ExitBootServices below.
     let (bs, rt, cfg) =
@@ -337,13 +367,31 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         fail("cannot open the boot volume");
     }
     let t_open = arch::counter();
+    // The command line first: in a test image, whether a harness hears the
+    // status decides how every failure after this one ends (a missing kernel
+    // included).
+    let cmdline = boot.read(root, "SILICA\\CMDLINE.TXT", efi::MEM_LOADER_DATA).unwrap_or((0, 0));
+    #[cfg(feature = "harness")]
+    {
+        // SAFETY: the command line was read into `cmdline.1` bytes at `cmdline.0`.
+        let words = unsafe { core::slice::from_raw_parts(cmdline.0 as *const u8, cmdline.1 as usize) };
+        HARNESS.store(
+            words.split(|b| b.is_ascii_whitespace()).any(|w| w == b"exit=semihosting" || w == b"exit=port"),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
     let (kfile, klen) = boot.read(root, "SILICA\\KERNEL.ELF", efi::MEM_LOADER_DATA).unwrap_or_else(|| fail("SILICA\\KERNEL.ELF not found"));
     let ramdisk = boot.read(root, "SILICA\\RAMDISK.IMG", efi::MEM_SILICA_RAMDISK).unwrap_or((0, 0));
-    let cmdline = boot.read(root, "SILICA\\CMDLINE.TXT", efi::MEM_LOADER_DATA).unwrap_or((0, 0));
     let t_files = arch::counter();
-    // SAFETY: the command line was read into `cmdline.1` bytes at `cmdline.0`.
-    let words = unsafe { core::slice::from_raw_parts(cmdline.0 as *const u8, cmdline.1 as usize) };
-    HARNESS.store(words.split(|b| b.is_ascii_whitespace()).any(|w| w == b"exit=semihosting"), Ordering::Relaxed);
+    // Refused here, once the command line said whether a harness hears the
+    // status (the loader is built for plain x86-64 and Armv8.0, so reading
+    // two files first is safe on any processor of either).
+    if let Some(what) = arch::unsupported() {
+        print("ERROR: loader: this processor lacks ");
+        print(what);
+        print(", which Silica requires\r\n");
+        stop()
+    }
 
     // Entropy and time, while the firmware can still be asked.
     let (seed, entropy_sources) = gather_entropy(&boot);
@@ -412,14 +460,20 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         fail("cannot read the firmware memory map");
     }
     let mut top = 4u64 << 30;
+    let mut ram = u64::MAX;
     for i in 0..size / dsize {
         // SAFETY: the firmware wrote `size` bytes of descriptors of `dsize` bytes each.
         let d = unsafe { &*((map as usize + i * dsize) as *const efi::MemoryDescriptor) };
         if !matches!(kind_of(d.ty), RegionKind::Firmware | RegionKind::FirmwareMemory) {
             top = top.max(d.phys + d.pages * PAGE);
+            ram = ram.min(d.phys);
         }
     }
     let top = (top + (1 << 30) - 1) & !((1 << 30) - 1);
+    // The crash record's region, at the same place every boot: an offset
+    // from the start of the machine's memory (0 on a PC, 1 GiB on an Arm
+    // virtual machine).
+    let crash = boot.crash_region(if ram == u64::MAX { 0 } else { ram & !0xF_FFFF });
     let root = boot.pages(efi::MEM_SILICA_KERNEL, PAGE, "out of memory for page tables");
     let low = if arch::SPLIT_ROOTS { boot.pages(efi::MEM_SILICA_KERNEL, PAGE, "out of memory for page tables") } else { root };
     let tables = Tables { boot: &boot, root, low };
@@ -525,34 +579,21 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         // SAFETY: as above; the map is no longer changing.
         unsafe { &*((map as usize + i * dsize) as *const efi::MemoryDescriptor) }
     };
-    let out = regions as *mut Region;
-    let mut n = 0usize;
-    let mut floor = 0u64;
-    loop {
-        // Selection sort over at most a few hundred descriptors.
-        let mut best: Option<&efi::MemoryDescriptor> = None;
-        for i in 0..count {
+    // Overlaps take the most restrictive kind; a range that wraps is
+    // refused by name (`kernel_core::boot::convert_map`, host-tested).
+    // SAFETY: `regions` was allocated for MAX_REGIONS entries, the loader's own.
+    let out = unsafe { core::slice::from_raw_parts_mut(regions as *mut Region, MAX_REGIONS) };
+    let n = match kernel_core::boot::convert_map(
+        count,
+        |i| {
             let d = desc(i);
-            if d.pages != 0 && d.phys >= floor && best.is_none_or(|b| d.phys < b.phys) {
-                best = Some(d);
-            }
-        }
-        let Some(d) = best else { break };
-        floor = d.phys + d.pages * PAGE;
-        let kind = kind_of(d.ty) as u32;
-        // SAFETY: `out` has room for MAX_REGIONS entries; `n` is checked below.
-        unsafe {
-            if n > 0 && (*out.add(n - 1)).kind == kind && (*out.add(n - 1)).base + (*out.add(n - 1)).len == d.phys {
-                (*out.add(n - 1)).len += d.pages * PAGE;
-            } else {
-                if n == MAX_REGIONS {
-                    fail("the firmware memory map has too many regions");
-                }
-                *out.add(n) = Region { base: d.phys, len: d.pages * PAGE, kind, reserved: 0 };
-                n += 1;
-            }
-        }
-    }
+            (d.phys, d.pages.checked_mul(PAGE).unwrap_or(u64::MAX), kind_of(d.ty) as u32)
+        },
+        out,
+    ) {
+        Ok(n) => n,
+        Err(why) => fail(why),
+    };
 
     let info = BootInfo {
         magic: BOOT_MAGIC,
@@ -580,6 +621,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         wall_secs,
         wall_tsc,
         loader_tsc,
+        crash,
     };
     // SAFETY: `info_page` is a page allocated above; the tables map this
     // code at its address through `low` and the kernel at its entry.

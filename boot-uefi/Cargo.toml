@@ -17,5 +17,10 @@ kernel-core = { path = "../kernel-core" }
 silica-abi = { path = "../abi" }
 silica-formats = { path = "../formats" }
 
+# A test image's loader tells a listening test harness the status of a
+# failure (`exit=`). A loader built for a machine is built without it.
+[features]
+harness = []
+
 [lints]
 workspace = true

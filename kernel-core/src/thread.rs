@@ -29,6 +29,10 @@ pub const SENDING: u64 = 2;
 pub const RECEIVING: u64 = 3;
 /// Message delivered; waiting for the receiver's reply.
 pub const REPLY: u64 = 4;
+/// Waiting to make again a system call that takes every processor's lock,
+/// its processor having used its share of such time (`Kernel::throttled`).
+/// Its registers are as the call left them: woken, it makes it again.
+pub const THROTTLED: u64 = 5;
 
 /// `ipc_flags`: the pending send is a call.
 pub(crate) const IPC_CALL: u64 = 1;
@@ -51,8 +55,14 @@ pub struct Thread {
     pub(crate) fault_ep: Slot,
     pub(crate) ipcbuf: Slot,
     pub(crate) state: Cell<u64>,
+    /// Links in the queue the thread is on: an endpoint's or a
+    /// notification's list, the deadline run queue (a list), or the fair
+    /// run queue (a tree, `order.rs`: `qprev` and `qnext` its left and
+    /// right child, `rq_up` its parent, `rq_meta` its height).
     pub(crate) qnext: Cell<Paddr>,
     pub(crate) qprev: Cell<Paddr>,
+    pub(crate) rq_up: Cell<Paddr>,
+    pub(crate) rq_meta: Cell<u64>,
     /// The endpoint or notification queued on, or the thread owing a reply.
     pub(crate) blocked_on: Cell<Paddr>,
     /// The thread whose call this thread has received and not yet answered.
@@ -60,8 +70,13 @@ pub struct Thread {
     pub(crate) ipc_badge: Cell<u64>,
     pub(crate) ipc_flags: Cell<u64>,
     pub(crate) deadline: Cell<u64>,
+    /// Links in its processor's timer tree (`order.rs`): `tprev` and
+    /// `tnext` its left and right child, `t_up` its parent, `t_meta` its
+    /// height and place.
     pub(crate) tnext: Cell<Paddr>,
     pub(crate) tprev: Cell<Paddr>,
+    pub(crate) t_up: Cell<Paddr>,
+    pub(crate) t_meta: Cell<u64>,
     pub(crate) fault: [Cell<u64>; 3],
     pub(crate) reap_next: Cell<u64>,
     /// The processor this thread runs on.
@@ -75,8 +90,8 @@ pub struct Thread {
     pub(crate) via_slot: Cell<Paddr>,
     /// While receiving: the slot of a notification to park the next call on.
     pub(crate) park: Cell<u64>,
-    /// The scheduling context it is bound to (0: the default fair share),
-    /// and its links in that context's list of threads.
+    /// The scheduling context it is bound to and runs on (0: none, and it
+    /// cannot run), and its links in that context's list of threads.
     pub(crate) sc: Cell<Paddr>,
     pub(crate) sc_next: Cell<Paddr>,
     pub(crate) sc_prev: Cell<Paddr>,
@@ -196,39 +211,13 @@ impl<H: Hal> Kernel<H> {
         if th.deadline.get() == 0 {
             return;
         }
-        let (p, n) = (th.tprev.get(), th.tnext.get());
-        if p != 0 {
-            self.thread(p).tnext.set(n);
-        } else {
-            self.home(t).timers.set(n);
-        }
-        if n != 0 {
-            self.thread(n).tprev.set(p);
-        }
+        crate::order::remove(&Timers(self, self.home(t)), t);
         th.deadline.set(0);
-        th.tnext.set(0);
-        th.tprev.set(0);
     }
 
     fn timer_insert(&self, t: Paddr, deadline: u64) {
-        let th = self.thread(t);
-        let cpu = self.home(t);
-        th.deadline.set(deadline);
-        let (mut prev, mut at) = (0, cpu.timers.get());
-        while at != 0 && self.thread(at).deadline.get() <= deadline {
-            prev = at;
-            at = self.thread(at).tnext.get();
-        }
-        th.tprev.set(prev);
-        th.tnext.set(at);
-        if prev != 0 {
-            self.thread(prev).tnext.set(t);
-        } else {
-            cpu.timers.set(t);
-        }
-        if at != 0 {
-            self.thread(at).tprev.set(t);
-        }
+        self.thread(t).deadline.set(deadline);
+        crate::order::insert(&Timers(self, self.home(t)), t, false);
     }
 
     /// Block thread `t` (current on its processor) in `state` on `on`, with
@@ -352,19 +341,16 @@ impl<H: Hal> Kernel<H> {
         cpu.dirty.set(true);
     }
 
-    /// Make processor `to` thread `t`'s home without changing what it does,
-    /// so that balancing (userspace policy) is invisible to the thread: a
-    /// runnable one runs there next; one waiting for a reply keeps waiting
-    /// and is answered there; one blocked in a send or receive (nothing
-    /// delivered yet) makes the same system call again there; an inactive
-    /// one stays inactive. The caller holds every lock.
-    pub(crate) fn move_thread(&self, t: Paddr, to: usize) {
-        let th = self.thread(t);
-        let from = th.cpu.get() as usize;
-        if from == to {
-            return;
-        }
-        let state = th.state.get();
+    /// Take thread `t` off its processor, to carry on with what it does on
+    /// another ([`Kernel::arrive`]): a thread goes where its scheduling
+    /// context is (`Kernel::sched_bind`), and the move is invisible to it.
+    /// A runnable one runs there next; one waiting for a reply keeps
+    /// waiting and is answered there; one blocked in a send or receive
+    /// (nothing delivered yet) makes the same system call again there; an
+    /// inactive one stays inactive. Returns whether it is to be made
+    /// runnable on arrival. The caller holds every lock.
+    pub(crate) fn depart(&self, t: Paddr) -> bool {
+        let state = self.thread(t).state.get();
         let again = state != INACTIVE && state != REPLY;
         if again {
             // Off its run queue or wait queue (a running thread's processor
@@ -372,7 +358,7 @@ impl<H: Hal> Kernel<H> {
             // call set up to run again.
             self.cancel(t, true);
         }
-        let (old, new) = (self.cpus.get(from), self.cpus.get(to));
+        let old = self.home(t);
         if old.account.get() == t {
             self.charge(old, self.hal.now());
             old.account.set(0);
@@ -383,10 +369,23 @@ impl<H: Hal> Kernel<H> {
             }
         }
         old.dirty.set(true);
-        // Its standing among the fair threads, carried over to the new
-        // processor's scale.
-        th.vr.set(th.vr.get().saturating_sub(old.min_vr.get()).saturating_add(new.min_vr.get()));
+        again
+    }
+
+    /// Make processor `to` the home of thread `t`, which left its last
+    /// ([`Kernel::depart`], which said whether it runs `again`).
+    pub(crate) fn arrive(&self, t: Paddr, to: usize, again: bool) {
+        let th = self.thread(t);
+        // A call waiting for its answer keeps its time limit, among the new
+        // processor's timers.
+        let deadline = th.deadline.get();
+        if deadline != 0 {
+            self.timer_remove(t);
+        }
         th.cpu.set(to as u64);
+        if deadline != 0 {
+            self.timer_insert(t, deadline);
+        }
         if again {
             self.make_runnable(t);
         }
@@ -514,6 +513,7 @@ impl<H: Hal> Kernel<H> {
             for (line, irq) in self.irqs.iter().enumerate() {
                 if irq.0.get() == q {
                     self.unwatch_line(line);
+                    self.irq_stat[line].held.store(false, core::sync::atomic::Ordering::Relaxed);
                     irq.0.set(0);
                     self.hal.irq_mask(line, true);
                 }
@@ -555,14 +555,23 @@ impl<H: Hal> Kernel<H> {
             // waiter of this processor in a queue another one owns (several
             // processors receive on it) is taken out holding every lock,
             // and the deadlines are looked at afresh.
+            // A call waiting for its answer past its time limit is unlinked from
+            // whoever owes it, which may be any processor's, likewise.
             let th = self.thread(t);
-            if !global
-                && self.ncpu() > 1
-                && matches!(th.state.get(), SENDING | RECEIVING)
-                && self.queue(th.blocked_on.get()).owner.get() != self.hal.cpu() as u64 + 1
-            {
+            let elsewhere = match th.state.get() {
+                SENDING | RECEIVING => self.queue(th.blocked_on.get()).owner.get() != self.hal.cpu() as u64 + 1,
+                REPLY => true,
+                _ => false,
+            };
+            if !global && self.ncpu() > 1 && elsewhere {
                 self.go_global();
                 global = true;
+                continue;
+            }
+            if th.state.get() == THROTTLED {
+                // Its processor's share has come back: it makes its call
+                // again, its registers as the call left them.
+                self.make_runnable(t);
                 continue;
             }
             self.cancel(t, false);
@@ -634,12 +643,12 @@ impl<H: Hal> Kernel<H> {
             // now come before the running one?
             if me.woken.get() && cur_ok {
                 me.woken.set(false);
-                let first = if me.dl_head.get() != 0 { me.dl_head.get() } else { me.rq_head.get() };
+                let first = if me.dl_head.get() != 0 { me.dl_head.get() } else { self.fair_first(me) };
                 if first != 0 && self.preempts(me, first) {
                     me.resched.set(true);
                 }
             }
-            let others = me.rq_head.get() != 0 || me.dl_head.get() != 0;
+            let others = me.fq_first.get() != 0 || me.dl_head.get() != 0;
             if cur_ok && !me.resched.get() {
                 // Keep running; a queue that has just stopped being empty
                 // needs a time at which to look again.
@@ -661,12 +670,8 @@ impl<H: Hal> Kernel<H> {
             // Choose afresh: queue the running thread (behind its equals if
             // it yielded) and pick.
             if cur_ok {
-                let th = self.thread(cur);
-                let tail = me.rq_tail.get();
-                if me.yielded.replace(false) && tail != 0 && (th.sc.get() == 0 || self.dl_of(cur).is_none()) {
-                    // A yield: behind every fair thread waiting.
-                    th.vr.set(th.vr.get().max(self.thread(tail).vr.get()));
-                    self.q_push(&me.rq_head, &me.rq_tail, cur);
+                if me.yielded.replace(false) && me.fq_first.get() != 0 && self.dl_of(cur).is_none() {
+                    self.requeue_yielded(me, cur);
                 } else {
                     self.enqueue(me, cur);
                 }
@@ -750,7 +755,7 @@ impl<H: Hal> Kernel<H> {
         // The devices interrupt again, and what they wrote meanwhile is
         // delivered (`watch.rs`).
         self.end_watches();
-        if halted || me.rq_head.get() != 0 || me.dl_head.get() != 0 || me.direct.get() != 0 || self.hal.now() >= until {
+        if halted || me.fq_first.get() != 0 || me.dl_head.get() != 0 || me.direct.get() != 0 || self.hal.now() >= until {
             return;
         }
         // The watch ran its length with nothing: halt, without watching again.
@@ -793,5 +798,30 @@ impl<H: Hal> Kernel<H> {
             me.timer_at.set(want);
             self.hal.set_timer(want);
         }
+    }
+}
+
+/// A processor's timers as `order.rs` sees them: threads in order of
+/// deadline, linked through `tprev` (left), `tnext` (right) and `t_up`.
+pub(crate) struct Timers<'a, H: Hal>(pub(crate) &'a Kernel<H>, pub(crate) &'a Cpu);
+
+impl<H: Hal> crate::order::Tree for Timers<'_, H> {
+    #[inline(always)]
+    fn node(&self, t: Paddr) -> crate::order::Node<'_> {
+        let th = self.0.thread(t);
+        crate::order::Node { left: &th.tprev, right: &th.tnext, up: &th.t_up, meta: &th.t_meta }
+    }
+    #[inline(always)]
+    fn key(&self, t: Paddr) -> u64 {
+        self.0.thread(t).deadline.get()
+    }
+    fn root(&self) -> &crate::order::Root {
+        &self.1.timer_tree
+    }
+    fn first(&self) -> &Cell<Paddr> {
+        &self.1.timers
+    }
+    fn last(&self) -> &Cell<Paddr> {
+        &self.1.timers_last
     }
 }

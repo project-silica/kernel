@@ -91,7 +91,9 @@ impl<H: Hal> Kernel<H> {
             match ty {
                 ObjectType::Thread => {
                     self.hal.init_thread(&self.phys, obj);
-                    // A thread starts on the processor that made it.
+                    // No time yet: it runs once its maker binds it to a
+                    // scheduling context, on that context's processor
+                    // (until then it is nowhere in particular: here).
                     self.thread(obj).cpu.set(self.hal.cpu() as u64);
                 }
                 ObjectType::SchedContext => self.init_sched(obj),

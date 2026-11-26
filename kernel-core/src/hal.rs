@@ -112,6 +112,10 @@ pub trait Hal {
     /// The device address space `root` is going away: every device attached
     /// to it reaches nothing from now on.
     fn io_release(&self, _phys: &Phys, _root: Paddr) {}
+    /// Whoever holds the device address space `root` has read how many of
+    /// its devices' accesses were refused (`Inspect`): a device held quiet
+    /// since its last refusal was reported is heard again.
+    fn io_taken(&self, _phys: &Phys, _root: Paddr) {}
     /// The first interrupt line that is a message, not a wire.
     fn msi_first(&self) -> usize {
         usize::MAX
@@ -216,15 +220,33 @@ pub trait Hal {
     fn irq_route(&self, line: usize, cpu: usize, level: bool, active_low: bool) -> bool;
     /// Hold interrupt line `line` off, or let it interrupt again.
     fn irq_mask(&self, line: usize, masked: bool);
+    /// Hold line `line` off because it fired again before its waiter took
+    /// its news, or let it interrupt again (`held` false). A level line
+    /// stays masked until its driver acknowledges it (`IrqAck`) whatever
+    /// this says. By default the line is masked.
+    fn irq_hold(&self, line: usize, held: bool) {
+        self.irq_mask(line, held)
+    }
+    /// Deliver line `line`, routed already (by [`Hal::irq_route`] or
+    /// [`Hal::msi_route`]), to processor `cpu` from now on, as it was
+    /// triggered before, without its device being told anything. `false`
+    /// where the machine cannot: a message line whose device names the
+    /// processor itself (no interrupt remapping). An interrupt already on
+    /// its way may still arrive where the line went before.
+    fn irq_move(&self, line: usize, cpu: usize) -> bool {
+        let _ = (line, cpu);
+        false
+    }
     /// Port I/O (x86_64). `width` is 1, 2 or 4.
     fn port_io(&self, port: u16, width: u8, write: bool, value: u32) -> u32;
     /// Write to the kernel's console.
     fn console(&self, bytes: &[u8]);
-    /// Turn the machine off, telling a test harness `status` (0: success).
-    /// Returns only where that is not possible.
+    /// Turn the machine off. A test image's kernel (`harness`) told that a
+    /// test harness listens tells it `status` (0: success) instead. Returns
+    /// only where that is not possible.
     fn power_off(&self, status: u64);
-    /// Reset the machine (a test harness is told `status`, as for
-    /// `power_off`). Returns only where that is not possible.
+    /// Reset the machine (`status` as for `power_off`). Returns only where
+    /// that is not possible.
     fn reset(&self, status: u64) {
         let _ = status;
     }

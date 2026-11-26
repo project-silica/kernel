@@ -143,6 +143,16 @@ extern "C" fn ap_main(slot: usize) -> ! {
     cpu::percpu().online.store(true, Ordering::Release);
     let k = super::kernel();
     k.enter();
+    // A test image asked (`panic=park`): processor 1 keeps its lock with
+    // interrupts off for good, as a processor hung in hardware or held by
+    // firmware would; the next entry that takes every lock must stop the
+    // machine naming it (`kernel_core::smp::stalled`), not wait for ever.
+    #[cfg(feature = "harness")]
+    if index == 1 && super::harness::PARK.load(Ordering::Relaxed) {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
     // SAFETY: tables, processor state and the kernel lock are set up.
     unsafe { cpu::exit_to_user() }
 }

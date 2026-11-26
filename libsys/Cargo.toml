@@ -9,5 +9,10 @@ publish.workspace = true
 [dependencies]
 silica-abi = { path = "../abi" }
 
+# What only a test image's programs may ask the kernel: the counts its test
+# kernel keeps (`IrqInfo::delivered`, `from_afar`).
+[features]
+harness = []
+
 [lints]
 workspace = true

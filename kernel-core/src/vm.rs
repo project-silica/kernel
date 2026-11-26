@@ -35,8 +35,23 @@ pub struct AsHeader {
     /// their first word, and how many: taken before new ones.
     pub(crate) free: Cell<Paddr>,
     pub(crate) nfree: Cell<u64>,
+    /// A device address space: accesses its devices were refused (by the
+    /// IOMMU), and a capability to the notification told of each, given
+    /// by whoever attached a device (`DeviceAttach`).
+    pub(crate) faults: Cell<u64>,
+    pub(crate) fault_note: crate::cap::Slot,
 }
 impl KObj for AsHeader {}
+// The page's upper half is the architecture's (processors' identifiers, the
+// IOMMU's domain).
+const _: () = assert!(core::mem::size_of::<AsHeader>() <= 2048);
+
+impl AsHeader {
+    /// Where its fault notification's slot is, in the object at `a`.
+    pub(crate) fn fault_note_slot(a: Paddr) -> Paddr {
+        a + core::mem::offset_of!(AsHeader, fault_note) as u64
+    }
+}
 
 const PAGE: u64 = 1 << PAGE_BITS;
 
@@ -286,6 +301,57 @@ impl<H: Hal> Kernel<H> {
         slot.mnext.set(0);
     }
 
+    /// The IOMMU refused accesses of the devices named by `sids` (source
+    /// identifiers): each one's device address space counts it (`Inspect`)
+    /// and its fault notification, if its attacher gave one, is signalled.
+    /// Called by the architecture's fault interrupt holding this
+    /// processor's lock; `space_of` finds a device's space as
+    /// [`Hal::io_attach`] named it, looked up again holding every lock (it
+    /// may have been destroyed since the fault was recorded).
+    pub fn device_faults(&self, sids: &[u16], space_of: impl Fn(u16) -> Paddr) {
+        if sids.is_empty() {
+            return;
+        }
+        let global = self.ncpu() > 1;
+        if global {
+            self.go_global();
+        }
+        for &sid in sids {
+            let root = space_of(sid);
+            if root == 0 {
+                continue;
+            }
+            let a = root - PAGE;
+            let h = self.aspace(a);
+            h.faults.set(h.faults.get() + 1);
+            if let Some(n) = self.slot(AsHeader::fault_note_slot(a)).cap() {
+                self.signal(n.obj, n.badge.max(1));
+            }
+        }
+        if global {
+            self.go_local();
+        }
+    }
+
+    /// Remove every mapping of address space `a` that overlaps `start` to
+    /// `end`, each whole, whoever holds its frame; returns how many. One
+    /// pass over the space's mapped frames.
+    pub(crate) fn unmap_range(&self, a: Paddr, start: u64, end: u64) -> u64 {
+        let (mut s, mut n) = (self.aspace(a).maps.get(), 0);
+        while s != 0 {
+            let slot = self.slot(s);
+            let next = slot.mnext.get();
+            let va = slot.badge.get() & !(PAGE - 1);
+            let bits = slot.cap().map_or(PAGE_BITS, |c| c.bits);
+            if va < end && va.saturating_add(1 << bits) > start {
+                self.unmap_slot(s);
+                n += 1;
+            }
+            s = next;
+        }
+        n
+    }
+
     /// A table page for address space `a`: one given back, else a new one
     /// from its pool (the caller has checked there is one, `check_map`).
     #[inline(always)]
@@ -408,6 +474,8 @@ impl<H: Hal> Kernel<H> {
             s = n;
         }
         if h.io.get() != 0 {
+            // Whoever was told of its devices' faults is not any more.
+            self.delete_slot_shallow(AsHeader::fault_note_slot(a));
             // Its devices reach nothing from here on: the memory of its
             // tables and of the frames that were mapped can be reused.
             if h.attached.replace(0) != 0 {

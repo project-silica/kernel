@@ -31,10 +31,15 @@ pub const SLOT_POWER: u64 = 9;
 /// `Syscall::IrqBind` with `IRQ_MSI`).
 pub const SLOT_DEVICES: u64 = 10;
 /// Slot of the processor-time capability: every processor of the machine,
-/// by index (`Syscall::SchedConfigure`: a weight above the default, or a
-/// deadline reservation, on the processors it covers). Narrowed by
-/// `CapCopy` as any range is.
+/// by index (`Syscall::SchedConfigure`: what gives a scheduling context a
+/// share or a reservation of a processor it covers). Narrowed by `CapCopy`
+/// as any range is.
 pub const SLOT_SCHED: u64 = 11;
+/// Slot of the root thread's own scheduling context: one fair share of
+/// the boot processor at the default weight, the first time there is.
+/// Every other context is made by the root task or by whoever it gives
+/// processor time to.
+pub const SLOT_CONTEXT: u64 = 12;
 /// Slot of the Untyped the root task's own objects were made from; what is
 /// left of it is the root task's to use.
 pub const SLOT_BOOT_UNTYPED: u64 = 7;
@@ -139,7 +144,17 @@ pub struct RootInfo {
     pub cmdline: [u8; 256],
     /// The Untyped capabilities, in slot order from `SLOT_FIRST_UNTYPED`.
     pub untyped: [UntypedDesc; MAX_UNTYPED],
+    /// Length of `last_panic` (0: the last boot did not end in a panic, or
+    /// its record did not survive the reset).
+    pub last_panic_len: u64,
+    /// The beginning of the last boot's crash record: the console's last
+    /// lines, the panic and its backtrace (the kernel says it whole on the
+    /// console when it boots).
+    pub last_panic: [u8; LAST_PANIC],
 }
+
+/// How much of the last boot's crash record [`RootInfo`] carries.
+pub const LAST_PANIC: usize = 4096;
 
 /// The boot secret from the root thread's start registers: the second to
 /// fifth argument registers (`a1` to `a4`), little-endian, in order. 32

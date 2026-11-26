@@ -40,6 +40,10 @@ impl TestHal {
 
 pub struct TestHal {
     pub now: Cell<u64>,
+    /// How much later each reading of the clock is than the last (0: time
+    /// moves only when a test moves it): what makes a kernel entry take
+    /// time, for a test that judges what holding a lock costs.
+    pub now_step: Cell<u64>,
     /// Each simulated processor's timer: its deadline, and whether it is
     /// armed (set and not yet fired).
     pub timers: [Cell<u64>; TEST_CPUS],
@@ -220,7 +224,9 @@ impl Hal for TestHal {
         self.forgets.set(self.forgets.get() + 1);
     }
     fn now(&self) -> u64 {
-        self.now.get()
+        let now = self.now.get();
+        self.now.set(now + self.now_step.get());
+        now
     }
     fn set_timer(&self, deadline: u64) {
         let c = self.cpu.get();
@@ -282,6 +288,10 @@ impl Hal for TestHal {
     }
     fn irq_mask(&self, line: usize, masked: bool) {
         self.irq_log.borrow_mut().push(format!("{} {line}", if masked { "mask" } else { "unmask" }));
+    }
+    fn irq_move(&self, line: usize, cpu: usize) -> bool {
+        self.irq_log.borrow_mut().push(format!("move {line} cpu{cpu}"));
+        true
     }
     fn port_io(&self, port: u16, _width: u8, write: bool, value: u32) -> u32 {
         if write { 0 } else { port as u32 ^ value }
@@ -399,7 +409,9 @@ impl Machine {
 }
 
 pub struct Machine {
-    pub k: Kernel<TestHal>,
+    /// Boxed: a test may keep several machines alive at once, and a
+    /// kernel is too large for a test thread's stack several times over.
+    pub k: Box<Kernel<TestHal>>,
     _ram: Ram,
     pub root: Paddr,
     /// The root CapSpace.
@@ -424,10 +436,22 @@ impl Machine {
 
     /// A machine with `cpus` processors; the root task runs on processor 0.
     pub fn with_cpus(mib: u64, cpus: usize) -> Machine {
+        Machine::build(mib, cpus, RAM_BASE)
+    }
+
+    /// A machine whose usable memory starts at `from` (at or above
+    /// `RAM_BASE`), as an aarch64 machine's starts at a large aligned
+    /// address: what lies below is not described to the kernel.
+    pub fn with_usable_from(mib: u64, from: u64) -> Machine {
+        Machine::build(mib, 1, from)
+    }
+
+    fn build(mib: u64, cpus: usize, from: u64) -> Machine {
         assert!(cpus <= TEST_CPUS, "the test machine has at most {TEST_CPUS} processors");
         let ram = Ram::new((mib << 20) as usize);
         let hal = TestHal {
             now: Cell::new(1000),
+            now_step: Cell::new(0),
             timers: [const { Cell::new(u64::MAX) }; TEST_CPUS],
             armed: [const { Cell::new(false) }; TEST_CPUS],
             pending: Cell::new(0),
@@ -458,7 +482,7 @@ impl Machine {
         // lives as long as the kernel and is used by nothing else.
         let k = Kernel::new(hal, unsafe { Phys::new(base) });
         let regions = [
-            Region { base: RAM_BASE, len: (mib << 20) - 0x4000, kind: RegionKind::Usable as u32, reserved: 0 },
+            Region { base: from, len: RAM_BASE + (mib << 20) - 0x4000 - from, kind: RegionKind::Usable as u32, reserved: 0 },
             Region { base: RAM_BASE + (mib << 20) - 0x4000, len: 0x4000, kind: RegionKind::Ramdisk as u32, reserved: 0 },
         ];
         let elf = tiny_elf(&[0x0F, 0x05, 0xEB, 0xFC], 0x3000);
@@ -478,6 +502,7 @@ impl Machine {
             entropy_sources: 0,
             cmdline: b"test=host",
             cpus: cpus as u64,
+            last_panic: &[],
         };
         k.set_cpu_count(cpus);
         k.enter();
@@ -490,7 +515,7 @@ impl Machine {
         k.schedule();
         k.leave();
         assert_eq!(k.current(), root);
-        Machine { k, _ram: ram, root, cs, info, mib, start_args }
+        Machine { k: Box::new(k), _ram: ram, root, cs, info, mib, start_args }
     }
 
     pub fn info(&self) -> &RootInfo {
@@ -607,11 +632,37 @@ impl Machine {
         self.ok(Syscall::Retype, [ut, ty as u64, bits, silica_abi::root::SLOT_CAPSPACE, slot, count]);
     }
 
-    /// A new thread sharing the root's CapSpace and address space, runnable.
+    /// The slot of a fair scheduling context of the default weight on
+    /// processor `cpu`: the root's own on processor 0, else one the root
+    /// makes on first use (it holds every processor's time).
+    pub fn time_on(&self, cpu: u64) -> u64 {
+        use silica_abi::root::{SLOT_CONTEXT, SLOT_SCHED};
+        if cpu == 0 {
+            return SLOT_CONTEXT;
+        }
+        let slot = 1900 + cpu;
+        if self.cap(slot).is_none() {
+            let (ut, _) = self.big_untyped();
+            self.retype(ut, ObjectType::SchedContext, 0, slot, 1);
+            self.ok(Syscall::SchedConfigure, [slot, silica_abi::SCHED_FAIR, silica_abi::SCHED_DEFAULT_WEIGHT, 0, cpu, SLOT_SCHED]);
+        }
+        slot
+    }
+
+    /// Take the thread in `slot` to processor `cpu`: bind it to time
+    /// there (`Machine::time_on`), which is the only way a thread moves.
+    pub fn move_to(&self, slot: u64, cpu: u64) {
+        let time = self.time_on(cpu);
+        self.ok(Syscall::ThreadControl, [slot, 2, time, 0, 0, 0]);
+    }
+
+    /// A new thread sharing the root's CapSpace, address space and
+    /// scheduling context (so on processor 0), runnable.
     /// Uses slots `slot` (thread) and returns the thread object.
     pub fn spawn(&self, ut: u64, slot: u64) -> Paddr {
         self.retype(ut, ObjectType::Thread, 0, slot, 1);
         self.ok(Syscall::ThreadConfigure, [slot, silica_abi::root::SLOT_CAPSPACE, SLOT_ASPACE, 0, 0, 0]);
+        self.ok(Syscall::ThreadControl, [slot, 2, silica_abi::root::SLOT_CONTEXT, 0, 0, 0]);
         self.ok(Syscall::ThreadStart, [slot, 0x40_0000, 0, 0, 1, 0]);
         self.cap(slot).unwrap().obj
     }
