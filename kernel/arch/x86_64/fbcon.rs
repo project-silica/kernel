@@ -34,13 +34,18 @@ static PANICKING: AtomicBool = AtomicBool::new(false);
 
 /// Find the framebuffer and start drawing. Boot processor, once, with the
 /// physical map up.
-pub fn init(bi: &BootInfo, phys: &Phys) {
+pub fn init(bi: &BootInfo, phys: &Phys, regions: &[kernel_core::boot::Region]) {
     let (w, h, stride) = (bi.fb_width as u64, bi.fb_height as u64, bi.fb_stride as u64);
-    let bytes = stride * h * 4;
+    let Some(bytes) = stride.checked_mul(h).and_then(|b| b.checked_mul(4)) else { return };
     if bi.fb_base == 0 || !matches!(bi.fb_format, 1 | 2) || w < WIDTH as u64 || h < HEIGHT as u64 || stride < w {
         return;
     }
     if bi.fb_base.checked_add(bytes).is_none_or(|end| end > bi.phys_map_len) {
+        return;
+    }
+    // A framebuffer the firmware places inside usable memory would have
+    // the kernel draw over what programs are given: not drawn.
+    if !kernel_core::boot::framebuffer_is_apart(regions, bi.fb_base, bytes) {
         return;
     }
     BASE.store(phys.ptr(bi.fb_base) as u64, Ordering::Relaxed);

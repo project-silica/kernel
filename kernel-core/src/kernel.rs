@@ -46,6 +46,9 @@ pub struct Kernel<H: Hal> {
     pub(crate) irqs: [(Cell<Paddr>, Cell<u64>); silica_abi::IRQ_LINES as usize],
     /// Where each line is routed and how its deliveries went.
     pub(crate) irq_stat: [crate::ipc::IrqStat; silica_abi::IRQ_LINES as usize],
+    /// How many lines are held off waiting for their news to be taken
+    /// (`Kernel::release_lines`).
+    pub(crate) held_lines: core::sync::atomic::AtomicU32,
     /// Watched lines (`watch.rs`), and how many entries are in use.
     pub(crate) watches: [crate::watch::LineWatch; silica_abi::IRQ_WATCHES],
     pub(crate) nwatches: Cell<usize>,
@@ -70,6 +73,7 @@ impl<H: Hal> Kernel<H> {
             reaping: Cell::new(0),
             irqs: [const { (Cell::new(0), Cell::new(0)) }; silica_abi::IRQ_LINES as usize],
             irq_stat: [const { crate::ipc::IrqStat::new() }; silica_abi::IRQ_LINES as usize],
+            held_lines: core::sync::atomic::AtomicU32::new(0),
             watches: [const { crate::watch::LineWatch::new() }; silica_abi::IRQ_WATCHES],
             nwatches: Cell::new(0),
             log_rate: crate::log::Rate::new(),
@@ -446,6 +450,43 @@ impl<H: Hal> Kernel<H> {
         self.leave_pair();
     }
 
+    /// `DeviceAttach`. Out of line, as are the other calls a driver makes
+    /// once: inside `dispatch` its code changed how the compiler laid out
+    /// the calls made thousands of times a second (a page fault took 30
+    /// instructions more with it there).
+    #[inline(never)]
+    fn device_attach(&self, t: Paddr, a: [u64; 6]) -> Result<Exit, Error> {
+        let id = self.device(t, a[0], a[1])?;
+        let space = if a[2] == 0 {
+            0
+        } else {
+            let (_, asp) = self.ccap(t, a[2], ObjectType::AddressSpace, Rights::WRITE)?;
+            if asp.flags & FLAG_IO == 0 {
+                return Err(Error::WrongType);
+            }
+            asp.obj
+        };
+        // The notification told of the space's devices' refused accesses
+        // (`a3`; write; 0: none, or keep the one given before).
+        let note = if space != 0 && a[3] != 0 { Some(self.ccap(t, a[3], ObjectType::Notification, Rights::WRITE)?) } else { None };
+        self.attach(id, space)?;
+        if let Some((s, n)) = note {
+            let embedded = crate::vm::AsHeader::fault_note_slot(space);
+            self.delete(embedded);
+            self.insert_sibling(s, embedded, &n);
+        }
+        Ok(Exit::Done)
+    }
+
+    /// `Inspect` of a device address space: the devices attached, and how
+    /// many of their accesses the IOMMU refused. Out of line as
+    /// [`Kernel::device_attach`] is.
+    #[inline(never)]
+    fn inspect_io_space(&self, a: Paddr) -> [u64; 6] {
+        let h = self.aspace(a);
+        [h.io.get(), h.attached.get(), h.faults.get(), 0, 0, 0]
+    }
+
     fn dispatch(&self, s: Syscall, t: Paddr, a: [u64; 6]) -> Result<Exit, Error> {
         let grant = |cap: &Cap| if cap.rights.has(Rights::GRANT) { IPC_GRANT } else { 0 };
         // Emptying left over from an earlier entry (a large CapSpace,
@@ -772,8 +813,12 @@ impl<H: Hal> Kernel<H> {
                     }
                 }
                 // Whatever the line signalled before no longer hears from it,
-                // and its news is no longer known.
+                // and its news is no longer known; a hold on it ends (the new
+                // route, or the mask below, sets what the hardware does).
                 self.unwatch_line(line);
+                if self.irq_stat[line].held.swap(false, core::sync::atomic::Ordering::Relaxed) {
+                    self.held_lines.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+                }
                 let old = self.irqs[line].0.replace(0);
                 if old != 0 {
                     let q = self.queue(old);
@@ -895,6 +940,9 @@ impl<H: Hal> Kernel<H> {
                         [sc.class.get(), size, sc.period.get(), sc.remaining.get(), sc.consumed.get(), cpu]
                     }
                     ObjectType::CapSpace | ObjectType::Thread => return Err(Error::BadArg),
+                    // A device address space: the devices attached, and how
+                    // many of their accesses the IOMMU refused.
+                    ObjectType::AddressSpace => self.inspect_io_space(cap.obj),
                     // Whether a call is parked on the notification, its
                     // caller still waiting for the answer: how a server
                     // tells a parked caller from one that has gone.
@@ -950,20 +998,7 @@ impl<H: Hal> Kernel<H> {
                 }
                 Ok(Exit::Done)
             }
-            Syscall::DeviceAttach => {
-                let id = self.device(t, a[0], a[1])?;
-                let space = if a[2] == 0 {
-                    0
-                } else {
-                    let (_, asp) = self.ccap(t, a[2], ObjectType::AddressSpace, Rights::WRITE)?;
-                    if asp.flags & FLAG_IO == 0 {
-                        return Err(Error::WrongType);
-                    }
-                    asp.obj
-                };
-                self.attach(id, space)?;
-                Ok(Exit::Done)
-            }
+            Syscall::DeviceAttach => self.device_attach(t, a),
             Syscall::Console => {
                 let (_, cap) = self.ccap(t, a[0], ObjectType::Hw, Rights::WRITE)?;
                 if cap.flags & FLAG_CONSOLE == 0 {

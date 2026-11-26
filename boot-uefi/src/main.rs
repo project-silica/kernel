@@ -530,34 +530,21 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         // SAFETY: as above; the map is no longer changing.
         unsafe { &*((map as usize + i * dsize) as *const efi::MemoryDescriptor) }
     };
-    let out = regions as *mut Region;
-    let mut n = 0usize;
-    let mut floor = 0u64;
-    loop {
-        // Selection sort over at most a few hundred descriptors.
-        let mut best: Option<&efi::MemoryDescriptor> = None;
-        for i in 0..count {
+    // Overlaps take the most restrictive kind; a range that wraps is
+    // refused by name (`kernel_core::boot::convert_map`, host-tested).
+    // SAFETY: `regions` was allocated for MAX_REGIONS entries, the loader's own.
+    let out = unsafe { core::slice::from_raw_parts_mut(regions as *mut Region, MAX_REGIONS) };
+    let n = match kernel_core::boot::convert_map(
+        count,
+        |i| {
             let d = desc(i);
-            if d.pages != 0 && d.phys >= floor && best.is_none_or(|b| d.phys < b.phys) {
-                best = Some(d);
-            }
-        }
-        let Some(d) = best else { break };
-        floor = d.phys + d.pages * PAGE;
-        let kind = kind_of(d.ty) as u32;
-        // SAFETY: `out` has room for MAX_REGIONS entries; `n` is checked below.
-        unsafe {
-            if n > 0 && (*out.add(n - 1)).kind == kind && (*out.add(n - 1)).base + (*out.add(n - 1)).len == d.phys {
-                (*out.add(n - 1)).len += d.pages * PAGE;
-            } else {
-                if n == MAX_REGIONS {
-                    fail("the firmware memory map has too many regions");
-                }
-                *out.add(n) = Region { base: d.phys, len: d.pages * PAGE, kind, reserved: 0 };
-                n += 1;
-            }
-        }
-    }
+            (d.phys, d.pages.checked_mul(PAGE).unwrap_or(u64::MAX), kind_of(d.ty) as u32)
+        },
+        out,
+    ) {
+        Ok(n) => n,
+        Err(why) => fail(why),
+    };
 
     let info = BootInfo {
         magic: BOOT_MAGIC,

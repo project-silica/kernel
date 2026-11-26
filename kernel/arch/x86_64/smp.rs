@@ -117,6 +117,9 @@ unsafe extern "C" {
 /// The secondaries that arrived (`kernel_core::smp::Admission`).
 static ADMISSION: kernel_core::smp::Admission = kernel_core::smp::Admission::new();
 
+/// `panic=park` (tests): processor 1 parks holding its lock (`ap_main`).
+pub static PARK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// A secondary, in its slot `slot` (its stacks and tables), arrives: it
 /// takes the next index, or stops for good if the boot processor has
 /// already closed the count (said by `wait`).
@@ -143,6 +146,15 @@ extern "C" fn ap_main(slot: usize) -> ! {
     cpu::percpu().online.store(true, Ordering::Release);
     let k = super::kernel();
     k.enter();
+    // `panic=park` (tests): processor 1 keeps its lock with interrupts off
+    // for good, as a processor hung in hardware or held by firmware would;
+    // the next entry that takes every lock must stop the machine naming it
+    // (`kernel_core::smp::stalled`), not wait for ever.
+    if index == 1 && PARK.load(Ordering::Relaxed) {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
     // SAFETY: tables, processor state and the kernel lock are set up.
     unsafe { cpu::exit_to_user() }
 }

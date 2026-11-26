@@ -152,7 +152,8 @@ unsafe extern "C" {
 // The vector table. Entries from EL0 (AArch64) save the thread's frame and
 // call `user_trap` with the kind; the kernel's own synchronous exceptions
 // are faults; the only interrupts taken in the kernel are in the idle wait.
-// AArch32 and SError entries are fatal.
+// AArch32 entries, and SErrors taken in the kernel, are fatal; an SError from
+// EL0 is judged by `user_trap` (kind 2).
 global_asm!(
     r#"
 .section .text.fast, "ax"
@@ -192,8 +193,10 @@ vectors:
     mov x1, #1
     b user_entry
 .balign 128
-    mov x3, #11
-    b kernel_bad
+    sub sp, sp, #16
+    stp x0, x1, [sp]
+    mov x1, #2
+    b user_entry
 .irp n, 12,13,14,15
 .balign 128
     mov x3, #\n
@@ -201,7 +204,7 @@ vectors:
 .endr
 
 // Save the thread's frame. On entry x1 is the kind (0 synchronous, 1
-// interrupt); the thread's x0 and x1 are on the stack.
+// interrupt, 2 SError); the thread's x0 and x1 are on the stack.
 user_entry:
     mrs x0, tpidr_el1
     ldr x0, [x0]

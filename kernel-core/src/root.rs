@@ -171,7 +171,7 @@ impl<H: Hal> Kernel<H> {
         };
         let mut cursor = 0u64;
         for r in spec.regions {
-            let (a, b) = (r.base, r.base + r.len);
+            let (a, b) = (r.base, r.base.saturating_add(r.len));
             if a > cursor {
                 device(cursor, a, &mut emit);
             }

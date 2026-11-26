@@ -13,6 +13,7 @@ macro_rules! ctor {
     };
 }
 
+pub mod arm;
 pub mod boot;
 pub mod cap;
 /// The image format readers (their own crate, shared with the loader and userspace).

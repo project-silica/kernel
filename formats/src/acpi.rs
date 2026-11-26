@@ -326,6 +326,46 @@ pub fn iort_its_device(iort: &[u8], segment: u32, rid: u32) -> Option<u32> {
     None
 }
 
+/// The buses of PCI segment `segment` the MCFG table `mcfg` gives
+/// configuration space for: one past its highest bus number (how many
+/// root-table entries can have devices), or `None` when it names none.
+/// Entries are 16 bytes from offset 44: base, segment, start and end bus.
+pub fn mcfg_buses(mcfg: &[u8], segment: u16) -> Option<u64> {
+    let entries = mcfg.get(44..)?;
+    entries
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .filter(|e| u16::from_le_bytes([e[8], e[9]]) == segment && e[10] <= e[11])
+        .map(|e| e[11] as u64 + 1)
+        .max()
+}
+
+#[cfg(test)]
+mod mcfg {
+    use super::mcfg_buses;
+    extern crate std;
+
+    #[test]
+    fn the_buses_of_a_segment_come_from_its_highest_bus() {
+        let mut t = std::vec![0u8; 44];
+        let entry = |seg: u16, start: u8, end: u8| {
+            let mut e = std::vec![0u8; 16];
+            e[8..10].copy_from_slice(&seg.to_le_bytes());
+            (e[10], e[11]) = (start, end);
+            e
+        };
+        assert_eq!(mcfg_buses(&t, 0), None);
+        t.extend(entry(0, 0, 255));
+        assert_eq!(mcfg_buses(&t, 0), Some(256));
+        t.extend(entry(1, 0, 15));
+        t.extend(entry(0, 0x80, 0x40)); // malformed: ignored
+        assert_eq!(mcfg_buses(&t, 1), Some(16));
+        assert_eq!(mcfg_buses(&t, 0), Some(256));
+        assert_eq!(mcfg_buses(&t[..50], 0), None, "a truncated entry is not one");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

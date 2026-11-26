@@ -25,15 +25,27 @@ pub struct IrqStat {
     /// still take one routed before, so these are atomic.
     pub(crate) fired: core::sync::atomic::AtomicU64,
     pub(crate) far: core::sync::atomic::AtomicU64,
+    /// Held off: it fired again while its last news was still pending, so
+    /// it waits (masked, or sent to the discard vector) until its waiter
+    /// takes the news (`Kernel::release_lines`).
+    pub(crate) held: core::sync::atomic::AtomicBool,
+    /// Deliveries in a row that found the line's last news still pending
+    /// (one that found it taken starts again): past [`STORM`] the line is
+    /// held off. A busy device that its waiter keeps up with never gets
+    /// there, so the hold costs ordinary interrupts nothing.
+    pub(crate) pending_run: core::sync::atomic::AtomicU32,
 }
 
 impl IrqStat {
     ctor! {
         pub(crate) fn new() -> IrqStat {
-            IrqStat { cpu: core::cell::Cell::new(0), fired: core::sync::atomic::AtomicU64::new(0), far: core::sync::atomic::AtomicU64::new(0) }
+            IrqStat { cpu: core::cell::Cell::new(0), fired: core::sync::atomic::AtomicU64::new(0), far: core::sync::atomic::AtomicU64::new(0), held: core::sync::atomic::AtomicBool::new(false), pending_run: core::sync::atomic::AtomicU32::new(0) }
         }
     }
 }
+
+/// Deliveries in a row with the news still pending that make a storm.
+pub(crate) const STORM: u32 = 64;
 
 /// The notification slot a receive listens on, from its first argument.
 pub(crate) fn listen_slot(a0: u64) -> u64 {
@@ -280,6 +292,7 @@ impl<H: Hal> Kernel<H> {
                 return Err(Error::InUse);
             }
             let word = n.word.replace(0);
+            self.release_lines(listen.1);
             if word != 0 {
                 th.regs[H::ARG[0]].set(word);
                 th.regs[H::ARG[1]].set(MsgInfo::NOTIFIED.0);
@@ -391,8 +404,17 @@ impl<H: Hal> Kernel<H> {
             });
         let stat = &self.irq_stat[line];
         stat.fired.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // A line that keeps firing while its waiter has not taken the last
+        // news gains nothing by being heard: past [`STORM`] such deliveries
+        // in a row it is held off until the waiter receives, so a device (or
+        // a driver programming one) raising it without end costs one
+        // interrupt per receive, not a processor.
+        let storm = self.storming(line, q.word.get() & irq.1.get() != 0);
         if local {
             self.signal(n, irq.1.get());
+            if storm {
+                self.hold_line(line);
+            }
             return;
         }
         // The waiter is another processor's: take every lock, and look
@@ -406,6 +428,9 @@ impl<H: Hal> Kernel<H> {
             // moved to another processor (or one that waits on a processor
             // other than the one it bound the line on) is otherwise
             // interrupted through every processor's lock, every time.
+            if storm {
+                self.hold_line(line);
+            }
             let to = self.waiter_cpu(n);
             self.signal(n, irq.1.get());
             if let Some(to) = to.filter(|c| *c != me)
@@ -415,6 +440,54 @@ impl<H: Hal> Kernel<H> {
             }
         }
         self.go_local();
+    }
+
+    /// Whether line `line`, delivered now with its news `pending` (not yet
+    /// taken) or not, has fired [`STORM`] times in a row with it pending.
+    #[inline]
+    fn storming(&self, line: usize, pending: bool) -> bool {
+        let run = &self.irq_stat[line].pending_run;
+        if !pending {
+            run.store(0, core::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        run.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1 >= STORM
+    }
+
+    /// Hold line `line` off until its waiter takes its news.
+    fn hold_line(&self, line: usize) {
+        if !self.irq_stat[line].held.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            self.held_lines.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.hal.irq_hold(line, true);
+        }
+    }
+
+    /// Notification `n`'s news was taken: the lines held off for it may
+    /// interrupt again. Costs one load while no line is held anywhere.
+    #[inline]
+    pub(crate) fn release_lines(&self, n: Paddr) {
+        if self.held_lines.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+            self.release_lines_of(n);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn release_lines_of(&self, n: Paddr) {
+        for (line, irq) in self.irqs.iter().enumerate() {
+            if irq.0.get() == n {
+                self.unhold_line(line);
+            }
+        }
+    }
+
+    /// Line `line` is no longer held off (released, or bound anew).
+    pub(crate) fn unhold_line(&self, line: usize) {
+        self.irq_stat[line].pending_run.store(0, core::sync::atomic::Ordering::Relaxed);
+        if self.irq_stat[line].held.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            self.held_lines.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            self.hal.irq_hold(line, false);
+        }
     }
 
     /// The processor of whoever waits on notification `n`: the first
@@ -478,6 +551,7 @@ impl<H: Hal> Kernel<H> {
             q.listener().set(0);
         }
         let word = q.word.replace(0);
+        self.release_lines(n);
         if word != 0 {
             let th = self.thread(t);
             th.regs[H::ARG[0]].set(word);

@@ -433,7 +433,8 @@ impl Hal for X86 {
 
     fn set_timer(&self, deadline: u64) {
         // No later than the console must be fed again (`serial::due`).
-        let tsc = self.tsc_at(deadline.min(serial::due()));
+        let deadline = deadline.min(serial::due()).min(iommu::due());
+        let tsc = self.tsc_at(deadline);
         let per_ns = self.apic_per_ns.get();
         // Writing the timer leaves a virtual machine; writing what it holds
         // already (above all: disarming a timer that has fired, on every
@@ -621,14 +622,28 @@ impl Hal for X86 {
         // SAFETY: the x2APIC interrupt command register: a fixed interrupt
         // to one processor by its identifier.
         unsafe { wrmsr(0x830, (them.apic_id as u64) << 32 | KICK_VECTOR) };
+        // Bounded: a processor that never enters the kernel (its interrupt
+        // lost, or a firmware SMI holding it) is sent the kick once more
+        // after a second, then named (`kernel_core::smp::stalled`).
+        let mut stall = kernel_core::smp::Stall::new();
+        let mut resent = false;
         while wait && them.mode.is_user() {
+            let now = self.now();
+            stall.turn(now, cpu, "entered the kernel when asked");
+            if !resent && stall.longer_than(now, 1_000_000_000) {
+                resent = true;
+                // SAFETY: as above.
+                unsafe { wrmsr(0x830, (them.apic_id as u64) << 32 | KICK_VECTOR) };
+            }
             core::hint::spin_loop();
         }
     }
 
-    fn wait_left(&self, _cpu: usize, request: &kernel_core::lock::Leave) {
+    fn wait_left(&self, cpu: usize, request: &kernel_core::lock::Leave) {
         // It answers while it waits for its lock, which the caller holds.
+        let mut stall = kernel_core::smp::Stall::new();
         while !request.answered() {
+            stall.turn(self.now(), cpu, "left an address space being destroyed");
             core::hint::spin_loop();
         }
     }
@@ -659,6 +674,20 @@ impl Hal for X86 {
 
     fn irq_mask(&self, line: usize, masked: bool) {
         ioapic::mask(&kernel().phys, line, masked);
+    }
+
+    fn irq_hold(&self, line: usize, held: bool) {
+        if line < ioapic::lines() {
+            // A level line is unmasked by its driver's acknowledgement only.
+            if held || !ioapic::is_level(line) {
+                ioapic::mask(&kernel().phys, line, held);
+            }
+        } else {
+            // A message line: its remapping entry delivers to the discard
+            // vector while held. Without remapping the device holds the
+            // message and the kernel cannot hold it off.
+            iommu::hold(&kernel().phys, line, held);
+        }
     }
 
     fn irq_move(&self, line: usize, cpu: usize) -> bool {
@@ -921,7 +950,29 @@ pub fn irq(vector: u64, locked: bool) {
             console_tick(k);
         }
         KICK_VECTOR => {}
-        iommu::FAULT_VECTOR => iommu::fault(&k.phys),
+        iommu::FAULT_VECTOR => {
+            let refused = iommu::fault(&k.phys, k.hal.now());
+            // Held off for the rest of the second: the timer lets it go
+            // (`console_tick`), armed for then unless it fires sooner.
+            let due = iommu::due();
+            if due != u64::MAX && k.hal.tsc_at(due) < percpu().deadline.get() {
+                k.hal.set_timer(due);
+            }
+            if refused.n != 0 {
+                // Whoever attached each device hears of it, through the
+                // kernel (which the idle wait has not entered).
+                let space_of = |sid| iommu::space_of(&k.phys, sid);
+                if locked {
+                    k.device_faults(&refused.sids[..refused.n], space_of);
+                } else {
+                    percpu().mode.enter_kernel();
+                    k.enter();
+                    k.device_faults(&refused.sids[..refused.n], space_of);
+                    percpu().mode.idle();
+                    k.leave();
+                }
+            }
+        }
         iommu::DISCARD_VECTOR => iommu::discarded(),
         SPURIOUS_VECTOR => return,
         v if (ioapic::FIRST_VECTOR..ioapic::FIRST_VECTOR + silica_abi::IRQ_LINES).contains(&v) => {
@@ -1426,7 +1477,9 @@ pub extern "C" fn kmain(info: u64) -> ! {
     }
     flush_all();
 
-    fbcon::init(&bi, &k.phys);
+    // SAFETY: loader memory, read-only during boot (as read below).
+    let firmware_regions = unsafe { core::slice::from_raw_parts(k.phys.ptr(bi.regions).cast::<Region>(), bi.region_count as usize) };
+    fbcon::init(&bi, &k.phys, firmware_regions);
     if !serial::present() {
         klog!(
             k,
@@ -1503,6 +1556,7 @@ pub extern "C" fn kmain(info: u64) -> ! {
     // They come up while the IOMMU is set up, and are counted (those that
     // arrived) before the root task is told how many there are.
     let smp_from = rdtsc();
+    smp::PARK.store(Cmdline(cmdline).get("panic") == Some(b"park"), Ordering::Relaxed);
     if cpus > 1 {
         smp::start(hz);
     }
@@ -1664,8 +1718,10 @@ fn crc32c(state: u32, data: &[u8]) -> u32 {
 /// its own deadlines, and `set_timer` takes the console's into account).
 fn console_tick(k: &kernel_core::Kernel<X86>) {
     report_nmis(k);
-    serial::drain(k.hal.now());
-    if serial::due() != u64::MAX {
+    let now = k.hal.now();
+    serial::drain(now);
+    iommu::tick(&k.phys, now);
+    if serial::due() != u64::MAX || iommu::due() != u64::MAX {
         k.hal.set_timer(u64::MAX);
     }
 }
