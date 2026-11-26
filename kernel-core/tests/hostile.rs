@@ -827,6 +827,55 @@ fn a_flood_of_lock_taking_calls_holds_back_its_own_context_only() {
     m.k.check_runqueues().unwrap();
 }
 
+/// What holding every lock costs a program on another processor is the
+/// whole time held, however many other processors are idle: a pair of
+/// programs calling each other across two processors has one of them
+/// running at a time, and each call of the pair waits for the locks. So a
+/// flood on a machine of four processors beside one busy one is held
+/// back after spending its burst, as on a machine of two (before: it was
+/// charged a third, and on eight processors a flood beside such a pair
+/// kept 69% of the pair's round trips; `smp_global_flood8`).
+#[test]
+fn a_flood_beside_idle_processors_pays_the_whole_time_it_holds_every_lock() {
+    use kernel_core::smp::GLOBAL_BURST_NS;
+    use kernel_core::thread::THROTTLED;
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    let m = Machine::with_cpus(64, 4);
+    let (ut, _) = m.big_untyped();
+    // One other processor has work; the other two are idle.
+    m.spawn(ut, FREE + 20);
+    m.move_to(FREE + 20, 1);
+    m.settle(1);
+    m.on(0);
+    m.retype(ut, T::SchedContext, 0, FREE, 1);
+    m.ok(S::SchedConfigure, [FREE, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    let flood = m.spawn(ut, FREE + 2);
+    m.ok(S::ThreadControl, [FREE + 2, 2, FREE, 0, 0, 0]);
+    m.retype(ut, T::Endpoint, 0, FREE + 4, 1);
+    // Every reading of the clock is 10 us later than the last, so a call
+    // that takes every lock holds them at least that long.
+    m.k.hal.now_step.set(10_000);
+    let mut calls = 0u64;
+    while m.k.thread_view(flood).state != THROTTLED {
+        let slot = FREE + 5;
+        let call = if m.cap(slot).is_none() {
+            (S::CapCopy, [SLOT_CAPSPACE, slot, FREE + 4, 15, 0, 0])
+        } else {
+            (S::CapDelete, [slot, 0, 0, 0, 0, 0])
+        };
+        let r = m.sys_as(flood, call.0, call.1);
+        assert!(r.blocked || r.status == 0, "{:?}", Error::result(r.status));
+        calls += 1;
+        assert!(calls < 100_000, "a flood of calls that take every lock was never held back");
+    }
+    assert!(
+        calls * 10_000 <= 2 * GLOBAL_BURST_NS,
+        "a flood beside two idle processors and one busy one held every lock for {} calls of at least 10 us before it was held back, its burst being {} us",
+        calls,
+        GLOBAL_BURST_NS / 1000
+    );
+}
+
 /// Binding takes a thread to its context's processor (the context's
 /// capability is the authority to), fair or reserved, and a context with
 /// threads bound keeps its processor. When a context's last capability

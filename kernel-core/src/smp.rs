@@ -531,21 +531,22 @@ impl<H: Hal> Kernel<H> {
     /// context `t` runs on now. Its length, from before it took the first
     /// lock (waiting for the others it held some), is what it cost each
     /// other processor that had a thread to run; an idle one loses nothing
-    /// to its lock being held. So the charge is the length times the part
-    /// of the other processors that had work: nothing for a program alone
-    /// on a machine that maps and unmaps on every fault (a pager), all of
-    /// it on a machine with every processor busy. Read holding every lock:
-    /// what each processor runs is a fact, not an estimate.
+    /// to its lock being held. So it is charged whole when any other
+    /// processor had work, and not at all on a machine where none did (a
+    /// pager alone, mapping and unmapping on every fault). Not scaled by
+    /// how many had work: a pair of programs calling each other across two
+    /// processors has one running at a time, and every call of the pair
+    /// waits out the whole of it. Read holding every lock: what each
+    /// processor runs is a fact, not an estimate.
     #[inline(always)]
     pub(crate) fn spent_global(&self, me: &Cpu, t: Paddr) {
-        let busy = self.others().filter(|(_, c)| c.cur.get() != 0).count() as u64;
         let s = self.thread(t).sc.get();
         // (A call may have taken the caller's own context away.)
-        if busy == 0 || s == 0 {
+        if s == 0 || !self.others().any(|(_, c)| c.cur.get() != 0) {
             return;
         }
         let held = self.hal.now().saturating_sub(me.global_from.get());
-        let cost = (held as u128 * busy as u128 / (self.ncpu() as u128 - 1)).min(i64::MAX as u128) as i64;
+        let cost = held.min(i64::MAX as u64) as i64;
         let sc = self.sched(s);
         sc.global_budget.set(sc.global_budget.get().saturating_sub(cost));
     }
