@@ -780,11 +780,36 @@ pub fn unremap(phys: &Phys, line: usize) {
     // SAFETY: under `LOCK`.
     let s = unsafe { &*STATE.0.get() };
     let at = s.irt + line as u64 * 16;
-    // SAFETY: entry `line` of the kernel's table: not present.
+    // The entry stays present, its source check and destination kept, and
+    // delivers to the discard vector: the line is gone, but its device may
+    // still have the vector unmasked (its driver was ended, and nothing has
+    // reached the device yet). A message through a not-present entry is a
+    // fault the unit records for every message, and QEMU's VT-d model,
+    // updating KVM's route for a vector still in use, aborted on it (about
+    // one `recovery` run in five).
+    // SAFETY: entry `line` of the kernel's table; one aligned store changes
+    // the vector, so a unit reads the old entry or the parked one.
     unsafe {
-        word(phys, at).write_volatile(0);
-        word(phys, at + 8).write_volatile(0);
+        let low = word(phys, at).read_volatile();
+        if low & 1 != 0 {
+            word(phys, at).write_volatile(low & !(0xFF << 16) & !(1 << 4) | DISCARD_VECTOR << 16);
+        }
     }
     invalidate(phys, s, &[[4 | 1 << 4 | (line as u64) << 32, 0]]);
     LOCK.unlock();
+}
+
+/// The vector a released line's remapping entry delivers to ([`unremap`]):
+/// counted and acknowledged, never anyone's line.
+pub const DISCARD_VECTOR: u64 = 0xF3;
+static DISCARDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A device raised a line that was released: counted.
+pub fn discarded() {
+    DISCARDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many messages released lines have delivered since boot.
+pub fn discarded_count() -> u64 {
+    DISCARDED.load(Ordering::Relaxed)
 }

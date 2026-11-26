@@ -922,6 +922,7 @@ pub fn irq(vector: u64, locked: bool) {
         }
         KICK_VECTOR => {}
         iommu::FAULT_VECTOR => iommu::fault(&k.phys),
+        iommu::DISCARD_VECTOR => iommu::discarded(),
         SPURIOUS_VECTOR => return,
         v if (ioapic::FIRST_VECTOR..ioapic::FIRST_VECTOR + silica_abi::IRQ_LINES).contains(&v) => {
             let line = (v - ioapic::FIRST_VECTOR) as usize;
