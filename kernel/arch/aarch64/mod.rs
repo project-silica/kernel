@@ -137,8 +137,91 @@ struct Out;
 impl Write for Out {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         write_bytes(s.as_bytes());
+        record(s.as_bytes());
         Ok(())
     }
+}
+
+/// The crash record's region (`kernel_core::crash`, physical; 0: none), this
+/// boot's number, and while a panic writes its record, how long it is
+/// (`usize::MAX`: no panic is writing). As on x86_64.
+static CRASH: AtomicU64 = AtomicU64::new(0);
+static BOOT: AtomicU64 = AtomicU64::new(0);
+static RECORD_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// The crash record's region, mapped, when there is one.
+fn crash_region() -> Option<&'static mut [u8]> {
+    let at = CRASH.load(Ordering::Relaxed);
+    // SAFETY: the region the loader kept for the record, `REGION_BYTES`
+    // long, in the physical map; nothing else maps or uses it, and only the
+    // boot processor (at boot) or the first processor to panic touches it.
+    (at != 0)
+        .then(|| unsafe { core::slice::from_raw_parts_mut((PHYS_MAP_BASE + at) as *mut u8, kernel_core::crash::REGION_BYTES as usize) })
+}
+
+/// A panic begins its record: the console's last lines first.
+fn record_panic() {
+    let Some(region) = crash_region() else { return };
+    if RECORD_LEN.compare_exchange(usize::MAX, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    kernel_core::crash::begin(region);
+    let mut tail = [0u8; 8192];
+    let n = CONSOLE.recent(&mut tail);
+    RECORD_LEN.store(kernel_core::crash::append(region, 0, &tail[..n]), Ordering::Release);
+}
+
+/// What the panic says goes into its record as well.
+fn record(bytes: &[u8]) {
+    let len = RECORD_LEN.load(Ordering::Acquire);
+    if len == usize::MAX {
+        return;
+    }
+    if let Some(region) = crash_region() {
+        RECORD_LEN.store(kernel_core::crash::append(region, len, bytes), Ordering::Release);
+    }
+}
+
+/// The end of a panic: its record sealed, then the machine reset (PSCI)
+/// unless a harness listens for the status.
+fn after_panic() -> ! {
+    let len = RECORD_LEN.swap(usize::MAX, Ordering::AcqRel);
+    if let Some(region) = crash_region()
+        && len != usize::MAX
+    {
+        kernel_core::crash::seal(region, BOOT.load(Ordering::Relaxed), len);
+    }
+    if HARNESS.load(Ordering::Relaxed) {
+        die();
+    }
+    let _ = write!(Out, "kernel: resetting the machine\r\n");
+    smp::system_reset();
+    die()
+}
+
+/// At boot: the last boot's crash record, if one survived, said on the
+/// console whole, kept for the root task (returned), and cleared.
+fn last_panic(at: u64) -> &'static [u8] {
+    struct Kept(core::cell::UnsafeCell<[u8; silica_abi::root::LAST_PANIC]>);
+    // SAFETY: written once by the boot processor before any other starts.
+    unsafe impl Sync for Kept {}
+    static KEPT: Kept = Kept(core::cell::UnsafeCell::new([0; silica_abi::root::LAST_PANIC]));
+    CRASH.store(at, Ordering::Relaxed);
+    let Some(region) = crash_region() else {
+        let _ = write!(Out, "kernel: no memory kept for a crash record: a panic halts this machine\r\n");
+        return &[];
+    };
+    BOOT.store(kernel_core::crash::next_boot(region), Ordering::Relaxed);
+    let Some((was, text)) = kernel_core::crash::read(region) else { return &[] };
+    let _ = write!(Out, "kernel: the last boot (boot {was}) ended in a panic; its record:\r\n");
+    write_bytes(text);
+    let _ = write!(Out, "\r\nkernel: end of the last boot's record\r\n");
+    // SAFETY: as above.
+    let kept = unsafe { &mut *KEPT.0.get() };
+    let n = text.len().min(kept.len());
+    kept[..n].copy_from_slice(&text[..n]);
+    kernel_core::crash::clear(region);
+    &kept[..n]
 }
 
 /// Stop this processor: tell a test harness the kernel failed, then wait.
@@ -411,6 +494,7 @@ static SLIDE: AtomicU64 = AtomicU64::new(0);
 
 /// The kernel panicked: say why, show where, stop.
 pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    record_panic();
     let _ = write!(Out, "\r\nPANIC: {}\r\n", info.message());
     if let Some(l) = info.location() {
         let _ = write!(Out, "  at {}:{}\r\n", l.file(), l.line());
@@ -420,11 +504,12 @@ pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     // SAFETY: reads the program counter and the frame pointer.
     unsafe { asm!("adr {}, .", "mov {}, x29", out(reg) pc, out(reg) fp, options(nomem, nostack)) }
     backtrace(pc, fp);
-    die()
+    after_panic()
 }
 
 /// An exception taken in the kernel (the only kind there is so far).
 extern "C" fn kernel_fault(esr: u64, elr: u64, far: u64, entry: u64, fp: u64) -> ! {
+    record_panic();
     let _ = write!(
         Out,
         "\r\nPANIC: kernel exception through vector {} (syndrome {:#x}: class {:#x}) at {:#x}, address {:#x}\r\n  kernel slide {:#x}; backtrace (link addresses):\r\n",
@@ -436,7 +521,7 @@ extern "C" fn kernel_fault(esr: u64, elr: u64, far: u64, entry: u64, fp: u64) ->
         SLIDE.load(Ordering::Relaxed)
     );
     backtrace(elr, fp);
-    die()
+    after_panic()
 }
 
 // ---- the kernel's view of the machine ---------------------------------------
@@ -1036,6 +1121,7 @@ extern "C" fn kmain(info: u64) -> ! {
     if let Some(uart) = spcr_uart(bi.rsdp).and_then(map_device) {
         UART.store(uart, Ordering::Relaxed);
     }
+    let last_panic = last_panic(bi.crash);
 
     // SAFETY: as for the command line.
     let regions = unsafe { core::slice::from_raw_parts((PHYS_MAP_BASE + bi.regions) as *const Region, bi.region_count as usize) };
@@ -1180,6 +1266,7 @@ extern "C" fn kmain(info: u64) -> ! {
         entropy_sources: bi.entropy_sources,
         cmdline: cmdline.0,
         cpus: cpus as u64,
+        last_panic,
     };
     if let Err(e) = k.boot_root(&spec) {
         let _ = write!(Out, "ERROR: kernel: cannot start the root task: {e:?}\r\n");

@@ -61,6 +61,8 @@ pub struct RootSpec<'a> {
     pub cmdline: &'a [u8],
     /// Number of processors.
     pub cpus: u64,
+    /// The last boot's crash record, as the kernel found it (empty: none).
+    pub last_panic: &'a [u8],
 }
 
 /// Why the root task could not be created.
@@ -250,6 +252,9 @@ impl<H: Hal> Kernel<H> {
         put(offset_of!(RootInfo, cmdline_len), &[cmd.len() as u64]);
         put(offset_of!(RootInfo, cpus), &[spec.cpus, self.hal.io_top(), (self.hal.msi_first() as u64).min(silica_abi::IRQ_LINES)]);
         self.phys.write_bytes(info + offset_of!(RootInfo, cmdline) as u64, cmd);
+        let last = &spec.last_panic[..spec.last_panic.len().min(silica_abi::root::LAST_PANIC)];
+        put(offset_of!(RootInfo, last_panic_len), &[last.len() as u64]);
+        self.phys.write_bytes(info + offset_of!(RootInfo, last_panic) as u64, last);
 
         // The thread: its CapSpace, address space and IPC buffer, then go.
         let t = self.slot(slot(SLOT_THREAD)).obj.get();

@@ -84,6 +84,23 @@ impl Boot {
         addr
     }
 
+    /// The crash record's region (`kernel_core::crash`): the first of a few
+    /// fixed addresses the firmware lets this loader have, neither zeroed
+    /// nor ever given to anyone else, so a panic's record outlives a warm
+    /// reset at an address the next boot finds again. 0 when none is free.
+    fn crash_region(&self) -> u64 {
+        let pages = (kernel_core::crash::REGION_BYTES / PAGE) as usize;
+        for at in CRASH_AT {
+            let mut addr = at;
+            // SAFETY: valid boot services; `addr` outlives the call. Type 2
+            // is AllocateAddress: exactly these pages or nothing.
+            if unsafe { ((*self.bs).allocate_pages)(2, efi::MEM_SILICA_CRASH, pages, &mut addr) } == efi::SUCCESS {
+                return addr;
+            }
+        }
+        0
+    }
+
     fn protocol<T>(&self, handle: efi::Handle, guid: &efi::Guid) -> Option<*mut T> {
         let mut p: *mut c_void = ptr::null_mut();
         // SAFETY: valid boot services; `p` outlives the call.
@@ -300,6 +317,8 @@ fn kind_of(ty: u32) -> RegionKind {
         efi::MEM_LOADER_DATA => RegionKind::Loader,
         efi::MEM_SILICA_KERNEL => RegionKind::Kernel,
         efi::MEM_SILICA_RAMDISK => RegionKind::Ramdisk,
+        // The crash record: the kernel's, never handed out.
+        efi::MEM_SILICA_CRASH => RegionKind::Kernel,
         efi::MEM_MMIO | efi::MEM_MMIO_PORT | efi::MEM_RESERVED => RegionKind::Firmware,
         // ACPI tables and NVS, runtime services, persistent memory and the
         // like: memory, the firmware's.
@@ -309,6 +328,10 @@ fn kind_of(ty: u32) -> RegionKind {
 
 const MAX_REGIONS: usize = 1024;
 const MAP_BYTES: u64 = 256 * 1024;
+
+/// Where the crash record may live, in order: low enough for the smallest
+/// machine (256 MB), above what the firmware uses early in its boot.
+const CRASH_AT: [u64; 3] = [0x0300_0000, 0x0500_0000, 0x0700_0000];
 
 /// UEFI image entry point.
 // SAFETY: `efi_main` is the entry symbol the UEFI target's linker expects;
@@ -336,6 +359,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     let (kfile, klen) = boot.read(root, "SILICA\\KERNEL.ELF", efi::MEM_LOADER_DATA).unwrap_or_else(|| fail("SILICA\\KERNEL.ELF not found"));
     let ramdisk = boot.read(root, "SILICA\\RAMDISK.IMG", efi::MEM_SILICA_RAMDISK).unwrap_or((0, 0));
     let cmdline = boot.read(root, "SILICA\\CMDLINE.TXT", efi::MEM_LOADER_DATA).unwrap_or((0, 0));
+    let crash = boot.crash_region();
     let t_files = arch::counter();
     // SAFETY: the command line was read into `cmdline.1` bytes at `cmdline.0`.
     let words = unsafe { core::slice::from_raw_parts(cmdline.0 as *const u8, cmdline.1 as usize) };
@@ -585,6 +609,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         wall_secs,
         wall_tsc,
         loader_tsc,
+        crash,
     };
     // SAFETY: `info_page` is a page allocated above; the tables map this
     // code at its address through `low` and the kernel at its entry.

@@ -15,6 +15,7 @@ macro_rules! ctor {
 
 pub mod boot;
 pub mod cap;
+pub mod crash;
 /// The image format readers (their own crate, shared with the loader and userspace).
 pub use silica_formats::{acpi, elf, ramdisk};
 #[cfg(test)]

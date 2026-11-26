@@ -484,6 +484,7 @@ impl Machine {
             entropy_sources: 0,
             cmdline: b"test=host",
             cpus: cpus as u64,
+            last_panic: &[],
         };
         k.set_cpu_count(cpus);
         k.enter();

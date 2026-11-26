@@ -139,7 +139,17 @@ pub struct RootInfo {
     pub cmdline: [u8; 256],
     /// The Untyped capabilities, in slot order from `SLOT_FIRST_UNTYPED`.
     pub untyped: [UntypedDesc; MAX_UNTYPED],
+    /// Length of `last_panic` (0: the last boot did not end in a panic, or
+    /// its record did not survive the reset).
+    pub last_panic_len: u64,
+    /// The beginning of the last boot's crash record: the console's last
+    /// lines, the panic and its backtrace (the kernel says it whole on the
+    /// console when it boots).
+    pub last_panic: [u8; LAST_PANIC],
 }
+
+/// How much of the last boot's crash record [`RootInfo`] carries.
+pub const LAST_PANIC: usize = 4096;
 
 /// The boot secret from the root thread's start registers: the second to
 /// fifth argument registers (`a1` to `a4`), little-endian, in order. 32

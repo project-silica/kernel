@@ -149,3 +149,8 @@ pub fn write(bytes: &[u8]) {
         send(b);
     }
 }
+
+/// The console's last bytes, sent or not (a crash record's tail).
+pub fn recent(out: &mut [u8]) -> usize {
+    RING.recent(out)
+}
