@@ -886,7 +886,14 @@ impl<H: Hal> Kernel<H> {
                     ObjectType::CapSpace if a[2] == 0 => {
                         let s = self.slot_in(&cap, a[1])?;
                         match self.view(s) {
-                            Some(v) => [v.cap.ty as u64, v.cap.rights.0 as u64, v.cap.bits as u64, v.cap.obj, v.cap.badge, v.depth as u64 | isolated(&v.cap)],
+                            Some(v) => [
+                                v.cap.ty as u64,
+                                v.cap.rights.0 as u64,
+                                v.cap.bits as u64,
+                                v.cap.obj,
+                                v.cap.badge,
+                                v.depth as u64 | isolated(&v.cap),
+                            ],
                             None => [0; 6],
                         }
                     }
