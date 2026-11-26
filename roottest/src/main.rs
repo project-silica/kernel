@@ -763,6 +763,7 @@ fn t_irq() -> T {
 /// 2026-11-24 audit), the line stayed where it was bound, and every
 /// interrupt of a moved driver took every processor's lock. The serial
 /// port's "transmitter empty" interrupt is the device (as in [`t_irq`]).
+#[cfg(target_arch = "x86_64")]
 fn t_irq_follow() -> T {
     need_cpus(2)?;
     const LINES: Cap = Cap(SLOT_IRQS);
@@ -2218,6 +2219,7 @@ const TESTS: &[(&str, fn() -> T)] = &[
     ("untyped", t_untyped),
     ("caps", t_caps),
     ("irq", t_irq),
+    #[cfg(target_arch = "x86_64")]
     ("irq_follow", t_irq_follow),
     ("inspect", t_inspect),
     ("ipc_caps", t_ipc_caps),

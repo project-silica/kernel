@@ -357,13 +357,15 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         fail("cannot open the boot volume");
     }
     let t_open = arch::counter();
-    let (kfile, klen) = boot.read(root, "SILICA\\KERNEL.ELF", efi::MEM_LOADER_DATA).unwrap_or_else(|| fail("SILICA\\KERNEL.ELF not found"));
-    let ramdisk = boot.read(root, "SILICA\\RAMDISK.IMG", efi::MEM_SILICA_RAMDISK).unwrap_or((0, 0));
+    // The command line first: whether a harness hears the status decides
+    // how every failure after this one ends (a missing kernel included).
     let cmdline = boot.read(root, "SILICA\\CMDLINE.TXT", efi::MEM_LOADER_DATA).unwrap_or((0, 0));
-    let t_files = arch::counter();
     // SAFETY: the command line was read into `cmdline.1` bytes at `cmdline.0`.
     let words = unsafe { core::slice::from_raw_parts(cmdline.0 as *const u8, cmdline.1 as usize) };
     HARNESS.store(words.split(|b| b.is_ascii_whitespace()).any(|w| w == b"exit=semihosting" || w == b"exit=port"), Ordering::Relaxed);
+    let (kfile, klen) = boot.read(root, "SILICA\\KERNEL.ELF", efi::MEM_LOADER_DATA).unwrap_or_else(|| fail("SILICA\\KERNEL.ELF not found"));
+    let ramdisk = boot.read(root, "SILICA\\RAMDISK.IMG", efi::MEM_SILICA_RAMDISK).unwrap_or((0, 0));
+    let t_files = arch::counter();
     // Refused here, once the command line says whether a harness hears the
     // status (the loader is built for plain x86-64 and Armv8.0, so reading
     // two files first is safe on any processor of either).

@@ -324,9 +324,30 @@ fn a_mapping_too_large_for_one_call_is_refused() {
 /// maps a peer's memory at a fresh address each time (as a service mapping
 /// what its clients lend it does) ran its address space out of tables:
 /// 120 lend-and-end cycles of a 1 MiB frame in an 18-bit space.
+/// One test per frame size and kind of space, so Miri runs them side by side
+/// (in one test, one after another, they were the longest of its run).
 #[test]
-fn page_tables_are_given_back_when_their_mappings_go() {
-    for (bits, io) in [(14u64, false), (20, false), (22, false), (20, true)] {
+fn page_tables_are_given_back_when_their_mappings_go_16k() {
+    tables_given_back(14, false);
+}
+
+#[test]
+fn page_tables_are_given_back_when_their_mappings_go_1m() {
+    tables_given_back(20, false);
+}
+
+#[test]
+fn page_tables_are_given_back_when_their_mappings_go_4m() {
+    tables_given_back(22, false);
+}
+
+#[test]
+fn page_tables_are_given_back_when_their_mappings_go_for_devices() {
+    tables_given_back(20, true);
+}
+
+fn tables_given_back(bits: u64, io: bool) {
+    {
         let m = Machine::new(if cfg!(miri) { 16 } else { 64 });
         let (ut, _) = m.big_untyped();
         m.retype(ut, T::AddressSpace, 18 | if io { silica_abi::ASPACE_IO } else { 0 }, FREE + 10, 1);

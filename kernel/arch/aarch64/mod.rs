@@ -222,6 +222,8 @@ fn last_panic(at: u64) -> &'static [u8] {
     kept[..n].copy_from_slice(&text[..n]);
     kernel_core::crash::clear(region);
     &kept[..n]
+}
+
 /// A panic is under way: a processor taking a kick stops for good.
 static PANICKING: AtomicBool = AtomicBool::new(false);
 /// Processors that stopped for the panic.
