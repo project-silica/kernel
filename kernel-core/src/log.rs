@@ -293,6 +293,17 @@ impl<const N: usize> TxRing<N> {
         self.push(bytes);
     }
 
+    /// The last bytes put, sent or not, as many as `out` holds and the
+    /// ring still has (a crash record's console tail). Returns how many.
+    pub fn recent(&self, out: &mut [u8]) -> usize {
+        let h = self.head.load(Ordering::Relaxed);
+        let n = out.len().min(h).min(N);
+        for (i, o) in out[..n].iter_mut().enumerate() {
+            *o = self.buf[(h - n + i) % N].load(Ordering::Relaxed);
+        }
+        n
+    }
+
     /// Whether anything waits to be sent.
     pub fn pending(&self) -> bool {
         self.head.load(Ordering::Relaxed) != self.tail.load(Ordering::Relaxed)

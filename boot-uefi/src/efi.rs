@@ -221,6 +221,8 @@ pub const MEM_CONVENTIONAL: u32 = 7;
 pub const MEM_SILICA_KERNEL: u32 = 0x8000_0001;
 /// OS-defined memory type: the ramdisk.
 pub const MEM_SILICA_RAMDISK: u32 = 0x8000_0002;
+/// OS-defined memory type: the crash record (`kernel_core::crash`).
+pub const MEM_SILICA_CRASH: u32 = 0x8000_0003;
 
 /// EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL (the part this loader uses).
 #[repr(C)]

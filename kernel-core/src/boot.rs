@@ -4,7 +4,7 @@
 /// `BootInfo::magic`.
 pub const BOOT_MAGIC: u64 = 0x544F_4F42_4C49_5321; // "!SILBOOT"
 /// Version of this structure. The kernel refuses any other.
-pub const BOOT_VERSION: u32 = 1;
+pub const BOOT_VERSION: u32 = 2;
 
 /// Virtual address at which the loader maps all physical memory.
 pub const PHYS_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
@@ -105,6 +105,10 @@ pub struct BootInfo {
     pub wall_tsc: u64,
     /// Timestamp counter when the loader started.
     pub loader_tsc: u64,
+    /// Physical address of the crash record's region
+    /// ([`crate::crash::REGION_BYTES`], kept out of every allocation and
+    /// never cleared by the loader); 0 when the firmware would not give it.
+    pub crash: u64,
 }
 
 /// The kernel command line: space-separated `key=value` words and bare flags.

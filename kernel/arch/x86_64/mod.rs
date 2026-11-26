@@ -979,8 +979,116 @@ impl Write for Out {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         serial::write(s.as_bytes());
         fbcon::write(s.as_bytes());
+        record(s.as_bytes());
         Ok(())
     }
+}
+
+/// The crash record's region (`kernel_core::crash`, physical; 0: the loader
+/// could not keep one), this boot's number, and while a panic writes its
+/// record, how long it is (`usize::MAX`: no panic is writing).
+static CRASH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BOOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RECORD_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// The crash record's region, mapped, when there is one.
+fn crash_region() -> Option<&'static mut [u8]> {
+    let at = CRASH.load(Ordering::Relaxed);
+    // SAFETY: the region the loader kept for the record, `REGION_BYTES`
+    // long, in the physical map; nothing else maps or uses it, and only the
+    // boot processor (at boot) or the one panicking processor (the others
+    // stopped) touches it.
+    (at != 0).then(|| unsafe { core::slice::from_raw_parts_mut(kernel().phys.ptr(at), kernel_core::crash::REGION_BYTES as usize) })
+}
+
+/// A panic begins its record: the console's last lines first. Only the
+/// first processor to panic writes one.
+fn record_panic() {
+    let Some(region) = crash_region() else { return };
+    if RECORD_LEN.compare_exchange(usize::MAX, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    kernel_core::crash::begin(region);
+    let mut tail = [0u8; 8192];
+    let n = serial::recent(&mut tail);
+    let len = kernel_core::crash::append(region, 0, &tail[..n]);
+    RECORD_LEN.store(len, Ordering::Release);
+}
+
+/// What the panic says goes into its record as well.
+fn record(bytes: &[u8]) {
+    let len = RECORD_LEN.load(Ordering::Acquire);
+    if len == usize::MAX {
+        return;
+    }
+    if let Some(region) = crash_region() {
+        RECORD_LEN.store(kernel_core::crash::append(region, len, bytes), Ordering::Release);
+    }
+}
+
+/// The end of a panic: its record sealed, then, unless a harness listens
+/// for the status, the machine reset (a machine nobody watches comes back,
+/// and the next boot says why it went). With a harness, stop as before.
+fn after_panic() -> ! {
+    let len = RECORD_LEN.swap(usize::MAX, Ordering::AcqRel);
+    if let Some(region) = crash_region()
+        && len != usize::MAX
+    {
+        kernel_core::crash::seal(region, BOOT.load(Ordering::Relaxed), len);
+    }
+    if HARNESS.load(Ordering::Relaxed) {
+        die();
+    }
+    let _ = write!(Out, "kernel: resetting the machine\r\n");
+    force_reset()
+}
+
+/// Reset the machine, whatever state it is in: the ACPI reset register,
+/// then the keyboard controller's reset line, then a triple fault.
+fn force_reset() -> ! {
+    if let Some((port, value)) = power().and_then(|p| p.registers.reset) {
+        serial::outb(port, value);
+    }
+    // The 8042's pulse of the reset line, where there is one.
+    serial::outb(0x64, 0xFE);
+    // SAFETY: an empty interrupt table and an exception: the processor
+    // cannot deliver it and shuts down, which a PC resets on.
+    unsafe {
+        let idtr = [0u16; 5];
+        asm!("lidt [{}]", "int3", in(reg) idtr.as_ptr(), options(nostack));
+    }
+    loop {
+        // SAFETY: stop this processor; interrupts are off.
+        unsafe { asm!("cli", "hlt", options(nomem, nostack)) }
+    }
+}
+
+/// At boot: the last boot's crash record, if one survived the reset, said
+/// on the console whole and kept for the root task (returned), and cleared;
+/// this boot's number taken.
+fn last_panic(at: u64) -> &'static [u8] {
+    struct Kept(core::cell::UnsafeCell<[u8; silica_abi::root::LAST_PANIC]>);
+    // SAFETY: written once by the boot processor before any other starts.
+    unsafe impl Sync for Kept {}
+    static KEPT: Kept = Kept(core::cell::UnsafeCell::new([0; silica_abi::root::LAST_PANIC]));
+    CRASH.store(at, Ordering::Relaxed);
+    let Some(region) = crash_region() else {
+        klog!(kernel(), "kernel: no memory kept for a crash record: a panic halts this machine");
+        return &[];
+    };
+    let boot = kernel_core::crash::next_boot(region);
+    BOOT.store(boot, Ordering::Relaxed);
+    let Some((was, text)) = kernel_core::crash::read(region) else { return &[] };
+    let _ = write!(Out, "kernel: the last boot (boot {was}) ended in a panic; its record:\r\n");
+    serial::write(text);
+    let _ = write!(Out, "\r\nkernel: end of the last boot's record\r\n");
+    // SAFETY: written once, by the boot processor, before the root task
+    // reads the copy the kernel makes of it.
+    let kept = unsafe { &mut *KEPT.0.get() };
+    let n = text.len().min(kept.len());
+    kept[..n].copy_from_slice(&text[..n]);
+    kernel_core::crash::clear(region);
+    &kept[..n]
 }
 
 fn die() -> ! {
@@ -1016,6 +1124,7 @@ fn backtrace(first: u64, mut rbp: u64) {
 /// The kernel panicked: say why, show where, stop.
 pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     stop_others();
+    record_panic();
     fbcon::panic();
     let _ = write!(Out, "\r\nPANIC: {}\r\n", info.message());
     if let Some(l) = info.location() {
@@ -1026,12 +1135,13 @@ pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     // SAFETY: reads the instruction and frame pointers.
     unsafe { asm!("lea {}, [rip]", "mov {}, rbp", out(reg) rip, out(reg) rbp, options(nomem, nostack)) }
     backtrace(rip, rbp);
-    die()
+    after_panic()
 }
 
 /// A processor exception in kernel mode: a kernel bug.
 pub fn kernel_fault(f: &cpu::KernelFrame) -> ! {
     stop_others();
+    record_panic();
     let cr2: u64;
     // SAFETY: reading CR2 in ring 0 has no side effect.
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) }
@@ -1047,7 +1157,7 @@ pub fn kernel_fault(f: &cpu::KernelFrame) -> ! {
         kernel().hal.slide.get()
     );
     backtrace(f.rip, f.gpr[6]);
-    die()
+    after_panic()
 }
 
 fn require(ok: bool, what: &str) {
@@ -1452,6 +1562,7 @@ pub extern "C" fn kmain(info: u64) -> ! {
         (table, k.phys.bytes(bi.cmdline, bi.cmdline_len), k.phys.bytes(bi.ramdisk, bi.ramdisk_len))
     };
     HARNESS.store(Cmdline(cmdline).get("exit") == Some(b"port"), core::sync::atomic::Ordering::Relaxed);
+    let last_panic = last_panic(bi.crash);
     // Physical page 0 is never an object (address 0 means "none" in the
     // kernel), so it is unmapped in the physical map: a kernel bug that
     // reaches an object through a null address faults at once, as on
@@ -1597,6 +1708,7 @@ pub extern "C" fn kmain(info: u64) -> ! {
         entropy_sources: bi.entropy_sources,
         cmdline,
         cpus: cpus as u64,
+        last_panic,
     };
     if let Err(e) = k.boot_root(&spec) {
         klog!(k, "ERROR: kernel: cannot start the root task: {e:?}");
