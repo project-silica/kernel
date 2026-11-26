@@ -268,6 +268,9 @@ pub unsafe fn init_idt() {
 /// # Safety
 /// Once per processor, early, with interrupts off; `t` and the stacks must
 /// live for ever and belong to this processor alone.
+/// Out of line: it sets the GS base, which `Hal::cpu_slot` and `Hal::cpu`
+/// read as constant (`nomem`), so no read of either may be moved into it.
+#[inline(never)]
 pub unsafe fn init(t: *mut Tables, index: usize, apic_id: u32, stack: (u64, u64), ist: u64) {
     // SAFETY: exclusive access to this processor's tables during its boot;
     // the descriptors built here describe memory that lives for ever.

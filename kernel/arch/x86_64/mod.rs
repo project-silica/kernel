@@ -600,10 +600,14 @@ impl Hal for X86 {
 
     fn cpu_slot(&self) -> usize {
         let s: usize;
-        // SAFETY: reads this processor's slot from its `PerCpu`; it never
-        // changes, so the read is pure.
+        // SAFETY: reads this processor's slot from its `PerCpu`. Kernel code
+        // never moves between processors and the GS base is set before any
+        // kernel code runs (`cpu::init`, out of line), so for all the
+        // compiler can see the value is a constant: `nomem` lets it read
+        // it once per function instead of after every store (five times
+        // in a context switch).
         unsafe {
-            asm!("mov {}, gs:[{off}]", out(reg) s, off = const core::mem::offset_of!(cpu::PerCpu, slot), options(nostack, pure, readonly, preserves_flags))
+            asm!("mov {}, gs:[{off}]", out(reg) s, off = const core::mem::offset_of!(cpu::PerCpu, slot), options(nostack, pure, nomem, preserves_flags))
         }
         s
     }
@@ -611,8 +615,8 @@ impl Hal for X86 {
     fn cpu(&self) -> usize {
         let i: usize;
         // SAFETY: reads this processor's index from its `PerCpu` (offset 40
-        // in `cpu::PerCpu`); it never changes, so the read is pure.
-        unsafe { asm!("mov {}, gs:[40]", out(reg) i, options(nostack, pure, readonly, preserves_flags)) }
+        // in `cpu::PerCpu`); constant for all kernel code, as in `cpu_slot`.
+        unsafe { asm!("mov {}, gs:[40]", out(reg) i, options(nostack, pure, nomem, preserves_flags)) }
         i
     }
 
@@ -1506,6 +1510,15 @@ pub extern "C" fn kmain(info: u64) -> ! {
         let (base, top, ist) = cpu::boot_stacks();
         cpu::init(cpu::boot_tables(), 0, 0, (base, top), ist);
     }
+    kmain_on_cpu(entered, bi)
+}
+
+/// The rest of [`kmain`], once the GS base is set: out of line, so that no
+/// read of the processor's index or slot (constant to the compiler,
+/// `Hal::cpu_slot`) can be placed before `cpu::init`.
+#[inline(never)]
+fn kmain_on_cpu(entered: u64, bi: BootInfo) -> ! {
+    let k = kernel();
     STARTED.store(true, Ordering::Release);
     init_processor(true);
     let apic_id = rdmsr(0x802) as u32;
