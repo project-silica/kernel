@@ -1662,6 +1662,167 @@ fn bench_pairs(pairs: usize, cross: bool) -> u64 {
     (total as u128 * 1_000_000_000 / took as u128) as u64
 }
 
+/// The flood's state: 0 waiting, 1 running, 2 stopping.
+#[cfg(target_arch = "x86_64")]
+static FLOOD: AtomicU64 = AtomicU64::new(0);
+/// Operations each flooding thread made.
+#[cfg(target_arch = "x86_64")]
+static FLOODED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Where each flooding thread maps its frame.
+#[cfg(target_arch = "x86_64")]
+static FLOOD_AT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// The measured pairs: 0 waiting, 1 measuring, 2 stopping.
+#[cfg(target_arch = "x86_64")]
+static LAT_GO: AtomicU64 = AtomicU64::new(0);
+/// Round trips and the slowest one (ns) of each measured pair.
+#[cfg(target_arch = "x86_64")]
+static LAT_COUNT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+#[cfg(target_arch = "x86_64")]
+static LAT_WORST: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Round trips slower than 50 us, each pair.
+#[cfg(target_arch = "x86_64")]
+static LAT_SLOW: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// A thread that does nothing but what takes every processor's lock:
+/// derive a capability and delete it, inspect a slot, map a frame and unmap
+/// it, as fast as it can. `arg`: its index, and from bit 8 the first of two
+/// slots of its own (a free one to derive into, then its frame), the
+/// endpoint to derive from in the slot before them.
+#[cfg(target_arch = "x86_64")]
+extern "C" fn flood_thread(arg: u64) -> ! {
+    let (i, base) = ((arg & 0xFF) as usize, (arg >> 8) & 0xFF_FFFF);
+    let (src, dst, frame) = (Cap(base - 1), base, Cap(base + 1));
+    let at = FLOOD_AT[i].load(SeqCst) as usize;
+    while FLOOD.load(SeqCst) == 0 {
+        core::hint::spin_loop();
+    }
+    let mut n = 0u64;
+    while FLOOD.load(SeqCst) == 1 {
+        let _ = cap_derive(SPACE, dst, src, Rights::WRITE, 0);
+        // SAFETY: a copy this thread just made, used by nothing.
+        let _ = unsafe { cap_delete(Cap(dst)) };
+        let _ = inspect_slot(SPACE, src.0);
+        let _ = map(ASPACE, frame, at, RW);
+        // SAFETY: this thread's own frame, which nothing reads.
+        let _ = unsafe { unmap(frame) };
+        n += 5;
+        FLOODED[i].store(n, SeqCst);
+    }
+    finish(arg)
+}
+
+/// A client that times each round trip.
+#[cfg(target_arch = "x86_64")]
+extern "C" fn lat_client(arg: u64) -> ! {
+    let (pair, ep) = ((arg & 0xFF) as usize, Cap((arg >> 8) & 0xFF_FFFF));
+    while LAT_GO.load(SeqCst) == 0 {
+        core::hint::spin_loop();
+    }
+    let (mut n, mut worst, mut slow) = (0u64, 0u64, 0u64);
+    while LAT_GO.load(SeqCst) == 1 {
+        let t = CLOCK.now();
+        let _ = call(ep, MsgInfo::new(1, 4), [n, 2, 3, 4]);
+        let took = CLOCK.now() - t;
+        worst = worst.max(took);
+        slow += (took > 50_000) as u64;
+        n += 1;
+    }
+    LAT_COUNT[pair].store(n, SeqCst);
+    LAT_WORST[pair].store(worst, SeqCst);
+    LAT_SLOW[pair].store(slow, SeqCst);
+    finish(arg)
+}
+
+/// Round trips a second, the slowest (ns) and how many took over 50 us,
+/// of a pair with its client on `client` and its server on `server`, over
+/// 300 ms.
+#[cfg(target_arch = "x86_64")]
+fn timed_pair(client: usize, server: usize) -> (u64, u64, u64) {
+    LAT_GO.store(0, SeqCst);
+    LAT_COUNT[0].store(u64::MAX, SeqCst);
+    let ep = new(ObjectType::Endpoint, 0);
+    let s = foreign_thread_on(server, stub(&raw const stub_echo, &raw const stub_echo_end), ep.0);
+    let c = spawn_on(client, lat_client, ep.0 << 8, Cap::NONE).0;
+    sleep_ms(20);
+    let start = CLOCK.now();
+    LAT_GO.store(1, SeqCst);
+    sleep_ms(300);
+    LAT_GO.store(2, SeqCst);
+    let took = CLOCK.now() - start;
+    for _ in 0..1000 {
+        if LAT_COUNT[0].load(SeqCst) != u64::MAX {
+            break;
+        }
+        sleep_ms(1);
+    }
+    for t in [s, c] {
+        // SAFETY: the test's own threads, finished or blocked.
+        let _ = unsafe { cap_delete(t) };
+    }
+    let n = LAT_COUNT[0].load(SeqCst);
+    ((n as u128 * 1_000_000_000 / took as u128) as u64, LAT_WORST[0].load(SeqCst), LAT_SLOW[0].load(SeqCst))
+}
+
+/// A hostile program on processors of its own floods the kernel with what
+/// takes every processor's lock (capability derive and delete, inspect,
+/// map and unmap): how much slower are a pair's round trips on other
+/// processors, and how much later the slowest? (The 2026-11-24 audit:
+/// "capability operations, Unmap, Inspect and IrqAck take every processor's
+/// lock".) On two processors the pair shares processor 0 and the flood has
+/// processor 1; on eight the pair spans processors 1 and 2 and the flood
+/// has the other five. Judges a time: quiet.
+#[cfg(target_arch = "x86_64")]
+fn t_smp_global_flood() -> T {
+    need_cpus(2)?;
+    let cpus = CPUS.load(SeqCst) as usize;
+    let (client, server, flooders): (usize, usize, &[usize]) = if cpus >= 8 { (1, 2, &[3, 4, 5, 6, 7]) } else { (0, 0, &[1]) };
+    let (rate0, worst0, slow0) = timed_pair(client, server);
+    FLOOD.store(0, SeqCst);
+    let mut threads = [Cap::NONE; 8];
+    for (i, &cpu) in flooders.iter().enumerate() {
+        FLOODED[i].store(0, SeqCst);
+        let src = new(ObjectType::Endpoint, 0);
+        let dst = slot();
+        let frame = new(ObjectType::Frame, 12);
+        if src.0 + 1 != dst || dst + 1 != frame.0 {
+            return Err("the flood's slots are not consecutive");
+        }
+        FLOOD_AT[i].store(region(4096) as u64, SeqCst);
+        threads[i] = spawn_on(cpu, flood_thread, i as u64 | dst << 8, Cap::NONE).0;
+    }
+    sleep_ms(20);
+    let start = CLOCK.now();
+    FLOOD.store(1, SeqCst);
+    let (rate1, worst1, slow1) = timed_pair(client, server);
+    let took = CLOCK.now() - start;
+    FLOOD.store(2, SeqCst);
+    sleep_ms(20);
+    let ops: u64 = (0..flooders.len()).map(|i| FLOODED[i].load(SeqCst)).sum();
+    for t in &threads[..flooders.len()] {
+        // SAFETY: the test's own threads, finished or blocked.
+        let _ = unsafe { cap_delete(*t) };
+    }
+    println!(
+        "smp_global_flood: {cpus} processors: alone {rate0} round trips/s, slowest {} us, {slow0} over 50 us; beside {} flooding threads ({} lock-taking operations/s): {rate1}/s ({}%), slowest {} us, {slow1} over 50 us",
+        worst0 / 1000,
+        flooders.len(),
+        ops as u128 * 1_000_000_000 / took as u128,
+        rate1 * 100 / rate0.max(1),
+        worst1 / 1000
+    );
+    if ops == 0 {
+        return Err("the flood made no operation");
+    }
+    // Each processor may hold every lock a tenth of the machine's time
+    // divided among the processors, after a burst of 5 ms (`GLOBAL_SHARE`):
+    // over these 300 ms five flooders get at most 44 ms of it, one 20 ms.
+    // Before that bound the pair kept 27% (eight processors) and 37% (two).
+    if rate1 * 100 < rate0 * 70 {
+        return Err("a program flooding the kernel with what takes every lock took more than 30% of other processors' round trips");
+    }
+    Ok(())
+}
+
 fn bench() -> ! {
     bench_null_syscall();
     bench_ipc();
@@ -1994,6 +2155,11 @@ const TESTS: &[(&str, fn() -> T)] = &[
     ("smp_stress", t_smp_stress),
     ("smp_revoke", t_smp_revoke),
     ("smp_timeouts", t_smp_timeouts),
+    // A time judged under emulation is the emulator's: x86_64 runs on KVM.
+    #[cfg(target_arch = "x86_64")]
+    ("smp_global_flood", t_smp_global_flood),
+    #[cfg(target_arch = "x86_64")]
+    ("smp_global_flood8", t_smp_global_flood),
 ];
 
 /// Program entry, called by libsys's `_start`.

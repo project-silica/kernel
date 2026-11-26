@@ -29,6 +29,10 @@ pub const SENDING: u64 = 2;
 pub const RECEIVING: u64 = 3;
 /// Message delivered; waiting for the receiver's reply.
 pub const REPLY: u64 = 4;
+/// Waiting to make again a system call that takes every processor's lock,
+/// its processor having used its share of such time (`Kernel::throttled`).
+/// Its registers are as the call left them: woken, it makes it again.
+pub const THROTTLED: u64 = 5;
 
 /// `ipc_flags`: the pending send is a call.
 pub(crate) const IPC_CALL: u64 = 1;
@@ -560,6 +564,12 @@ impl<H: Hal> Kernel<H> {
             if !global && self.ncpu() > 1 && elsewhere {
                 self.go_global();
                 global = true;
+                continue;
+            }
+            if th.state.get() == THROTTLED {
+                // Its processor's share has come back: it makes its call
+                // again, its registers as the call left them.
+                self.make_runnable(t);
                 continue;
             }
             self.cancel(t, false);

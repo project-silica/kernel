@@ -45,6 +45,13 @@ pub use crate::lock::{Lock, Word};
 use crate::mem::Paddr;
 use core::cell::Cell;
 
+/// The machine's time that processors may spend holding every lock, in
+/// parts per thousand, divided equally among them (`Kernel::throttled`).
+pub const GLOBAL_SHARE: u64 = crate::tuned(option_env!("SILICA_TUNE_GLOBAL_SHARE"), 100);
+/// What a processor may spend holding every lock at once, in nanoseconds,
+/// before its share holds it back: a program's start, the boot.
+pub const GLOBAL_BURST_NS: u64 = crate::tuned(option_env!("SILICA_TUNE_GLOBAL_BURST"), 5_000_000);
+
 /// Most processors the kernel will run.
 pub const MAX_CPUS: usize = 256;
 const _: () = assert!(MAX_CPUS.is_power_of_two());
@@ -167,6 +174,14 @@ pub struct Cpu {
     pub(crate) pair: Cell<u64>,
     /// How many of this processor's kernel entries took a second lock.
     pub(crate) pairs: Cell<u64>,
+    /// Time this processor may still spend holding every lock, in
+    /// nanoseconds (negative: overdrawn), when it was last refilled, and
+    /// when the global entry under way took the locks ([`Kernel::throttled`]).
+    pub(crate) global_budget: Cell<i64>,
+    pub(crate) global_at: Cell<u64>,
+    pub(crate) global_from: Cell<u64>,
+    /// How many of this processor's system calls waited for its share.
+    pub(crate) throttles: Cell<u64>,
     /// A global entry's request that this processor stop running on a root
     /// it is about to reuse ([`Kernel::evict`]), answered while this
     /// processor waits for a lock without holding its own.
@@ -222,6 +237,10 @@ impl Cpu {
             flush: Cell::new(false),
             pair: Cell::new(0),
             pairs: Cell::new(0),
+            global_budget: Cell::new(crate::smp::GLOBAL_BURST_NS as i64),
+            global_at: Cell::new(0),
+            global_from: Cell::new(0),
+            throttles: Cell::new(0),
             leave: crate::lock::Leave::new(),
         }
     }
@@ -349,6 +368,74 @@ impl<H: Hal> Kernel<H> {
         self.global.set(true);
         self.globals.set(self.globals.get() + 1);
         self.catch_up(me);
+    }
+
+    /// Whether system call `t` made, about to take every lock (holding only
+    /// this processor's), must wait for
+    /// its processor's share of the machine's time spent so: then it is set
+    /// up to be made again and waits, and this returns true. Taking every
+    /// lock stops the whole machine, so a program on processors of its own
+    /// that did nothing else (capability copies and deletes, maps and
+    /// unmaps, inspections) took two thirds of the round trips of programs
+    /// on the others (the 2026-11-24 audit; `smp_global_flood`). The time
+    /// spent holding every lock is a resource like processor time: each
+    /// processor may hold them for [`GLOBAL_SHARE`] parts per thousand of
+    /// the time, divided among the processors, with [`GLOBAL_BURST_NS`] in
+    /// hand for bursts (a program's start, the boot). A processor that has
+    /// used its share makes the calls that want every lock wait until it
+    /// has some again; the others never wait for it. In line: one load and
+    /// a branch unless the share is used up.
+    #[inline(always)]
+    pub(crate) fn throttled(&self, me: &Cpu, t: Paddr) -> bool {
+        if me.global_budget.get() > 0 {
+            me.global_from.set(self.hal.now());
+            return false;
+        }
+        self.throttle(me, t)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn throttle(&self, me: &Cpu, t: Paddr) -> bool {
+        let now = self.hal.now();
+        let n = self.ncpu() as u128;
+        let earned = (now.saturating_sub(me.global_at.get()) as u128 * GLOBAL_SHARE as u128 / (1000 * n)).min(GLOBAL_BURST_NS as u128);
+        let budget = (me.global_budget.get() + earned as i64).min(GLOBAL_BURST_NS as i64);
+        me.global_at.set(now);
+        me.global_budget.set(budget);
+        if budget > 0 {
+            me.global_from.set(now);
+            return false;
+        }
+        // Until the share is back: then the call is made again.
+        let wait = ((-budget) as u128 * 1000 * n / GLOBAL_SHARE as u128) as u64 + 1;
+        let r = &self.thread(t).regs;
+        r[H::IP].set(r[H::IP].get().wrapping_sub(H::SYSCALL_LEN));
+        self.block(t, crate::thread::THROTTLED, 0, now.saturating_add(wait));
+        me.throttles.set(me.throttles.get() + 1);
+        true
+    }
+
+    /// The global entry under way, which [`Kernel::throttled`] let through,
+    /// is over: its time, from before it took the first lock (waiting for
+    /// the others it held some), comes out of this processor's share.
+    /// What it cost is what it cost the others: nothing when no other
+    /// processor had a thread to run (an idle processor loses nothing to
+    /// its lock being held), so a program alone on a machine that maps and
+    /// unmaps on every fault (a pager) is never held back; else the time.
+    #[inline(always)]
+    pub(crate) fn spent_global(&self, me: &Cpu) {
+        if !self.others().any(|(_, c)| c.cur.get() != 0) {
+            return;
+        }
+        let held = self.hal.now().saturating_sub(me.global_from.get());
+        me.global_budget.set(me.global_budget.get() - held.min(i64::MAX as u64) as i64);
+    }
+
+    /// How many system calls have waited for their processor's share of
+    /// the time holding every lock (a statistic for tests).
+    pub fn throttled_calls(&self) -> u64 {
+        self.cpus.iter(self.ncpu()).map(|c| c.throttles.get()).sum()
     }
 
     /// How many times a kernel entry has taken every lock (a statistic

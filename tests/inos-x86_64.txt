@@ -39,3 +39,5 @@ sched quiet
 machine_check smp=2 mce
 nmi smp=2 nmi
 isolated
+smp_global_flood smp=2 quiet
+smp_global_flood8 smp=8 quiet

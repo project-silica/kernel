@@ -364,6 +364,10 @@ pub const THREAD_SENDING: u64 = 2;
 pub const THREAD_RECEIVING: u64 = 3;
 /// `Inspect` thread state: waiting for the answer to a call (or to a fault).
 pub const THREAD_REPLY: u64 = 4;
+/// `Inspect` thread state: waiting to make a system call again that would
+/// take every processor's lock, while its processor has used up its share
+/// of the machine's time spent so (the kernel's `Kernel::throttled`).
+pub const THREAD_THROTTLED: u64 = 5;
 
 /// `Recv`, `ReplyRecv`: the notification to listen on while receiving on an
 /// endpoint is named in `a0` from this bit up (31 bits).

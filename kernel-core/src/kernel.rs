@@ -418,6 +418,11 @@ impl<H: Hal> Kernel<H> {
             }
         }
         if global {
+            // Before any other processor's lock is taken: a processor that
+            // has used its share of that time takes none of them.
+            if self.throttled(me, t) {
+                return;
+            }
             self.go_global();
             if me.cur.get() != t || self.thread(t).state.get() != RUNNABLE {
                 me.dirty.set(true);
@@ -432,6 +437,7 @@ impl<H: Hal> Kernel<H> {
             Err(e) => r[H::SYS].set(e as u64),
         }
         if global {
+            self.spent_global(me);
             self.go_local();
         }
         self.leave_pair();
