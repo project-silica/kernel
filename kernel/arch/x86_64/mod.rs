@@ -146,7 +146,7 @@ static KERNEL: Global = Global(Kernel::new(
     },
     // SAFETY: the loader maps all physical memory at PHYS_MAP_BASE and the
     // kernel only uses addresses from the boot regions through it.
-    unsafe { Phys::new(PHYS_MAP_BASE as *mut u8) },
+    unsafe { Phys::direct_map() },
 ));
 
 /// The kernel.
