@@ -1122,6 +1122,9 @@ extern "C" fn kmain(info: u64) -> ! {
         UART.store(uart, Ordering::Relaxed);
     }
     let last_panic = last_panic(bi.crash);
+    // Whether the firmware can reset the machine, known before anything
+    // can panic: a panic resets through it.
+    smp::detect_psci(bi.rsdp);
 
     // SAFETY: as for the command line.
     let regions = unsafe { core::slice::from_raw_parts((PHYS_MAP_BASE + bi.regions) as *const Region, bi.region_count as usize) };

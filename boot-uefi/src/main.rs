@@ -88,10 +88,10 @@ impl Boot {
     /// fixed addresses the firmware lets this loader have, neither zeroed
     /// nor ever given to anyone else, so a panic's record outlives a warm
     /// reset at an address the next boot finds again. 0 when none is free.
-    fn crash_region(&self) -> u64 {
+    fn crash_region(&self, ram: u64) -> u64 {
         let pages = (kernel_core::crash::REGION_BYTES / PAGE) as usize;
         for at in CRASH_AT {
-            let mut addr = at;
+            let mut addr = ram + at;
             // SAFETY: valid boot services; `addr` outlives the call. Type 2
             // is AllocateAddress: exactly these pages or nothing.
             if unsafe { ((*self.bs).allocate_pages)(2, efi::MEM_SILICA_CRASH, pages, &mut addr) } == efi::SUCCESS {
@@ -329,8 +329,9 @@ fn kind_of(ty: u32) -> RegionKind {
 const MAX_REGIONS: usize = 1024;
 const MAP_BYTES: u64 = 256 * 1024;
 
-/// Where the crash record may live, in order: low enough for the smallest
-/// machine (256 MB), above what the firmware uses early in its boot.
+/// Where the crash record may live, in order, from the start of memory: low
+/// enough for the smallest machine (256 MB), above what the firmware uses
+/// early in its boot.
 const CRASH_AT: [u64; 3] = [0x0300_0000, 0x0500_0000, 0x0700_0000];
 
 /// UEFI image entry point.
@@ -359,7 +360,6 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
     let (kfile, klen) = boot.read(root, "SILICA\\KERNEL.ELF", efi::MEM_LOADER_DATA).unwrap_or_else(|| fail("SILICA\\KERNEL.ELF not found"));
     let ramdisk = boot.read(root, "SILICA\\RAMDISK.IMG", efi::MEM_SILICA_RAMDISK).unwrap_or((0, 0));
     let cmdline = boot.read(root, "SILICA\\CMDLINE.TXT", efi::MEM_LOADER_DATA).unwrap_or((0, 0));
-    let crash = boot.crash_region();
     let t_files = arch::counter();
     // SAFETY: the command line was read into `cmdline.1` bytes at `cmdline.0`.
     let words = unsafe { core::slice::from_raw_parts(cmdline.0 as *const u8, cmdline.1 as usize) };
@@ -441,14 +441,20 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         fail("cannot read the firmware memory map");
     }
     let mut top = 4u64 << 30;
+    let mut ram = u64::MAX;
     for i in 0..size / dsize {
         // SAFETY: the firmware wrote `size` bytes of descriptors of `dsize` bytes each.
         let d = unsafe { &*((map as usize + i * dsize) as *const efi::MemoryDescriptor) };
         if !matches!(kind_of(d.ty), RegionKind::Firmware | RegionKind::FirmwareMemory) {
             top = top.max(d.phys + d.pages * PAGE);
+            ram = ram.min(d.phys);
         }
     }
     let top = (top + (1 << 30) - 1) & !((1 << 30) - 1);
+    // The crash record's region, at the same place every boot: an offset
+    // from the start of the machine's memory (0 on a PC, 1 GiB on an Arm
+    // virtual machine).
+    let crash = boot.crash_region(if ram == u64::MAX { 0 } else { ram & !0xF_FFFF });
     let root = boot.pages(efi::MEM_SILICA_KERNEL, PAGE, "out of memory for page tables");
     let low = if arch::SPLIT_ROOTS { boot.pages(efi::MEM_SILICA_KERNEL, PAGE, "out of memory for page tables") } else { root };
     let tables = Tables { boot: &boot, root, low };
