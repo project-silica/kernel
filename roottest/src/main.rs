@@ -755,6 +755,78 @@ fn t_irq() -> T {
     quiet.then_some(()).ok_or("an unbound interrupt line still signalled")
 }
 
+/// An interrupt line follows the thread that waits on it: bound here on
+/// processor 0, it is moved by the kernel to processor 1 once this thread
+/// waits there, and back when it returns. The first interrupt after a move
+/// arrives where the line was and reaches the waiter through every lock;
+/// the next ones arrive where the waiter is (`inspect_irq`). Before (the
+/// 2026-11-24 audit), the line stayed where it was bound, and every
+/// interrupt of a moved driver took every processor's lock. The serial
+/// port's "transmitter empty" interrupt is the device (as in [`t_irq`]).
+fn t_irq_follow() -> T {
+    need_cpus(2)?;
+    const LINES: Cap = Cap(SLOT_IRQS);
+    const LINE: u32 = 4;
+    let n = new(ObjectType::Notification, 0);
+    irq_bind(LINES, LINE, n, 0).map_err(|_| "cannot bind interrupt line 4")?;
+    let mcr = port_in(PORTS, 0x3FC, 1).unwrap_or(0);
+    port_out(PORTS, 0x3FC, 1, mcr | 0x08).map_err(|_| "port")?;
+    // One interrupt: "transmitter empty" enabled, waited for, disabled and
+    // cleared. The UART asks at once, possibly before this thread waits:
+    // a short wait first makes it the notification's waiter on the
+    // processor it is on, as a driver is by the time its device interrupts.
+    let once = || -> T {
+        let _ = recv(n, Wait::Until(CLOCK.now() + 1_000_000));
+        port_out(PORTS, 0x3F9, 1, 0x02).map_err(|_| "port")?;
+        let m = recv(n, Wait::Until(CLOCK.now() + 1_000_000_000));
+        port_out(PORTS, 0x3F9, 1, 0).map_err(|_| "port")?;
+        let _ = port_in(PORTS, 0x3FA, 1);
+        irq_ack(LINES, LINE).map_err(|_| "ack")?;
+        m.map(|_| ()).map_err(|_| "the serial port's interrupt never arrived")
+    };
+    let info = || inspect_irq(LINES, LINE as u64).map_err(|_| "cannot inspect the interrupt line");
+    let on = |cpu: usize| -> T {
+        thread_set_cpu(Cap(SLOT_THREAD), cpu).map_err(|_| "cannot move this thread")?;
+        (inspect_thread(Cap(SLOT_THREAD)).map_err(|_| "inspect")?.cpu == cpu).then_some(()).ok_or("this thread did not move")
+    };
+    let result = (|| -> T {
+        if info()?.cpu != Some(0) {
+            return Err("a line bound by a thread on processor 0 is not routed there");
+        }
+        once()?;
+        if info()?.from_afar != 0 {
+            return Err("an interrupt for a waiter on its own processor took every lock");
+        }
+        // Moved: the line follows after one interrupt from afar.
+        on(1)?;
+        once()?;
+        let i = info()?;
+        if i.cpu != Some(1) || i.from_afar != 1 {
+            println!("irq_follow: after the move to processor 1: {i:?}");
+            return Err("the line did not follow its waiter to processor 1");
+        }
+        for _ in 0..8 {
+            once()?;
+        }
+        let i = info()?;
+        if i.from_afar != 1 || i.delivered != 10 {
+            println!("irq_follow: on processor 1: {i:?}");
+            return Err("interrupts kept arriving away from their waiter after the line followed it");
+        }
+        // And back.
+        on(0)?;
+        once()?;
+        once()?;
+        let i = info()?;
+        println!("irq_follow: {} interrupts, {} of them from afar, the line now on processor {:?}", i.delivered, i.from_afar, i.cpu);
+        (i.cpu == Some(0) && i.from_afar == 2).then_some(()).ok_or("the line did not follow its waiter back to processor 0")
+    })();
+    let _ = on(0);
+    port_out(PORTS, 0x3FC, 1, mcr).map_err(|_| "port")?;
+    irq_unbind(LINES, LINE).map_err(|_| "unbind")?;
+    result
+}
+
 /// [`t_irq`] where devices are in memory space: a PL011 UART the firmware
 /// describes (ACPI DSDT, `ARMH0011`) other than the kernel's console (SPCR),
 /// found, mapped and driven from here, its "transmit" interrupt bound to a
@@ -1985,6 +2057,7 @@ const TESTS: &[(&str, fn() -> T)] = &[
     ("untyped", t_untyped),
     ("caps", t_caps),
     ("irq", t_irq),
+    ("irq_follow", t_irq_follow),
     ("inspect", t_inspect),
     ("ipc_caps", t_ipc_caps),
     ("ipc_parked", t_ipc_parked),

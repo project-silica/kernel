@@ -661,6 +661,18 @@ impl Hal for X86 {
         ioapic::mask(&kernel().phys, line, masked);
     }
 
+    fn irq_move(&self, line: usize, cpu: usize) -> bool {
+        let Some(apic) = cpu::percpu_of(cpu).map(|c| c.apic_id) else { return false };
+        // Remapped, every line (wire or message) is its remapping entry; a
+        // message line without remapping names its processor in the device,
+        // which only its driver writes.
+        if iommu::remapping() {
+            iommu::retarget(&kernel().phys, line, apic)
+        } else {
+            line < ioapic::lines() && ioapic::retarget(&kernel().phys, line, apic)
+        }
+    }
+
     fn port_io(&self, port: u16, width: u8, write: bool, value: u32) -> u32 {
         let mut v = value;
         // SAFETY: the caller holds a capability covering this port range;

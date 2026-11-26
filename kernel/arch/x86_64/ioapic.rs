@@ -136,6 +136,23 @@ pub fn route(phys: &Phys, line: usize, apic_id: u32, level: bool, active_low: bo
     true
 }
 
+/// Deliver `line`, routed already and not remapped, to the processor with
+/// APIC identifier `apic_id`: its destination field rewritten with the
+/// entry held off meanwhile, so no interrupt goes to half of each.
+pub fn retarget(phys: &Phys, line: usize, apic_id: u32) -> bool {
+    let Some((base, pin, _)) = find(line) else { return false };
+    if apic_id > 0xFE {
+        return false;
+    }
+    REGS.lock();
+    let low = read(phys, base, 0x10 + 2 * pin);
+    write(phys, base, 0x10 + 2 * pin, low | 1 << 16);
+    write(phys, base, 0x11 + 2 * pin, apic_id << 24);
+    write(phys, base, 0x10 + 2 * pin, low);
+    REGS.unlock();
+    true
+}
+
 /// Hold `line` off, or let it interrupt again.
 pub fn mask(phys: &Phys, line: usize, masked: bool) {
     let Some((base, pin, _)) = find(line) else { return };

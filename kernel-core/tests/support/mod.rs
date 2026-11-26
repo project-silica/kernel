@@ -283,6 +283,10 @@ impl Hal for TestHal {
     fn irq_mask(&self, line: usize, masked: bool) {
         self.irq_log.borrow_mut().push(format!("{} {line}", if masked { "mask" } else { "unmask" }));
     }
+    fn irq_move(&self, line: usize, cpu: usize) -> bool {
+        self.irq_log.borrow_mut().push(format!("move {line} cpu{cpu}"));
+        true
+    }
     fn port_io(&self, port: u16, _width: u8, write: bool, value: u32) -> u32 {
         if write { 0 } else { port as u32 ^ value }
     }
@@ -399,7 +403,9 @@ impl Machine {
 }
 
 pub struct Machine {
-    pub k: Kernel<TestHal>,
+    /// Boxed: a test may keep several machines alive at once, and a
+    /// kernel is too large for a test thread's stack several times over.
+    pub k: Box<Kernel<TestHal>>,
     _ram: Ram,
     pub root: Paddr,
     /// The root CapSpace.
@@ -490,7 +496,7 @@ impl Machine {
         k.schedule();
         k.leave();
         assert_eq!(k.current(), root);
-        Machine { k, _ram: ram, root, cs, info, mib, start_args }
+        Machine { k: Box::new(k), _ram: ram, root, cs, info, mib, start_args }
     }
 
     pub fn info(&self) -> &RootInfo {

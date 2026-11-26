@@ -517,6 +517,36 @@ pub fn remap(phys: &Phys, line: usize, apic_id: u32, vector: u8, level: bool, so
     Some(line as u16)
 }
 
+/// Make remapping entry `line`, present already, deliver to the processor
+/// with x2APIC identifier `apic_id`, everything else about it unchanged:
+/// how a line follows the thread that waits on it without its device (or
+/// its I/O APIC entry, which names the remapping entry) being written.
+/// `false` when interrupts are not remapped or the entry is not in use.
+pub fn retarget(phys: &Phys, line: usize, apic_id: u32) -> bool {
+    if !remapping() || line >= IRT_ENTRIES {
+        return false;
+    }
+    LOCK.lock();
+    // SAFETY: under `LOCK`.
+    let s = unsafe { &*STATE.0.get() };
+    let at = s.irt + line as u64 * 16;
+    // SAFETY: entry `line` of the kernel's table. The destination is the
+    // upper half of its first word, which one aligned store replaces whole:
+    // a unit reads the old destination or the new, never a mixture.
+    let moved = unsafe {
+        let low = word(phys, at).read_volatile();
+        if low & 1 != 0 {
+            word(phys, at).write_volatile(low & 0xFFFF_FFFF | (apic_id as u64) << 32);
+        }
+        low & 1 != 0
+    };
+    if moved {
+        invalidate(phys, s, &[[4 | 1 << 4 | (line as u64) << 32, 0]]);
+    }
+    LOCK.unlock();
+    moved
+}
+
 /// `Hal::io_attach`.
 pub fn attach(phys: &Phys, id: u64, root: Paddr) -> Result<Paddr, Error> {
     if top() == 0 || id >> 16 != 0 {

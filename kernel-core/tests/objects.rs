@@ -1202,6 +1202,71 @@ fn an_interrupt_line_signals_the_notification_it_is_bound_to() {
     assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "mask 5");
 }
 
+/// An interrupt line is delivered where the thread waiting on its
+/// notification runs, and follows it when it moves. Before (the 2026-11-24
+/// audit), a line went to the processor of whoever bound it, for good: a
+/// driver whose thread ran elsewhere, or was moved, had every interrupt
+/// taken on the old processor and delivered through every processor's lock.
+#[test]
+fn an_interrupt_line_follows_the_thread_waiting_on_it() {
+    let m = Machine::with_cpus(16, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    // A driver's thread waits on processor 1; the line is bound from 0.
+    let t = m.spawn(ut, FREE + 3);
+    m.ok(S::ThreadControl, [FREE + 3, 2, 1, 0, 0, 0]);
+    m.settle(1);
+    assert_eq!(m.k.current(), t);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(0);
+    m.ok(S::IrqBind, [SLOT_IRQS, 5, FREE, 0, 0, 0]);
+    assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "route 5 cpu1 level=false low=false", "bound where its waiter is");
+    let stat = |m: &Machine| {
+        m.on(0);
+        m.ok(S::Inspect, [SLOT_IRQS, 5, 0, 0, 0, 0]);
+        [m.arg(m.root, 0), m.arg(m.root, 1), m.arg(m.root, 2)]
+    };
+    assert_eq!(stat(&m), [2, 0, 0], "routed to processor 1, nothing delivered yet");
+    // Delivered there under that processor's lock alone.
+    m.on(1);
+    let globals = m.k.global_entries();
+    m.irq(5);
+    assert_eq!(m.k.global_entries(), globals, "an interrupt on its waiter's processor took every lock");
+    assert_eq!(m.k.thread_view(t).state, RUNNABLE);
+    m.settle(1);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    // The thread is moved to processor 0 and waits there again.
+    m.on(0);
+    m.ok(S::ThreadControl, [FREE + 3, 2, 0, 0, 0, 0]);
+    m.ok(S::Yield, [0; 6]);
+    assert_eq!(m.k.current(), t);
+    assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    assert_eq!(m.k.thread_view(t).cpu, 0);
+    // The next interrupt still arrives where the line was: it reaches its
+    // waiter through every lock once, and the line moves to processor 0.
+    m.on(1);
+    let globals = m.k.global_entries();
+    m.irq(5);
+    assert_eq!(m.k.global_entries(), globals + 1);
+    assert_eq!(m.k.hal.irq_log.borrow().last().unwrap(), "move 5 cpu0", "the line did not follow its waiter");
+    assert_eq!(stat(&m), [1, 2, 1], "routed to processor 0; two delivered, one of them from afar");
+    // From then on it is delivered there alone.
+    m.settle(0);
+    m.on(0);
+    if m.k.current() == t {
+        assert!(m.raw(S::Recv as u64, [FREE, 0, 0, 0, 0, 0]).blocked);
+    }
+    let globals = m.k.global_entries();
+    m.irq(5);
+    assert_eq!(m.k.global_entries(), globals, "after following its waiter, the line still took every lock");
+    assert_eq!(stat(&m), [1, 3, 1]);
+    // Unbound, it is routed nowhere; a line outside the capability is refused.
+    m.ok(S::IrqBind, [SLOT_IRQS, 5, 0, 0, 0, 0]);
+    assert_eq!(stat(&m)[0], 0);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 4, SLOT_IRQS, 15, 4 | 6 << 32, 0]);
+    assert_eq!(m.err(S::Inspect, [FREE + 4, 6, 0, 0, 0, 0]), Error::BadArg);
+}
+
 #[test]
 fn inspect_shows_slots_and_threads_without_changing_them() {
     let (m, t) = pair();
