@@ -93,13 +93,16 @@ pub fn print(s: &str) {
     }
 }
 
-/// Report `code` through the emulator's debug-exit device when `harness`
-/// says one is there (on other machines port 0xF4 is nobody's to write),
-/// and halt.
-pub fn stop(code: u8, harness: bool) -> ! {
-    if harness {
-        outb(0xF4, code);
-    }
+/// Tell a test harness `code` through the emulator's debug-exit device (on
+/// other machines port 0xF4 is nobody's to write: test images only, and
+/// only when the command line said one is there).
+#[cfg(feature = "harness")]
+pub fn tell(code: u8) {
+    outb(0xF4, code);
+}
+
+/// Halt for good.
+pub fn halt() -> ! {
     loop {
         // SAFETY: halting with interrupts as the firmware left them.
         unsafe { asm!("hlt", options(nomem, nostack)) }

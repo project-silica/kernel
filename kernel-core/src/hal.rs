@@ -237,11 +237,12 @@ pub trait Hal {
     fn port_io(&self, port: u16, width: u8, write: bool, value: u32) -> u32;
     /// Write to the kernel's console.
     fn console(&self, bytes: &[u8]);
-    /// Turn the machine off, telling a test harness `status` (0: success).
-    /// Returns only where that is not possible.
+    /// Turn the machine off. A test image's kernel (`harness`) told that a
+    /// test harness listens tells it `status` (0: success) instead. Returns
+    /// only where that is not possible.
     fn power_off(&self, status: u64);
-    /// Reset the machine (a test harness is told `status`, as for
-    /// `power_off`). Returns only where that is not possible.
+    /// Reset the machine (`status` as for `power_off`). Returns only where
+    /// that is not possible.
     fn reset(&self, status: u64) {
         let _ = status;
     }

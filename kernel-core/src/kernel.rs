@@ -835,8 +835,8 @@ impl<H: Hal> Kernel<H> {
                     self.irqs[line].0.set(to);
                     let stat = &self.irq_stat[line];
                     stat.cpu.set(cpu as u64 + 1);
-                    stat.fired.store(0, core::sync::atomic::Ordering::Relaxed);
-                    stat.far.store(0, core::sync::atomic::Ordering::Relaxed);
+                    stat.fired.clear();
+                    stat.far.clear();
                     self.irqs[line].1.set(badge);
                     let q = self.queue(to);
                     q.bound.set(q.bound.get() + 1);
@@ -959,15 +959,15 @@ impl<H: Hal> Kernel<H> {
                     // tells a parked caller from one that has gone.
                     ObjectType::Notification => [(self.queue(cap.obj).kind.get() == crate::ipc::PARKED) as u64, 0, 0, 0, 0, 0],
                     // An interrupt line: the processor it is routed to plus one
-                    // (0: not bound), how many interrupts it delivered, and how
-                    // many of them took every lock to reach a waiter elsewhere.
+                    // (0: not bound). A test image's kernel also says how many
+                    // interrupts it delivered and how many of them took every
+                    // lock to reach a waiter elsewhere (0 and 0 otherwise).
                     ObjectType::Hw if cap.flags & crate::cap::FLAG_IRQS != 0 => {
                         if a[1] < cap.obj || a[1] >= cap.badge || a[1] >= silica_abi::IRQ_LINES {
                             return Err(Error::BadArg);
                         }
                         let s = &self.irq_stat[a[1] as usize];
-                        let n = |c: &core::sync::atomic::AtomicU64| c.load(core::sync::atomic::Ordering::Relaxed);
-                        [s.cpu.get(), n(&s.fired), n(&s.far), 0, 0, 0]
+                        [s.cpu.get(), s.fired.get(), s.far.get(), 0, 0, 0]
                     }
                     // Where a device reaches a frame on a machine that
                     // cannot confine DMA: its physical address.

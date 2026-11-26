@@ -4,7 +4,7 @@
 //! ever, and its message and backtrace went with the machine. Now it writes
 //! them, after the console's last lines, into a region of memory the loader
 //! keeps out of every allocation and does not clear, and resets the machine
-//! (unless a test harness is listening). The next boot finds the record in
+//! (a test image told a harness listens stops instead). The next boot finds the record in
 //! the same region, checks it, says it on the console whole, gives it to the
 //! root task, and clears it. RAM keeps its contents across a warm reset; a
 //! record that did not survive (power lost, firmware that scrubs memory) is
@@ -134,6 +134,82 @@ pub fn next_boot(region: &mut [u8]) -> u64 {
     let n = u32::from_le_bytes([region[COUNT], region[COUNT + 1], region[COUNT + 2], region[COUNT + 3]]).wrapping_add(1).max(1);
     region[COUNT..COUNT + 4].copy_from_slice(&n.to_le_bytes());
     n as u64
+}
+
+/// A running kernel's part in the record, the same on every architecture:
+/// this boot's number and, while a panic writes its record, how long it is.
+/// The architecture maps the region (`region`, `None` where the loader
+/// kept none) and says what its console held.
+pub struct Recorder {
+    boot: core::sync::atomic::AtomicU64,
+    /// `usize::MAX`: no panic is writing.
+    len: core::sync::atomic::AtomicUsize,
+}
+
+impl Default for Recorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Recorder {
+    pub const fn new() -> Recorder {
+        Recorder { boot: core::sync::atomic::AtomicU64::new(0), len: core::sync::atomic::AtomicUsize::new(usize::MAX) }
+    }
+
+    /// At boot: take this boot's number. If the last boot left a record,
+    /// `say` is given its boot number and its text whole (for the console),
+    /// as much of it as fits is copied into `kept` (for the root task) and
+    /// returned, and the record is cleared.
+    pub fn start<'k>(&self, region: &mut [u8], kept: &'k mut [u8], say: impl FnOnce(u64, &[u8])) -> &'k [u8] {
+        use core::sync::atomic::Ordering;
+        self.boot.store(next_boot(region), Ordering::Relaxed);
+        let Some((was, text)) = read(region) else { return &[] };
+        say(was, text);
+        let n = text.len().min(kept.len());
+        kept[..n].copy_from_slice(&text[..n]);
+        clear(region);
+        &kept[..n]
+    }
+
+    /// A panic begins its record with the console's last lines (`tail`
+    /// fills its buffer and says how much). Only the first processor to
+    /// panic writes one.
+    pub fn begin(&self, region: Option<&mut [u8]>, tail: impl FnOnce(&mut [u8]) -> usize) {
+        use core::sync::atomic::Ordering;
+        let Some(region) = region else { return };
+        if self.len.compare_exchange(usize::MAX, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return;
+        }
+        begin(region);
+        let mut last = [0u8; 8192];
+        let n = tail(&mut last).min(last.len());
+        self.len.store(append(region, 0, &last[..n]), Ordering::Release);
+    }
+
+    /// What the panic says goes into its record as well (`region` is asked
+    /// for only while a record is being written).
+    pub fn say<'r>(&self, region: impl FnOnce() -> Option<&'r mut [u8]>, bytes: &[u8]) {
+        use core::sync::atomic::Ordering;
+        let len = self.len.load(Ordering::Acquire);
+        if len == usize::MAX {
+            return;
+        }
+        if let Some(region) = region() {
+            self.len.store(append(region, len, bytes), Ordering::Release);
+        }
+    }
+
+    /// The end of the panic: its record becomes one the next boot takes.
+    pub fn seal(&self, region: Option<&mut [u8]>) {
+        use core::sync::atomic::Ordering;
+        let len = self.len.swap(usize::MAX, Ordering::AcqRel);
+        if let Some(region) = region
+            && len != usize::MAX
+        {
+            seal(region, self.boot.load(Ordering::Relaxed), len);
+        }
+    }
 }
 
 #[cfg(test)]

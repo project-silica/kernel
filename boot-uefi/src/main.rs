@@ -21,7 +21,6 @@ mod arch;
 
 use core::ffi::c_void;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::boot::{BOOT_MAGIC, BOOT_VERSION, BootInfo, KERNEL_BASE, PHYS_MAP_BASE, Region, RegionKind};
 use kernel_core::elf::{Elf, PF_W, PF_X};
 use silica_abi::root::{ENTROPY_CPU, ENTROPY_FIRMWARE};
@@ -30,11 +29,22 @@ use silica_formats::blake2s::Blake2s;
 const PAGE: u64 = 4096;
 const HUGE: u64 = 2 << 20;
 
-/// A test harness is listening for the exit status: the command line says
-/// how (`exit=semihosting` on aarch64, see `arch/aarch64.rs`; `exit=port`,
-/// QEMU's debug-exit device, on x86_64). On a machine with neither, the
-/// loader writes nothing it was not told is there.
-static HARNESS: AtomicBool = AtomicBool::new(false);
+/// A test image's loader (the `harness` feature) was told a test harness
+/// listens for the exit status: the command line says how (`exit=semihosting`
+/// on aarch64, see `arch/aarch64.rs`; `exit=port`, QEMU's debug-exit device,
+/// on x86_64). A loader built for a machine has neither word nor call.
+#[cfg(feature = "harness")]
+static HARNESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Stop for good after a failure; a test image's loader first tells a
+/// listening harness.
+fn stop() -> ! {
+    #[cfg(feature = "harness")]
+    if HARNESS.load(core::sync::atomic::Ordering::Relaxed) {
+        arch::tell(kernel_core::ExitStatus::Failure.code());
+    }
+    arch::halt()
+}
 
 fn print(s: &str) {
     arch::print(s);
@@ -55,13 +65,12 @@ fn print_u64(mut v: u64) {
     print(core::str::from_utf8(&b[i..]).unwrap_or("?"));
 }
 
-/// Report a fatal error and stop: status through the emulator's exit device
-/// when there is one, then halt.
+/// Report a fatal error and stop.
 fn fail(what: &str) -> ! {
     print("ERROR: loader: ");
     print(what);
     print("\r\n");
-    arch::stop(kernel_core::ExitStatus::Failure.code(), HARNESS.load(Ordering::Relaxed))
+    stop()
 }
 
 struct Boot {
@@ -358,23 +367,30 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         fail("cannot open the boot volume");
     }
     let t_open = arch::counter();
-    // The command line first: whether a harness hears the status decides
-    // how every failure after this one ends (a missing kernel included).
+    // The command line first: in a test image, whether a harness hears the
+    // status decides how every failure after this one ends (a missing kernel
+    // included).
     let cmdline = boot.read(root, "SILICA\\CMDLINE.TXT", efi::MEM_LOADER_DATA).unwrap_or((0, 0));
-    // SAFETY: the command line was read into `cmdline.1` bytes at `cmdline.0`.
-    let words = unsafe { core::slice::from_raw_parts(cmdline.0 as *const u8, cmdline.1 as usize) };
-    HARNESS.store(words.split(|b| b.is_ascii_whitespace()).any(|w| w == b"exit=semihosting" || w == b"exit=port"), Ordering::Relaxed);
+    #[cfg(feature = "harness")]
+    {
+        // SAFETY: the command line was read into `cmdline.1` bytes at `cmdline.0`.
+        let words = unsafe { core::slice::from_raw_parts(cmdline.0 as *const u8, cmdline.1 as usize) };
+        HARNESS.store(
+            words.split(|b| b.is_ascii_whitespace()).any(|w| w == b"exit=semihosting" || w == b"exit=port"),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
     let (kfile, klen) = boot.read(root, "SILICA\\KERNEL.ELF", efi::MEM_LOADER_DATA).unwrap_or_else(|| fail("SILICA\\KERNEL.ELF not found"));
     let ramdisk = boot.read(root, "SILICA\\RAMDISK.IMG", efi::MEM_SILICA_RAMDISK).unwrap_or((0, 0));
     let t_files = arch::counter();
-    // Refused here, once the command line says whether a harness hears the
+    // Refused here, once the command line said whether a harness hears the
     // status (the loader is built for plain x86-64 and Armv8.0, so reading
     // two files first is safe on any processor of either).
     if let Some(what) = arch::unsupported() {
         print("ERROR: loader: this processor lacks ");
         print(what);
         print(", which Silica requires\r\n");
-        arch::stop(kernel_core::ExitStatus::Failure.code(), HARNESS.load(Ordering::Relaxed))
+        stop()
     }
 
     // Entropy and time, while the firmware can still be asked.

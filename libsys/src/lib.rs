@@ -398,8 +398,9 @@ pub fn console_write(console: Cap, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Turn the machine off through a power capability, telling a test harness
-/// `status` (0: success). Returns only with the reason it could not.
+/// Turn the machine off through a power capability (`status`, 0: success, is
+/// what a test image's kernel tells a listening test harness instead).
+/// Returns only with the reason it could not.
 pub fn power_off(power: Cap, status: u64) -> Error {
     match sys(Syscall::PowerOff, [power.0, status, 0, 0, 0, 0]) {
         Ok(_) => Error::Unsupported,
@@ -407,7 +408,7 @@ pub fn power_off(power: Cap, status: u64) -> Error {
     }
 }
 
-/// Reset the machine (a test harness is told `status`). Returns only on
+/// Reset the machine (`status` as for [`power_off`]). Returns only on
 /// failure, with why.
 pub fn reboot(power: Cap, status: u64) -> Error {
     match sys(Syscall::PowerOff, [power.0, status, 1, 0, 0, 0]) {
@@ -570,10 +571,17 @@ pub struct ThreadInfo {
 }
 
 /// Where interrupt line `line` (of the interrupt-line capability `lines`)
-/// is routed and how its deliveries went.
+/// is routed (and, asked by a test image's program of its test kernel, how
+/// its deliveries went).
 pub fn inspect_irq(lines: Cap, line: u64) -> Result<IrqInfo> {
     let r = sys(Syscall::Inspect, [lines.0, line, 0, 0, 0, 0])?;
-    Ok(IrqInfo { cpu: r[0].checked_sub(1).map(|c| c as usize), delivered: r[1], from_afar: r[2] })
+    Ok(IrqInfo {
+        cpu: r[0].checked_sub(1).map(|c| c as usize),
+        #[cfg(feature = "harness")]
+        delivered: r[1],
+        #[cfg(feature = "harness")]
+        from_afar: r[2],
+    })
 }
 
 /// What [`inspect_irq`] says of an interrupt line.
@@ -582,10 +590,13 @@ pub struct IrqInfo {
     /// The processor it is routed to (`None`: not bound). The kernel moves
     /// a line to the processor of the thread waiting on its notification.
     pub cpu: Option<usize>,
-    /// Interrupts it delivered since it was bound.
+    /// Interrupts it delivered since it was bound (a test image's kernel
+    /// counts them; one built for a machine does not).
+    #[cfg(feature = "harness")]
     pub delivered: u64,
     /// How many of them arrived on a processor other than their waiter's
     /// and were delivered through every processor's lock.
+    #[cfg(feature = "harness")]
     pub from_afar: u64,
 }
 

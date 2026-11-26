@@ -13,7 +13,8 @@ test = false
 bench = false
 
 [dependencies]
-libsys = { path = "../libsys" }
+# The test root task reads what only a test image's kernel keeps.
+libsys = { path = "../libsys", features = ["harness"] }
 silica-formats = { path = "../formats" }
 
 [lints]

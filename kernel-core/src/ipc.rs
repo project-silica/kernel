@@ -19,12 +19,12 @@ pub struct IrqStat {
     /// The processor the line is routed to, plus one (0: not bound). Changed
     /// only by a holder of every lock.
     pub(crate) cpu: core::cell::Cell<u64>,
-    /// Interrupts delivered, and how many of them found the line's waiter
-    /// on another processor and took every lock to reach it. Counted by
-    /// whichever processor took the interrupt: one moved a moment ago may
-    /// still take one routed before, so these are atomic.
-    pub(crate) fired: core::sync::atomic::AtomicU64,
-    pub(crate) far: core::sync::atomic::AtomicU64,
+    /// Test images only (`Tally`): interrupts delivered, and how many of
+    /// them found the line's waiter on another processor and took every
+    /// lock to reach it. Counted by whichever processor took the interrupt:
+    /// one moved a moment ago may still take one routed before.
+    pub(crate) fired: crate::tally::Tally,
+    pub(crate) far: crate::tally::Tally,
     /// Held off: it fired again while its last news was still pending, so
     /// it waits (masked, or sent to the discard vector) until its waiter
     /// takes the news (`Kernel::release_lines`).
@@ -39,7 +39,7 @@ pub struct IrqStat {
 impl IrqStat {
     ctor! {
         pub(crate) fn new() -> IrqStat {
-            IrqStat { cpu: core::cell::Cell::new(0), fired: core::sync::atomic::AtomicU64::new(0), far: core::sync::atomic::AtomicU64::new(0), held: core::sync::atomic::AtomicBool::new(false), pending_run: core::sync::atomic::AtomicU32::new(0) }
+            IrqStat { cpu: core::cell::Cell::new(0), fired: crate::tally::Tally::new(), far: crate::tally::Tally::new(), held: core::sync::atomic::AtomicBool::new(false), pending_run: core::sync::atomic::AtomicU32::new(0) }
         }
     }
 }
@@ -403,7 +403,7 @@ impl<H: Hal> Kernel<H> {
                 l == 0 || self.queue(self.thread(l).blocked_on.get()).owner.get() == me + 1
             });
         let stat = &self.irq_stat[line];
-        stat.fired.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        stat.fired.add();
         // A line that keeps firing while its waiter has not taken the last
         // news gains nothing by being heard: past [`STORM`] such deliveries
         // in a row it is held off until the waiter receives, so a device (or
@@ -419,7 +419,7 @@ impl<H: Hal> Kernel<H> {
         }
         // The waiter is another processor's: take every lock, and look
         // again at what the line is bound to now.
-        stat.far.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        stat.far.add();
         self.go_global();
         let n = irq.0.get();
         if n != 0 {
