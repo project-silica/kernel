@@ -29,7 +29,7 @@ use crate::mem::{KObj, Paddr};
 use crate::smp::Cpu;
 use crate::thread::RUNNABLE;
 use core::cell::Cell;
-use silica_abi::{Error, SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_MAX_WEIGHT};
+use silica_abi::{Error, SCHED_DEADLINE, SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_GROUP, SCHED_MAX_WEIGHT};
 
 /// How far a fair thread may run ahead of the one that has run least before
 /// it is preempted, in default-weight nanoseconds.
@@ -44,6 +44,12 @@ const SLEEPER_CREDIT: u64 = crate::tuned(option_env!("SILICA_TUNE_SLEEPER_CREDIT
 const WAKE_GRANULE: u64 = crate::tuned(option_env!("SILICA_TUNE_WAKE_GRANULE"), 1_000_000);
 /// The shortest time a fair thread runs before it can be preempted again.
 const MIN_RUN: u64 = crate::tuned(option_env!("SILICA_TUNE_MIN_RUN"), 100_000);
+
+/// `ran` nanoseconds of real time in the virtual time of weight `w`.
+#[inline(always)]
+fn scaled(ran: u64, w: u64) -> u64 {
+    if w == SCHED_DEFAULT_WEIGHT { ran } else { (ran as u128 * SCHED_DEFAULT_WEIGHT as u128 / w.max(1) as u128) as u64 }
+}
 /// How long a processor with nothing to run watches for work before it
 /// halts (`Presence::watch`): while it watches, a processor with work for
 /// it says so with one store instead of an interrupt, and a deadline that
@@ -117,12 +123,12 @@ const MIN_PERIOD: u64 = 100_000;
 /// A scheduling context.
 #[repr(C, align(128))]
 pub struct SchedCtx {
-    /// `SCHED_FAIR` or `SCHED_DEADLINE`.
+    /// `SCHED_FAIR`, `SCHED_DEADLINE` or `SCHED_GROUP`.
     pub(crate) class: Cell<u64>,
-    /// Fair: the weight.
+    /// Fair and group: the weight.
     pub(crate) weight: Cell<u64>,
-    /// Deadline: budget and period in nanoseconds, and the processor (plus
-    /// one; 0 none yet) whose reservation it is.
+    /// Deadline: budget and period in nanoseconds, and (deadline and group)
+    /// the processor (plus one; 0 none yet) whose reservation or group it is.
     pub(crate) budget: Cell<u64>,
     pub(crate) period: Cell<u64>,
     pub(crate) cpu: Cell<u64>,
@@ -131,10 +137,77 @@ pub struct SchedCtx {
     pub(crate) deadline: Cell<u64>,
     /// Nanoseconds charged to it, ever.
     pub(crate) consumed: Cell<u64>,
-    /// The threads bound to it (linked through `Thread::sc_next`).
+    /// The threads bound to it: linked through `Thread::sc_next` (fair and
+    /// deadline), or the threads in it through `Thread::g_next` (group).
     pub(crate) threads: Cell<Paddr>,
+    /// Group: its place on its processor.
+    pub(crate) group: Group,
 }
 impl KObj for SchedCtx {}
+const _: () = assert!(core::mem::size_of::<SchedCtx>() <= 1 << silica_abi::SCHED_BITS);
+
+/// Threads that share one share of a processor (`SCHED_GROUP`, and each
+/// processor's own group of the threads given none: `Cpu::unbound`).
+///
+/// Sharing a processor between threads, each its own share, let a program
+/// take as much of it as it had memory for threads: a service beside a
+/// program of 100 threads had 12 ms of each second and waited 300 ms for
+/// its turn (the remediation of the 2026-11-24 audit; `hostile.rs`). So the
+/// fair run queue has two levels: the processor's groups that have threads
+/// waiting, in order of the group's virtual runtime (which advances by the
+/// time any of its threads ran, scaled by the group's weight), and in each
+/// group its waiting threads in order of their own. The group that has run
+/// least runs its thread that has run least. A group is in its processor's
+/// tree exactly while it has threads waiting.
+#[repr(C)]
+pub struct Group {
+    /// Links in its processor's tree of groups (`order.rs`).
+    pub(crate) left: Cell<Paddr>,
+    pub(crate) right: Cell<Paddr>,
+    pub(crate) up: Cell<Paddr>,
+    pub(crate) meta: Cell<u64>,
+    /// Its virtual runtime.
+    pub(crate) vr: Cell<u64>,
+    /// The least virtual runtime among its threads (only grows): where a
+    /// waking one is placed.
+    pub(crate) min_vr: Cell<u64>,
+    /// Its waiting threads, a tree in order of virtual runtime: the tree,
+    /// its first and last.
+    pub(crate) top: crate::order::Root,
+    pub(crate) first: Cell<Paddr>,
+    pub(crate) last: Cell<Paddr>,
+}
+
+impl Group {
+    ctor! {
+        /// An empty group.
+        pub fn new() -> Group {
+            Group {
+                left: Cell::new(0),
+                right: Cell::new(0),
+                up: Cell::new(0),
+                meta: Cell::new(0),
+                vr: Cell::new(0),
+                min_vr: Cell::new(0),
+                top: crate::order::Root::new(),
+                first: Cell::new(0),
+                last: Cell::new(0),
+            }
+        }
+    }
+}
+
+impl Default for Group {
+    fn default() -> Group {
+        Group::new()
+    }
+}
+
+/// The name of a processor's own group, for threads given none: never an
+/// object's address (those are aligned), so it names no context. It names
+/// the group of the processor it is used on: a processor's run queue only
+/// ever holds its own.
+pub(crate) const UNBOUND: Paddr = 1;
 
 impl<H: Hal> Kernel<H> {
     pub(crate) fn sched(&self, s: Paddr) -> &SchedCtx {
@@ -159,15 +232,74 @@ impl<H: Hal> Kernel<H> {
         }
     }
 
+    /// The group thread `t` is in: a group context, or its processor's own.
+    #[inline(always)]
+    pub(crate) fn group_of(&self, t: Paddr) -> Paddr {
+        self.thread(t).group.get()
+    }
+
+    /// Group `g`'s state, on processor `cpu` (its own).
+    #[inline(always)]
+    pub(crate) fn grp<'a>(&'a self, cpu: &'a Cpu, g: Paddr) -> &'a Group {
+        if g == UNBOUND { &cpu.unbound } else { &self.sched(g).group }
+    }
+
+    fn group_weight(&self, g: Paddr) -> u64 {
+        if g == UNBOUND { SCHED_DEFAULT_WEIGHT } else { self.sched(g).weight.get() }
+    }
+
     /// Put runnable thread `t` (not running) on its processor's run queue:
-    /// the deadline queue, or the fair queue in order of virtual runtime,
-    /// after any equal (so equals take turns), or with `first` before them
-    /// (a thread whose waking took the processor).
+    /// the deadline queue, or among its group's waiting threads in order of
+    /// virtual runtime (its group joining the processor's groups if none of
+    /// its threads waited), after any equal (so equals take turns), or with
+    /// `first` before them (a thread whose waking took the processor).
     pub(crate) fn enqueue_at(&self, cpu: &Cpu, t: Paddr, first: bool) {
         if self.dl_of(t).is_some() {
             return self.q_push(&cpu.dl_head, &cpu.dl_tail, t);
         }
-        crate::order::insert(&RunQueue(self, cpu), t, first);
+        let g = self.group_of(t);
+        let gr = self.grp(cpu, g);
+        let joins = gr.first.get() == 0;
+        crate::order::insert(&Members(self, gr), t, first);
+        if joins {
+            crate::order::insert(&Groups(self, cpu), g, first);
+        }
+    }
+
+    /// Queue fair thread `t`, running on `cpu` and yielding, behind every
+    /// thread of its group waiting, and its group behind every group
+    /// waiting (some is: the caller saw one), without comparing.
+    #[inline(always)]
+    pub(crate) fn requeue_yielded(&self, cpu: &Cpu, t: Paddr) {
+        let g = self.group_of(t);
+        let gr = self.grp(cpu, g);
+        let th = self.thread(t);
+        if gr.last.get() != 0 {
+            th.vr.set(th.vr.get().max(self.thread(gr.last.get()).vr.get()));
+        }
+        let waiting = gr.first.get() != 0;
+        crate::order::push_last(&Members(self, gr), t);
+        // Alone among the groups waiting, it is in place already.
+        let last = cpu.gq_last.get();
+        if waiting && last == g && cpu.gq_first.get() == g {
+            return;
+        }
+        if last != g {
+            gr.vr.set(gr.vr.get().max(self.grp(cpu, last).vr.get()));
+        }
+        let groups = Groups(self, cpu);
+        if waiting {
+            crate::order::remove(&groups, g);
+        }
+        crate::order::push_last(&groups, g);
+    }
+
+    /// The first thread of the least-run group waiting (0: none).
+    pub(crate) fn grp_first(&self, cpu: &Cpu) -> Paddr {
+        match cpu.gq_first.get() {
+            0 => 0,
+            g => self.grp(cpu, g).first.get(),
+        }
     }
 
     /// [`Kernel::enqueue_at`] after any equals.
@@ -180,33 +312,50 @@ impl<H: Hal> Kernel<H> {
         if self.dl_of(t).is_some() {
             self.q_remove(&cpu.dl_head, &cpu.dl_tail, t);
         } else {
-            crate::order::remove(&RunQueue(self, cpu), t);
+            let g = self.group_of(t);
+            let gr = self.grp(cpu, g);
+            crate::order::remove(&Members(self, gr), t);
+            if gr.first.get() == 0 {
+                crate::order::remove(&Groups(self, cpu), g);
+            }
         }
     }
 
     /// A fair thread that becomes runnable is placed no further back than
-    /// the least-run thread minus a bounded credit, so a long sleep does not
-    /// buy a long monopoly. A thread that has never run (virtual runtime 0)
-    /// gets no credit: it starts level with the least-run thread, so a burst
-    /// of new threads does not push aside the ones already waiting.
+    /// the least-run thread of its group minus a bounded credit, so a long
+    /// sleep does not buy a long monopoly; and a group none of whose threads
+    /// waited or ran, no further back than the least-run group likewise. A
+    /// thread or group that has never run (virtual runtime 0) gets no
+    /// credit: it starts level with the least-run one, so a burst of new
+    /// threads does not push aside the ones already waiting.
     pub(crate) fn place(&self, cpu: &Cpu, t: Paddr) {
-        // The least-run fair time (only grows): of the running thread and
-        // the head of the queue.
-        let mut least = u64::MAX;
+        let floor = |vr: u64, min: u64| vr.max(if vr == 0 { min } else { min.saturating_sub(SLEEPER_CREDIT) }).max(1);
+        let g = self.group_of(t);
+        let gr = self.grp(cpu, g);
         let cur = cpu.cur.get();
-        if cur != 0 && self.dl_of(cur).is_none() {
-            least = self.thread(cur).vr.get();
-        }
-        let head = cpu.rq_head.get();
-        if head != 0 {
-            least = least.min(self.thread(head).vr.get());
+        let cur_group = if cur != 0 && self.dl_of(cur).is_none() { self.group_of(cur) } else { 0 };
+        // Within its group: the least-run time (only grows) of the group's
+        // running thread and its first waiting one.
+        let mut least = if cur_group == g { self.thread(cur).vr.get() } else { u64::MAX };
+        if gr.first.get() != 0 {
+            least = least.min(self.thread(gr.first.get()).vr.get());
         }
         if least != u64::MAX {
-            cpu.min_vr.set(cpu.min_vr.get().max(least));
+            gr.min_vr.set(gr.min_vr.get().max(least));
         }
         let th = self.thread(t);
-        let floor = if th.vr.get() == 0 { cpu.min_vr.get() } else { cpu.min_vr.get().saturating_sub(SLEEPER_CREDIT) };
-        th.vr.set(th.vr.get().max(floor).max(1));
+        th.vr.set(floor(th.vr.get(), gr.min_vr.get()));
+        // Among the groups, when this one comes back to the processor.
+        if gr.first.get() == 0 && cur_group != g {
+            let mut least = if cur_group != 0 { self.grp(cpu, cur_group).vr.get() } else { u64::MAX };
+            if cpu.gq_first.get() != 0 {
+                least = least.min(self.grp(cpu, cpu.gq_first.get()).vr.get());
+            }
+            if least != u64::MAX {
+                cpu.min_vr.set(cpu.min_vr.get().max(least));
+            }
+            gr.vr.set(floor(gr.vr.get(), cpu.min_vr.get()));
+        }
     }
 
     /// Whether `t`, just made runnable on processor `cpu`, should take the
@@ -224,7 +373,17 @@ impl<H: Hal> Kernel<H> {
             (Some(n), Some(c)) => n.remaining.get() > 0 && n.deadline.get() < c.deadline.get(),
             (Some(n), None) => n.remaining.get() > 0 || n.deadline.get() <= self.hal.now(),
             (None, Some(_)) => false,
-            (None, None) => self.thread(t).vr.get().saturating_add(WAKE_GRANULE) <= self.thread(cur).vr.get(),
+            (None, None) => {
+                // Within one group, by the threads' standing; else by the
+                // groups'.
+                let (gt, gc) = (self.group_of(t), self.group_of(cur));
+                let (a, b) = if gt == gc {
+                    (self.thread(t).vr.get(), self.thread(cur).vr.get())
+                } else {
+                    (self.grp(cpu, gt).vr.get(), self.grp(cpu, gc).vr.get())
+                };
+                a.saturating_add(WAKE_GRANULE) <= b
+            }
         }
     }
 
@@ -242,19 +401,36 @@ impl<H: Hal> Kernel<H> {
         // nanoseconds: 2^64 of them are 584 years.)
         if s == 0 {
             th.vr.set(th.vr.get().wrapping_add(ran));
-            return;
-        }
-        {
+        } else {
             let sc = self.sched(s);
             sc.consumed.set(sc.consumed.get().saturating_add(ran));
             if sc.class.get() == SCHED_DEADLINE {
                 sc.remaining.set(sc.remaining.get().saturating_sub(ran));
                 return;
             }
+            let w = sc.weight.get();
+            th.vr.set(th.vr.get().saturating_add(scaled(ran, w)));
         }
-        let w = self.weight_of(a);
-        let delta = if w == SCHED_DEFAULT_WEIGHT { ran } else { (ran as u128 * SCHED_DEFAULT_WEIGHT as u128 / w as u128) as u64 };
-        th.vr.set(th.vr.get().saturating_add(delta));
+        // Its group pays as well, at the group's weight.
+        let g = self.group_of(a);
+        let gr = self.grp(cpu, g);
+        let delta = if g == UNBOUND {
+            ran
+        } else {
+            let sc = self.sched(g);
+            sc.consumed.set(sc.consumed.get().saturating_add(ran));
+            scaled(ran, sc.weight.get())
+        };
+        // A group in the processor's tree moves to its new place (alone
+        // there, it is in place whatever its key).
+        if gr.first.get() != 0 && !(cpu.gq_first.get() == g && cpu.gq_last.get() == g) {
+            let groups = Groups(self, cpu);
+            crate::order::remove(&groups, g);
+            gr.vr.set(gr.vr.get().saturating_add(delta));
+            crate::order::insert(&groups, g, false);
+        } else {
+            gr.vr.set(gr.vr.get().wrapping_add(delta));
+        }
     }
 
     /// A deadline context whose period has ended gets its budget back.
@@ -288,9 +464,25 @@ impl<H: Hal> Kernel<H> {
     pub(crate) fn pick(&self, cpu: &Cpu, now: u64) -> Paddr {
         // The common case: no deadline work on this processor.
         if cpu.dl_head.get() == 0 {
-            return crate::order::pop(&RunQueue(self, cpu));
+            return self.pick_fair(cpu);
         }
         self.pick_deadline(cpu, now)
+    }
+
+    /// The first waiting thread of the least-run group, taken off the
+    /// queue (the group with it, if it was its last). 0: none.
+    #[inline(always)]
+    fn pick_fair(&self, cpu: &Cpu) -> Paddr {
+        let g = cpu.gq_first.get();
+        if g == 0 {
+            return 0;
+        }
+        let gr = self.grp(cpu, g);
+        let t = crate::order::pop(&Members(self, gr));
+        if gr.first.get() == 0 {
+            crate::order::pop(&Groups(self, cpu));
+        }
+        t
     }
 
     #[inline(never)]
@@ -310,7 +502,7 @@ impl<H: Hal> Kernel<H> {
             self.q_remove(&cpu.dl_head, &cpu.dl_tail, best);
             return best;
         }
-        crate::order::pop(&RunQueue(self, cpu))
+        self.pick_fair(cpu)
     }
 
     /// When processor `cpu`, running its current thread, must next look at
@@ -320,12 +512,19 @@ impl<H: Hal> Kernel<H> {
     #[inline]
     pub(crate) fn preempt_at(&self, cpu: &Cpu, now: u64) -> u64 {
         // The common case: no deadline work and a thread with the default
-        // share. The one picked has run least, so it cannot be GRANULE ahead
-        // of the next sooner than GRANULE from now: look again then (and
-        // the pick decides who runs).
+        // share in its processor's own group (or a group of the default
+        // weight). The one picked has run least, in its group and its group
+        // among the groups, so neither can be GRANULE ahead of the next
+        // sooner than GRANULE from now: look again then (and the pick decides
+        // who runs).
         let a = cpu.account.get();
-        if cpu.dl_head.get() == 0 && cpu.cur.get() != 0 && a != 0 && self.thread(a).sc.get() == 0 {
-            return if cpu.rq_head.get() == 0 { u64::MAX } else { now.wrapping_add(GRANULE) };
+        if cpu.dl_head.get() == 0
+            && cpu.cur.get() != 0
+            && a != 0
+            && self.thread(a).sc.get() == 0
+            && (self.thread(a).group.get() == UNBOUND || self.sched(self.thread(a).group.get()).weight.get() == SCHED_DEFAULT_WEIGHT)
+        {
+            return if cpu.gq_first.get() == 0 { u64::MAX } else { now.wrapping_add(GRANULE) };
         }
         self.preempt_at_exactly(cpu, now)
     }
@@ -357,11 +556,21 @@ impl<H: Hal> Kernel<H> {
         if let Some(sc) = self.dl_of(a) {
             return at.min(now.saturating_add(sc.remaining.get().max(1)));
         }
-        let head = cpu.rq_head.get();
+        // Within its group: GRANULE ahead of the group's first waiting thread.
+        let g = self.group_of(a);
+        let gr = self.grp(cpu, g);
+        let head = gr.first.get();
         if head != 0 {
             let ahead = (self.thread(head).vr.get() + GRANULE).saturating_sub(self.thread(a).vr.get());
             let w = self.weight_of(a);
             let real = (ahead as u128 * w as u128 / SCHED_DEFAULT_WEIGHT as u128) as u64;
+            at = at.min(now.saturating_add(real.max(MIN_RUN)));
+        }
+        // Among the groups: its group GRANULE ahead of the least-run other one.
+        let other = if cpu.gq_first.get() == g { crate::order::next(&Groups(self, cpu), g) } else { cpu.gq_first.get() };
+        if other != 0 {
+            let ahead = (self.grp(cpu, other).vr.get() + GRANULE).saturating_sub(gr.vr.get());
+            let real = (ahead as u128 * self.group_weight(g) as u128 / SCHED_DEFAULT_WEIGHT as u128) as u64;
             at = at.min(now.saturating_add(real.max(MIN_RUN)));
         }
         at
@@ -391,6 +600,25 @@ impl<H: Hal> Kernel<H> {
                 self.release_reservation(sc);
                 sc.class.set(SCHED_FAIR);
                 sc.weight.set(a);
+                Ok(())
+            }
+            SCHED_GROUP => {
+                // A group is one share of its processor, so it takes
+                // authority over that processor's time, whatever its weight.
+                if !(1..=SCHED_MAX_WEIGHT).contains(&a) || cpu >= self.ncpu() as u64 {
+                    return Err(Error::BadArg);
+                }
+                if !time.contains(&cpu) {
+                    return Err(Error::NoRights);
+                }
+                if bound && (sc.class.get() != SCHED_GROUP || sc.cpu.get() != cpu + 1) {
+                    return Err(Error::InUse);
+                }
+                // A new weight changes its pace, not its place.
+                self.release_reservation(sc);
+                sc.class.set(SCHED_GROUP);
+                sc.weight.set(a);
+                sc.cpu.set(cpu + 1);
                 Ok(())
             }
             SCHED_DEADLINE => {
@@ -434,15 +662,35 @@ impl<H: Hal> Kernel<H> {
         }
     }
 
-    /// Bind thread `t` to the context at `s` (0: none). The caller holds
-    /// every lock, or the thread's processor's lock.
+    /// Bind thread `t` to the context at `s` (0: none): a fair or deadline
+    /// context is the thread's own (0 unbinds it); a group is the share it
+    /// is in (left only for another group). The caller holds every lock, or
+    /// the thread's processor's lock.
     pub(crate) fn sched_bind(&self, t: Paddr, s: Paddr) -> Result<(), Error> {
         let th = self.thread(t);
         let home = self.home(t);
         if s != 0 {
             let sc = self.sched(s);
-            if sc.class.get() == SCHED_DEADLINE && sc.cpu.get() != th.cpu.get() + 1 {
-                return Err(Error::BadArg);
+            match sc.class.get() {
+                SCHED_DEADLINE if sc.cpu.get() != th.cpu.get() + 1 => return Err(Error::BadArg),
+                SCHED_GROUP => {
+                    // Joining a group on another processor takes the thread
+                    // there (the group's capability is the authority to; a
+                    // deadline reservation is the one thing that cannot go).
+                    let cpu = sc.cpu.get() - 1;
+                    if cpu != th.cpu.get() {
+                        if self.dl_of(t).is_some() {
+                            return Err(Error::InUse);
+                        }
+                        self.regroup(t, UNBOUND);
+                        self.move_thread(t, cpu as usize);
+                    }
+                    if th.group.get() != s {
+                        self.regroup(t, s);
+                    }
+                    return Ok(());
+                }
+                _ => {}
             }
         }
         let queued = th.state.get() == RUNNABLE && home.cur.get() != t && home.direct.get() != t;
@@ -488,37 +736,121 @@ impl<H: Hal> Kernel<H> {
         th.sc_prev.set(0);
     }
 
+    /// Put thread `t` in group `s` (a group context on its processor;
+    /// [`UNBOUND`]: its processor's own), carrying its standing over to the new group's
+    /// scale, as a move between processors does.
+    pub(crate) fn regroup(&self, t: Paddr, s: Paddr) {
+        let th = self.thread(t);
+        let home = self.home(t);
+        let queued = th.state.get() == RUNNABLE && home.cur.get() != t && home.direct.get() != t;
+        if queued {
+            self.dequeue(home, t);
+        }
+        let from = self.grp(home, self.group_of(t)).min_vr.get();
+        self.group_unlink(t);
+        if s != UNBOUND {
+            let sc = self.sched(s);
+            th.g_prev.set(0);
+            th.g_next.set(sc.threads.get());
+            if sc.threads.get() != 0 {
+                self.thread(sc.threads.get()).g_prev.set(t);
+            }
+            sc.threads.set(t);
+            th.group.set(s);
+        }
+        let to = self.grp(home, self.group_of(t)).min_vr.get();
+        if th.vr.get() != 0 {
+            th.vr.set(th.vr.get().saturating_sub(from).saturating_add(to).max(1));
+        }
+        if queued {
+            self.enqueue(home, t);
+        }
+        home.dirty.set(true);
+    }
+
+    /// Take thread `t` out of its group's list (it is then in its
+    /// processor's own group).
+    pub(crate) fn group_unlink(&self, t: Paddr) {
+        let th = self.thread(t);
+        let g = th.group.get();
+        if g == UNBOUND {
+            return;
+        }
+        let (p, n) = (th.g_prev.get(), th.g_next.get());
+        if p != 0 {
+            self.thread(p).g_next.set(n);
+        } else {
+            self.sched(g).threads.set(n);
+        }
+        if n != 0 {
+            self.thread(n).g_prev.set(p);
+        }
+        th.group.set(UNBOUND);
+        th.g_next.set(0);
+        th.g_prev.set(0);
+    }
+
     /// The last capability to the context at `s` is gone: its threads go
-    /// back to the default fair share and its reservation is given back.
-    /// The caller holds every lock.
+    /// back to the default fair share (a group's, to their processor's own
+    /// group) and its reservation is given back. The caller holds every
+    /// lock.
     pub(crate) fn finalise_sched(&self, s: Paddr) {
         loop {
             let t = self.sched(s).threads.get();
             if t == 0 {
                 break;
             }
-            let _ = self.sched_bind(t, 0);
+            if self.sched(s).class.get() == SCHED_GROUP {
+                self.regroup(t, UNBOUND);
+            } else {
+                let _ = self.sched_bind(t, 0);
+            }
         }
         self.release_reservation(self.sched(s));
     }
 }
 
 impl<H: Hal> Kernel<H> {
-    /// Thread `t`'s virtual runtime, and its processor's least virtual
-    /// runtime and running thread: the scheduler's view, for tests and the
-    /// debug console.
+    /// Thread `t`'s virtual runtime and its group's, and its processor's
+    /// running thread: the scheduler's view, for tests and the debug
+    /// console.
     pub fn sched_view(&self, t: Paddr) -> (u64, u64, Paddr) {
         let cpu = self.home(t);
-        (self.thread(t).vr.get(), cpu.min_vr.get(), cpu.cur.get())
+        (self.thread(t).vr.get(), self.grp(cpu, self.group_of(t)).vr.get(), cpu.cur.get())
     }
 }
 
-/// A processor's fair run queue as `order.rs` sees it: threads in order of
-/// virtual runtime, linked through `qprev` (left), `qnext` (right) and
-/// `rq_up`.
-pub(crate) struct RunQueue<'a, H: Hal>(pub(crate) &'a Kernel<H>, pub(crate) &'a Cpu);
+/// A processor's groups with threads waiting, as `order.rs` sees them: in
+/// order of the group's virtual runtime, linked through the group's own
+/// links.
+pub(crate) struct Groups<'a, H: Hal>(pub(crate) &'a Kernel<H>, pub(crate) &'a Cpu);
 
-impl<H: Hal> crate::order::Tree for RunQueue<'_, H> {
+impl<H: Hal> crate::order::Tree for Groups<'_, H> {
+    #[inline(always)]
+    fn node(&self, g: Paddr) -> crate::order::Node<'_> {
+        let gr = self.0.grp(self.1, g);
+        crate::order::Node { left: &gr.left, right: &gr.right, up: &gr.up, meta: &gr.meta }
+    }
+    #[inline(always)]
+    fn key(&self, g: Paddr) -> u64 {
+        self.0.grp(self.1, g).vr.get()
+    }
+    fn root(&self) -> &crate::order::Root {
+        &self.1.gq_tree
+    }
+    fn first(&self) -> &Cell<Paddr> {
+        &self.1.gq_first
+    }
+    fn last(&self) -> &Cell<Paddr> {
+        &self.1.gq_last
+    }
+}
+
+/// A group's waiting threads, as `order.rs` sees them: in order of virtual
+/// runtime, linked through `qprev` (left), `qnext` (right) and `rq_up`.
+pub(crate) struct Members<'a, H: Hal>(pub(crate) &'a Kernel<H>, pub(crate) &'a Group);
+
+impl<H: Hal> crate::order::Tree for Members<'_, H> {
     #[inline(always)]
     fn node(&self, t: Paddr) -> crate::order::Node<'_> {
         let th = self.0.thread(t);
@@ -529,12 +861,12 @@ impl<H: Hal> crate::order::Tree for RunQueue<'_, H> {
         self.0.thread(t).vr.get()
     }
     fn root(&self) -> &crate::order::Root {
-        &self.1.rq_tree
+        &self.1.top
     }
     fn first(&self) -> &Cell<Paddr> {
-        &self.1.rq_head
+        &self.1.first
     }
     fn last(&self) -> &Cell<Paddr> {
-        &self.1.rq_tail
+        &self.1.last
     }
 }

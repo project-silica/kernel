@@ -95,6 +95,11 @@ pub struct Thread {
     pub(crate) sc: Cell<Paddr>,
     pub(crate) sc_next: Cell<Paddr>,
     pub(crate) sc_prev: Cell<Paddr>,
+    /// The group it is in (`sched::Group`: a group context; 0: its
+    /// processor's own), and its links in the group's list of threads.
+    pub(crate) group: Cell<Paddr>,
+    pub(crate) g_next: Cell<Paddr>,
+    pub(crate) g_prev: Cell<Paddr>,
     /// Fair class: virtual runtime (`sched.rs`).
     pub(crate) vr: Cell<u64>,
     /// The notification this thread last listened on while receiving on an
@@ -374,7 +379,7 @@ impl<H: Hal> Kernel<H> {
         old.dirty.set(true);
         // Its standing among the fair threads, carried over to the new
         // processor's scale.
-        th.vr.set(th.vr.get().saturating_sub(old.min_vr.get()).saturating_add(new.min_vr.get()));
+        th.vr.set(th.vr.get().saturating_sub(old.unbound.min_vr.get()).saturating_add(new.unbound.min_vr.get()));
         // A call waiting for its answer keeps its time limit, among the new
         // processor's timers.
         let deadline = th.deadline.get();
@@ -471,6 +476,7 @@ impl<H: Hal> Kernel<H> {
         }
         self.drop_caller(t);
         self.sched_unlink(t);
+        self.group_unlink(t);
         let cpu = self.home(t);
         if cpu.account.get() == t {
             cpu.account.set(0);
@@ -641,12 +647,12 @@ impl<H: Hal> Kernel<H> {
             // now come before the running one?
             if me.woken.get() && cur_ok {
                 me.woken.set(false);
-                let first = if me.dl_head.get() != 0 { me.dl_head.get() } else { me.rq_head.get() };
+                let first = if me.dl_head.get() != 0 { me.dl_head.get() } else { self.grp_first(me) };
                 if first != 0 && self.preempts(me, first) {
                     me.resched.set(true);
                 }
             }
-            let others = me.rq_head.get() != 0 || me.dl_head.get() != 0;
+            let others = me.gq_first.get() != 0 || me.dl_head.get() != 0;
             if cur_ok && !me.resched.get() {
                 // Keep running; a queue that has just stopped being empty
                 // needs a time at which to look again.
@@ -669,12 +675,8 @@ impl<H: Hal> Kernel<H> {
             // it yielded) and pick.
             if cur_ok {
                 let th = self.thread(cur);
-                let tail = me.rq_tail.get();
-                if me.yielded.replace(false) && tail != 0 && (th.sc.get() == 0 || self.dl_of(cur).is_none()) {
-                    // A yield: behind every fair thread waiting (a fair
-                    // thread, so straight into the fair queue, as its last).
-                    th.vr.set(th.vr.get().max(self.thread(tail).vr.get()));
-                    crate::order::push_last(&crate::sched::RunQueue(self, me), cur);
+                if me.yielded.replace(false) && me.gq_first.get() != 0 && (th.sc.get() == 0 || self.dl_of(cur).is_none()) {
+                    self.requeue_yielded(me, cur);
                 } else {
                     self.enqueue(me, cur);
                 }
@@ -758,7 +760,7 @@ impl<H: Hal> Kernel<H> {
         // The devices interrupt again, and what they wrote meanwhile is
         // delivered (`watch.rs`).
         self.end_watches();
-        if halted || me.rq_head.get() != 0 || me.dl_head.get() != 0 || me.direct.get() != 0 || self.hal.now() >= until {
+        if halted || me.gq_first.get() != 0 || me.dl_head.get() != 0 || me.direct.get() != 0 || self.hal.now() >= until {
             return;
         }
         // The watch ran its length with nothing: halt, without watching again.

@@ -25,7 +25,8 @@ pub use silica_abi::root;
 pub use silica_abi::{
     ASPACE_IO, ASPACE_ISOLATED, Error, FAULT_FETCH, FAULT_LABEL, FAULT_MAP, FAULT_PRESENT, FAULT_RESUME, FAULT_WRITE, Fault,
     IRQ_ACTIVE_LOW, IRQ_LEVEL, IRQ_LINES, IRQ_MSI, KEEP, LARGE_BITS, LISTEN_SHIFT, MsgInfo, ObjectType, PAGE_BITS, Rights, SCHED_DEADLINE,
-    SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE, THREAD_SENDING,
+    SCHED_DEFAULT_WEIGHT, SCHED_FAIR, SCHED_GROUP, SCHED_MAX_WEIGHT, THREAD_INACTIVE, THREAD_RECEIVING, THREAD_REPLY, THREAD_RUNNABLE,
+    THREAD_SENDING,
 };
 
 /// Platform API level (`spec/CI_RELEASE.md` section 7).
@@ -576,8 +577,20 @@ pub fn sched_deadline(sc: Cap, budget: u64, period: u64, cpu: usize, time: Cap) 
     sys(Syscall::SchedConfigure, [sc.0, SCHED_DEADLINE, budget, period, cpu as u64, time.0]).map(|_| ())
 }
 
+/// Make `sc` a group of `weight` on processor `cpu`: the threads in it
+/// share one share of that processor, however many there are, and a
+/// thread made by one of them is in it too. Needs `time`, a processor-time
+/// capability covering `cpu` (`NoRights` otherwise). What a parent gives
+/// each program it starts, so that no program's threads take more of a
+/// processor than one share.
+pub fn sched_group(sc: Cap, weight: u64, cpu: usize, time: Cap) -> Result<()> {
+    sys(Syscall::SchedConfigure, [sc.0, SCHED_GROUP, weight, 0, cpu as u64, time.0]).map(|_| ())
+}
+
 /// Run `thread` on the scheduling context `sc` (`Cap::NONE`: the default
-/// fair share). A deadline context must be on the thread's processor.
+/// fair share, leaving any group it is in). A deadline context must be on
+/// the thread's processor; a group takes the thread to its processor, and
+/// the thread stays in it until it joins another.
 pub fn thread_bind(thread: Cap, sc: Cap) -> Result<()> {
     sys(Syscall::ThreadControl, [thread.0, 3, sc.0, 0, 0, 0]).map(|_| ())
 }

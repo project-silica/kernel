@@ -129,11 +129,14 @@ pub struct Cpu {
     /// is forgotten (`forget_root`): the next switch, whatever it loads,
     /// still leaves the isolated space's predictions behind.
     pub(crate) isolated: Cell<u8>,
-    /// The fair run queue, a tree in order of virtual runtime (`order.rs`):
-    /// its first (least-run) and last threads, and the tree.
-    pub(crate) rq_head: Cell<Paddr>,
-    pub(crate) rq_tail: Cell<Paddr>,
-    pub(crate) rq_tree: crate::order::Root,
+    /// The fair run queue's groups with threads waiting, a tree in order
+    /// of the group's virtual runtime (`order.rs`, `sched::Group`): its
+    /// first (least-run) and last groups, and the tree.
+    pub(crate) gq_first: Cell<Paddr>,
+    pub(crate) gq_last: Cell<Paddr>,
+    pub(crate) gq_tree: crate::order::Root,
+    /// This processor's own group: its threads given no group.
+    pub(crate) unbound: crate::sched::Group,
     /// Threads with deadlines, a tree in deadline order: the soonest, the
     /// latest, and the tree.
     pub(crate) timers: Cell<Paddr>,
@@ -147,7 +150,7 @@ pub struct Cpu {
     /// Runnable threads bound to deadline contexts.
     pub(crate) dl_head: Cell<Paddr>,
     pub(crate) dl_tail: Cell<Paddr>,
-    /// The least virtual runtime among this processor's fair threads (only grows).
+    /// The least virtual runtime among this processor's groups (only grows).
     pub(crate) min_vr: Cell<u64>,
     /// When time was last charged, and to which thread (0: none).
     pub(crate) since: Cell<u64>,
@@ -214,9 +217,10 @@ impl Cpu {
             loaded: Cell::new(0),
             loaded_root: Cell::new(0),
             isolated: Cell::new(0),
-            rq_head: Cell::new(0),
-            rq_tail: Cell::new(0),
-            rq_tree: crate::order::Root::new(),
+            gq_first: Cell::new(0),
+            gq_last: Cell::new(0),
+            gq_tree: crate::order::Root::new(),
+            unbound: crate::sched::Group::new(),
             timers: Cell::new(0),
             timers_last: Cell::new(0),
             timer_tree: crate::order::Root::new(),

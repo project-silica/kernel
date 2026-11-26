@@ -683,11 +683,16 @@ impl<H: Hal> Kernel<H> {
                     2 => {
                         // Move the thread to processor `a2`, doing what it
                         // was doing. A deadline reservation is on one
-                        // processor: unbind it first.
+                        // processor: unbind it first. A group is on one
+                        // processor too, and is left only for another: a
+                        // thread moved out of it would take a share of its
+                        // own (or of another processor's own group).
                         if a[2] >= self.ncpu() as u64 {
                             return Err(Error::BadArg);
                         }
-                        if self.dl_of(th.obj).is_some() {
+                        if self.dl_of(th.obj).is_some()
+                            || (self.thread(th.obj).group.get() != crate::sched::UNBOUND && a[2] != self.thread(th.obj).cpu.get())
+                        {
                             return Err(Error::InUse);
                         }
                         if th.obj == t {
@@ -698,8 +703,17 @@ impl<H: Hal> Kernel<H> {
                     }
                     3 => {
                         let s = if a[2] == 0 { 0 } else { self.ccap(t, a[2], ObjectType::SchedContext, Rights::READ)?.1.obj };
+                        let was = self.thread(th.obj).cpu.get();
+                        // A group on another processor takes the thread there:
+                        // the caller's own status is written before it goes.
+                        if th.obj == t {
+                            self.thread(t).regs[H::SYS].set(0);
+                        }
                         self.sched_bind(th.obj, s)?;
                         let home = self.thread(th.obj).cpu.get() as usize;
+                        if th.obj == t && home as u64 != was {
+                            return Ok(Exit::Blocked);
+                        }
                         if home != self.hal.cpu() && self.cpus.get(home).cur.get() == th.obj {
                             self.hal.kick(home, false);
                         }
@@ -1178,15 +1192,18 @@ impl<H: Hal> Kernel<H> {
     }
 
     /// Whether every processor's run queues are well formed: the fair
-    /// queue a balanced tree in order of virtual runtime, the deadline
-    /// queue a list linked both ways, each ending and holding only runnable
-    /// threads of that processor that are not running, of the queue's
-    /// class. For tests and fuzzing.
+    /// queue a balanced tree of the processor's groups with threads
+    /// waiting, in order of the group's virtual runtime, each a balanced
+    /// tree of its own waiting threads in order of theirs; the deadline
+    /// queue a list linked both ways; each ending and holding only runnable
+    /// threads of that processor that are not running, of the queue's class
+    /// and group. For tests and fuzzing.
     pub fn check_runqueues(&self) -> Result<(), &'static str> {
         use crate::order;
+        use crate::sched::{Groups, Members, UNBOUND};
         for (i, cpu) in self.cpus.iter(self.ncpu()).enumerate() {
-            let fair = crate::sched::RunQueue(self, cpu);
-            let n = order::check(&fair, 1 << 20)?;
+            let groups = Groups(self, cpu);
+            let ng = order::check(&groups, 1 << 20)?;
             let waiting = |t: Paddr, dl: bool| {
                 let th = self.thread(t);
                 if th.cpu.get() as usize != i || th.state.get() != RUNNABLE || t == cpu.cur.get() {
@@ -1197,14 +1214,39 @@ impl<H: Hal> Kernel<H> {
                 }
                 Ok(())
             };
-            let (mut t, mut seen) = (cpu.rq_head.get(), 0usize);
-            while t != 0 {
-                waiting(t, false)?;
+            let (mut g, mut seen, mut own) = (cpu.gq_first.get(), 0usize, false);
+            while g != 0 {
+                if g == UNBOUND {
+                    own = true;
+                } else if self.sched(g).class.get() != silica_abi::SCHED_GROUP || self.sched(g).cpu.get() != i as u64 + 1 {
+                    return Err("a processor's run queue holds a group that is not one of its own");
+                }
+                let gr = self.grp(cpu, g);
+                if gr.first.get() == 0 {
+                    return Err("a group with no thread waiting is on its processor's run queue");
+                }
+                let members = Members(self, gr);
+                let n = order::check(&members, 1 << 20)?;
+                let (mut t, mut m) = (gr.first.get(), 0usize);
+                while t != 0 {
+                    waiting(t, false)?;
+                    if self.group_of(t) != g {
+                        return Err("a group's run queue holds a thread of another group");
+                    }
+                    m += 1;
+                    t = order::next(&members, t);
+                }
+                if m != n {
+                    return Err("a group's run queue's order does not reach every thread in it");
+                }
                 seen += 1;
-                t = order::next(&fair, t);
+                g = order::next(&groups, g);
             }
-            if seen != n {
-                return Err("the fair run queue's order does not reach every thread in it");
+            if seen != ng {
+                return Err("the fair run queue's order does not reach every group in it");
+            }
+            if cpu.unbound.first.get() != 0 && !own {
+                return Err("a processor's own group has threads waiting and is not on its run queue");
             }
             let (mut t, mut prev, mut n) = (cpu.dl_head.get(), 0, 0usize);
             while t != 0 {
@@ -1311,7 +1353,7 @@ impl<H: Hal> Kernel<H> {
         let me = self.me();
         let c = me.cur.get();
         (c != 0 && self.thread(c).state.get() == RUNNABLE)
-            || me.rq_head.get() != 0
+            || me.gq_first.get() != 0
             || me.dl_head.get() != 0
             || me.direct.get() != 0
             || me.timers.get() != 0
