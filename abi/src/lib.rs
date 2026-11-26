@@ -112,17 +112,20 @@ pub enum Syscall {
     /// otherwise, with nothing changed.
     ThreadConfigure = 12,
     /// `a0` thread, `a1` instruction pointer, `a2` stack pointer, `a3`
-    /// first argument, `a4` not 0: make the thread runnable.
+    /// first argument, `a4` not 0: make the thread runnable (`NoTime`, with
+    /// nothing changed, for a thread bound to no scheduling context: a new
+    /// thread has no time until its maker binds it, `ThreadControl`).
     ThreadStart = 13,
-    /// `a0` thread, `a1` 0 suspend, 1 resume, 2 move to processor `a2`
-    /// (it carries on there with what it was doing: a call waiting for its
-    /// reply is answered there, a send or receive not yet delivered is made
-    /// again there, a suspended thread stays suspended; `InUse` while it is
-    /// bound to a deadline context or in a group), 3 bind it to the
-    /// SchedContext `a2` (read; 0: unbind its fair or deadline context,
-    /// back to the default fair share; a deadline context or a group must
-    /// be on the thread's processor; a group's thread stays in its group
-    /// until bound to another).
+    /// `a0` thread, `a1` 0 suspend, 1 resume (`NoTime` for a thread bound
+    /// to no context), 2 bind it to the SchedContext `a2` (read): from now
+    /// on it runs on that context's time, on that context's processor
+    /// (`NoTime` for a context nobody gave a processor's time). A thread
+    /// taken to another processor carries on there with what it was doing:
+    /// a call waiting for its reply is answered there, a send or receive
+    /// not yet delivered is made again there, a suspended thread stays
+    /// suspended. A thread leaves its context only for another; when a
+    /// context's last capability goes, its threads stop (suspended, bound
+    /// to nothing) until they are bound and resumed.
     ThreadControl = 14,
     /// `a0` port capability, `a1` port, `a2` width in bytes (1, 2, 4) with
     /// bit 8 set for a write, `a3` value. Returns `a0` value read.
@@ -199,38 +202,25 @@ pub enum Syscall {
     /// describes no way to do it. Nothing is stopped or flushed first: that
     /// is the caller's business (the shutdown service's).
     PowerOff = 20,
-    /// `a0` SchedContext (write), `a1` class. [`SCHED_FAIR`]: `a2` weight
-    /// (1 to [`SCHED_MAX_WEIGHT`]; a thread with none weighs
-    /// [`SCHED_DEFAULT_WEIGHT`]): bound threads share the processor in
-    /// proportion to their weights. [`SCHED_DEADLINE`]: `a2` budget and `a3`
-    /// period in nanoseconds, `a4` processor: bound threads run before any
-    /// fair work, earliest deadline first, for `a2` of every `a3`, and are
-    /// held back once it is spent until the next period. `Overload` when the
+    /// `a0` SchedContext (write), `a1` class, `a4` processor, `a5` a
+    /// processor-time capability covering `a4` (write;
+    /// [`root::SLOT_SCHED`] or one narrowed from it to a range of
+    /// processors). Processor time is authority, as memory is: a context
+    /// is time on one processor, given by whoever holds that processor's
+    /// time. A context made from memory alone is none: nothing bound to it
+    /// runs, and no thread runs without one. `NoRights` without the
+    /// capability, `WrongType` for one that is not processor time.
+    ///
+    /// [`SCHED_FAIR`]: `a2` weight (1 to [`SCHED_MAX_WEIGHT`]): one share
+    /// of the processor, which the context takes among the other fair
+    /// contexts there in proportion to its weight and divides equally among
+    /// the threads bound to it, so a program's threads take one share
+    /// however many it makes. [`SCHED_DEADLINE`]: `a2` budget and `a3`
+    /// period in nanoseconds: bound threads run before any fair work,
+    /// earliest deadline first, for `a2` of every `a3`, and are held back
+    /// once it is spent until the next period. `Overload` when the
     /// processor's reservations would take more than 90% of it. `InUse` to
-    /// change the class, or a deadline context's processor, while threads
-    /// are bound to it.
-    ///
-    /// Processor time is authority, as memory is: `a5` is a processor-time
-    /// capability (write; [`root::SLOT_SCHED`] or one narrowed from it to
-    /// a range of processors), or 0 for none. Without one a context may be
-    /// configured fair with at most [`SCHED_DEFAULT_WEIGHT`]: memory buys a
-    /// share no better than a thread without a context has. A greater
-    /// weight needs one covering every processor (a fair thread runs
-    /// wherever it is moved); a reservation, one covering `a4`. `NoRights`
-    /// otherwise, `WrongType` for a capability that is not processor time.
-    ///
-    /// [`SCHED_GROUP`]: `a2` weight, `a4` processor: a group, which every
-    /// thread bound to it shares as one: on its processor the group takes
-    /// the share its weight gives it among the other groups there, and
-    /// divides it among its threads (each by the weight of its own fair
-    /// context, or the default). Every fair thread is in a group: the one
-    /// it was bound to, else that of the thread that made it (`Retype`),
-    /// else its processor's own (the threads no group was given to). A
-    /// thread cannot leave its group but for another it is bound to, nor
-    /// be moved off its group's processor, so a program's threads take its
-    /// group's share however many it makes. Needs a processor-time
-    /// capability covering `a4`; `InUse` to change the processor or the
-    /// class while threads are in it.
+    /// change the class or the processor while threads are bound to it.
     SchedConfigure = 21,
     /// `a0` device-identity capability, `a1` a device's identity (its PCI
     /// segment, bus, device and function: `segment << 16 | bus << 8 |
@@ -489,13 +479,12 @@ pub const THREAD_BITS: u8 = 12;
 pub const ENDPOINT_BITS: u8 = 6;
 /// Size in bits of a SchedContext object.
 pub const SCHED_BITS: u8 = 8;
-/// `SchedConfigure` class: weighted fair share.
+/// `SchedConfigure` class: one weighted fair share of a processor.
 pub const SCHED_FAIR: u64 = 0;
 /// `SchedConfigure` class: a deadline reservation.
 pub const SCHED_DEADLINE: u64 = 1;
-/// `SchedConfigure` class: a group of threads sharing one share.
-pub const SCHED_GROUP: u64 = 2;
-/// The weight of a thread with no scheduling context, and of a new one.
+/// The weight shares are measured against: the root task's own context
+/// has it, and a service manager gives it to each service.
 pub const SCHED_DEFAULT_WEIGHT: u64 = 1024;
 /// The largest weight.
 pub const SCHED_MAX_WEIGHT: u64 = 1 << 20;
@@ -580,6 +569,9 @@ pub enum Error {
     /// The processor's time is already promised: a deadline reservation
     /// would take more than the share deadline work may have.
     Overload = 17,
+    /// The thread is bound to no scheduling context, or the context was
+    /// given no processor's time: nothing runs on time nobody granted.
+    NoTime = 18,
 }
 
 impl Error {
@@ -603,6 +595,7 @@ impl Error {
             15 => Error::Unsupported,
             16 => Error::TooDeep,
             17 => Error::Overload,
+            18 => Error::NoTime,
             _ => Error::BadSyscall,
         })
     }

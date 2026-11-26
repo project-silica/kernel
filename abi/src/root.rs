@@ -31,10 +31,15 @@ pub const SLOT_POWER: u64 = 9;
 /// `Syscall::IrqBind` with `IRQ_MSI`).
 pub const SLOT_DEVICES: u64 = 10;
 /// Slot of the processor-time capability: every processor of the machine,
-/// by index (`Syscall::SchedConfigure`: a weight above the default, or a
-/// deadline reservation, on the processors it covers). Narrowed by
-/// `CapCopy` as any range is.
+/// by index (`Syscall::SchedConfigure`: what gives a scheduling context a
+/// share or a reservation of a processor it covers). Narrowed by `CapCopy`
+/// as any range is.
 pub const SLOT_SCHED: u64 = 11;
+/// Slot of the root thread's own scheduling context: one fair share of
+/// the boot processor at the default weight, the first time there is.
+/// Every other context is made by the root task or by whoever it gives
+/// processor time to.
+pub const SLOT_CONTEXT: u64 = 12;
 /// Slot of the Untyped the root task's own objects were made from; what is
 /// left of it is the root task's to use.
 pub const SLOT_BOOT_UNTYPED: u64 = 7;

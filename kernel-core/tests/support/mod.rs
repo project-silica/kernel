@@ -625,11 +625,37 @@ impl Machine {
         self.ok(Syscall::Retype, [ut, ty as u64, bits, silica_abi::root::SLOT_CAPSPACE, slot, count]);
     }
 
-    /// A new thread sharing the root's CapSpace and address space, runnable.
+    /// The slot of a fair scheduling context of the default weight on
+    /// processor `cpu`: the root's own on processor 0, else one the root
+    /// makes on first use (it holds every processor's time).
+    pub fn time_on(&self, cpu: u64) -> u64 {
+        use silica_abi::root::{SLOT_CONTEXT, SLOT_SCHED};
+        if cpu == 0 {
+            return SLOT_CONTEXT;
+        }
+        let slot = 1900 + cpu;
+        if self.cap(slot).is_none() {
+            let (ut, _) = self.big_untyped();
+            self.retype(ut, ObjectType::SchedContext, 0, slot, 1);
+            self.ok(Syscall::SchedConfigure, [slot, silica_abi::SCHED_FAIR, silica_abi::SCHED_DEFAULT_WEIGHT, 0, cpu, SLOT_SCHED]);
+        }
+        slot
+    }
+
+    /// Take the thread in `slot` to processor `cpu`: bind it to time
+    /// there (`Machine::time_on`), which is the only way a thread moves.
+    pub fn move_to(&self, slot: u64, cpu: u64) {
+        let time = self.time_on(cpu);
+        self.ok(Syscall::ThreadControl, [slot, 2, time, 0, 0, 0]);
+    }
+
+    /// A new thread sharing the root's CapSpace, address space and
+    /// scheduling context (so on processor 0), runnable.
     /// Uses slots `slot` (thread) and returns the thread object.
     pub fn spawn(&self, ut: u64, slot: u64) -> Paddr {
         self.retype(ut, ObjectType::Thread, 0, slot, 1);
         self.ok(Syscall::ThreadConfigure, [slot, silica_abi::root::SLOT_CAPSPACE, SLOT_ASPACE, 0, 0, 0]);
+        self.ok(Syscall::ThreadControl, [slot, 2, silica_abi::root::SLOT_CONTEXT, 0, 0, 0]);
         self.ok(Syscall::ThreadStart, [slot, 0x40_0000, 0, 0, 1, 0]);
         self.cap(slot).unwrap().obj
     }

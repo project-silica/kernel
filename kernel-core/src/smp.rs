@@ -194,14 +194,12 @@ pub struct Cpu {
     /// is forgotten (`forget_root`): the next switch, whatever it loads,
     /// still leaves the isolated space's predictions behind.
     pub(crate) isolated: Cell<u8>,
-    /// The fair run queue's groups with threads waiting, a tree in order
-    /// of the group's virtual runtime (`order.rs`, `sched::Group`): its
-    /// first (least-run) and last groups, and the tree.
-    pub(crate) gq_first: Cell<Paddr>,
-    pub(crate) gq_last: Cell<Paddr>,
-    pub(crate) gq_tree: crate::order::Root,
-    /// This processor's own group: its threads given no group.
-    pub(crate) unbound: crate::sched::Group,
+    /// The fair run queue: the fair contexts with threads waiting, a tree
+    /// in order of the context's virtual runtime (`order.rs`,
+    /// `sched::Share`): its first (least-run) and last, and the tree.
+    pub(crate) fq_first: Cell<Paddr>,
+    pub(crate) fq_last: Cell<Paddr>,
+    pub(crate) fq_tree: crate::order::Root,
     /// Threads with deadlines, a tree in deadline order: the soonest, the
     /// latest, and the tree.
     pub(crate) timers: Cell<Paddr>,
@@ -215,7 +213,7 @@ pub struct Cpu {
     /// Runnable threads bound to deadline contexts.
     pub(crate) dl_head: Cell<Paddr>,
     pub(crate) dl_tail: Cell<Paddr>,
-    /// The least virtual runtime among this processor's groups (only grows).
+    /// The least virtual runtime among this processor's fair contexts (only grows).
     pub(crate) min_vr: Cell<u64>,
     /// When time was last charged, and to which thread (0: none).
     pub(crate) since: Cell<u64>,
@@ -288,10 +286,9 @@ impl Cpu {
             loaded: Cell::new(0),
             loaded_root: Cell::new(0),
             isolated: Cell::new(0),
-            gq_first: Cell::new(0),
-            gq_last: Cell::new(0),
-            gq_tree: crate::order::Root::new(),
-            unbound: crate::sched::Group::new(),
+            fq_first: Cell::new(0),
+            fq_last: Cell::new(0),
+            fq_tree: crate::order::Root::new(),
             timers: Cell::new(0),
             timers_last: Cell::new(0),
             timer_tree: crate::order::Root::new(),
