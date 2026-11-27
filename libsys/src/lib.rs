@@ -522,6 +522,8 @@ pub struct SlotInfo {
     pub depth: u16,
     /// An address space isolated against speculation (`ASPACE_ISOLATED`).
     pub isolated: bool,
+    /// Capabilities derived from this one still exist (`INSPECT_DERIVED`).
+    pub derived: bool,
 }
 
 /// Whether a call is parked on `notification` (`recv_parking`), its caller
@@ -542,6 +544,7 @@ pub fn inspect_slot(space: Cap, index: u64) -> Result<Option<SlotInfo>> {
         badge: r[4],
         depth: r[5] as u16,
         isolated: r[5] & silica_abi::INSPECT_ISOLATED != 0,
+        derived: r[5] & silica_abi::INSPECT_DERIVED != 0,
     }))
 }
 
