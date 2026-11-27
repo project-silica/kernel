@@ -20,6 +20,10 @@ impl<H: Hal> Kernel<H> {
     /// Create `count` objects of type `ty` from the Untyped in slot `us`,
     /// placing their capabilities in `dst` slots `index..index + count`.
     pub(crate) fn retype(&self, us: Paddr, ty: ObjectType, bits: u64, dst: &Cap, index: u64, count: u64) -> Result<Exit, Error> {
+        // Memory about to be reused: what this entry unmapped is told to
+        // the other processors first (`shoot_later`), as it names the
+        // address space it was in.
+        self.shoot_pending();
         let uslot = self.slot(us);
         let ut = uslot.cap().ok_or(Error::BadCap)?;
         if ut.ty != ObjectType::Untyped {

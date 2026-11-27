@@ -254,6 +254,23 @@ pub struct Cpu {
     /// Touched only by this processor, also while it does not hold its own
     /// lock; after `leave` for the same reason.
     pub(crate) wait_since: Cell<u64>,
+    /// Turns this processor has spent waiting for a lock, ever (counted
+    /// only while it waits, so an entry that finds its lock free pays
+    /// nothing). A long operation holding every lock reads the others':
+    /// one that has moved since it last looked is a processor waiting for
+    /// it ([`Kernel::must_pause`]).
+    pub(crate) spins: core::sync::atomic::AtomicU64,
+    /// [`Kernel::must_pause`]'s view of the others' `spins`: the global
+    /// entry it was taken in (`globals`) and their sum then.
+    pub(crate) pause_seen: Cell<(u64, u64)>,
+    /// An address space whose mappings this global entry removed: the
+    /// other processors are told once, when it lets go of every lock
+    /// ([`Kernel::go_local`]), not once a mapping (0: none).
+    pub(crate) shoot: Cell<Paddr>,
+    /// A capability to an address space went in this global entry: every
+    /// other processor looks again at what it should have loaded, told
+    /// once when the entry lets go of every lock.
+    pub(crate) reload: Cell<bool>,
 }
 
 const _: () = assert!(core::mem::size_of::<Cpu>() == 512);
@@ -308,6 +325,10 @@ impl Cpu {
             global_from: Cell::new(0),
             leave: crate::lock::Leave::new(),
             wait_since: Cell::new(0),
+            spins: core::sync::atomic::AtomicU64::new(0),
+            pause_seen: Cell::new((0, 0)),
+            shoot: Cell::new(0),
+            reload: Cell::new(false),
         }
     }
 
@@ -334,6 +355,14 @@ impl<H: Hal> Kernel<H> {
         let me = self.hal.cpu_state(&self.cpus);
         debug_assert!(core::ptr::eq(me, self.cpus.get(self.hal.cpu())));
         me
+    }
+
+    /// Processor `cpu`'s count of turns spent waiting for a lock: what a
+    /// long operation holding every lock looks at to know that another
+    /// processor waits for it (`Kernel::must_pause`). For tests, whose
+    /// processors do not run at once and so count for one that waits.
+    pub fn lock_wait_turns(&self, cpu: usize) -> &core::sync::atomic::AtomicU64 {
+        &self.cpus.get(cpu).spins
     }
 
     /// Processor `i`'s state, for an architecture to record beside the
@@ -419,6 +448,8 @@ impl<H: Hal> Kernel<H> {
     #[inline(always)]
     fn lock_wait_turn(&self, me: &Cpu, l: &Lock, began: bool) {
         self.answer_leave(me);
+        // Only this processor writes it: no locked instruction.
+        me.spins.store(me.spins.load(core::sync::atomic::Ordering::Relaxed).wrapping_add(1), core::sync::atomic::Ordering::Relaxed);
         let now = self.hal.now();
         if began {
             me.wait_since.set(now);
@@ -470,6 +501,30 @@ impl<H: Hal> Kernel<H> {
         self.me().lock.unlock();
     }
 
+    /// Whether a long operation holding every lock (emptying, revoking,
+    /// unmapping) should stop here and be made again: an interrupt is
+    /// pending on this processor, or another processor has been waiting for
+    /// a lock since this entry last looked (its `spins` moved). Before, only
+    /// the interrupt was asked, and a processor that had none (one with no
+    /// timer armed: nothing else interrupts it) held every lock until the
+    /// whole operation was done, for as long as the memory a program had
+    /// paid for let it make that (the 2026-11-27 audit: H4, N1). Asked every
+    /// so many steps; the first time in a global entry it only takes note.
+    pub(crate) fn must_pause(&self) -> bool {
+        if self.hal.irq_pending() {
+            return true;
+        }
+        if self.ncpu() == 1 || !self.global.get() {
+            return false;
+        }
+        let me = self.me();
+        let sum = self.others().fold(0u64, |s, (_, c)| s.wrapping_add(c.spins.load(core::sync::atomic::Ordering::Relaxed)));
+        let (entry, seen) = me.pause_seen.get();
+        let now = self.globals.get();
+        me.pause_seen.set((now, sum));
+        entry == now && seen != sum
+    }
+
     /// From holding this processor's lock to holding every processor's.
     /// Other global operations may run in between: the caller re-examines
     /// everything it looked at before.
@@ -509,7 +564,48 @@ impl<H: Hal> Kernel<H> {
     #[cold]
     #[inline(never)]
     fn throttle(&self, me: &Cpu, sc: &crate::sched::SchedCtx, t: Paddr) -> bool {
-        let now = self.hal.now();
+        self.throttle_as(me, sc, t, true)
+    }
+
+    /// [`Kernel::throttled`] for a fault that is to take every lock (its
+    /// fault endpoint another processor's): a thread whose context has
+    /// used its share waits for it and then faults again where it was, as
+    /// a system call is made again. Faults cost a program nothing to make,
+    /// and each took every lock unthrottled (the 2026-11-27 audit: M10).
+    pub(crate) fn throttled_fault(&self, me: &Cpu, t: Paddr) -> bool {
+        let sc = self.sched(self.thread(t).sc.get());
+        if sc.global_budget.get() > 0 {
+            me.global_from.set(self.hal.now());
+            return false;
+        }
+        self.throttle_as(me, sc, t, false)
+    }
+
+    /// For the timeouts of thread `t`, waiting in a queue another
+    /// processor owns, which are delivered holding every lock (`expire`):
+    /// when its context has used its share of that time, how long until it
+    /// is back (the timeout is delivered then); else `None`, the entry
+    /// about to take every lock timed from `now`, to be charged to it
+    /// ([`Kernel::spent_global`]). Each such timeout took every lock
+    /// unthrottled, as many as a program cared to arrange (the 2026-11-27
+    /// audit: M10).
+    pub(crate) fn share_back_in(&self, me: &Cpu, t: Paddr, now: u64) -> Option<u64> {
+        let s = self.thread(t).sc.get();
+        if s == 0 {
+            return None;
+        }
+        let sc = self.sched(s);
+        if sc.global_budget.get() > 0 {
+            me.global_from.set(now);
+            return None;
+        }
+        self.global_share(me, sc, now)
+    }
+
+    /// The share of time holding every lock left to context `sc`, brought
+    /// up to `now`: `None` when some is left (the global entry about to
+    /// begin is timed from `now`), else how long until it is back.
+    fn global_share(&self, me: &Cpu, sc: &crate::sched::SchedCtx, now: u64) -> Option<u64> {
         let n = self.ncpu() as u128;
         // A context never charged starts with the burst; configuring it
         // again does not refill it.
@@ -523,12 +619,22 @@ impl<H: Hal> Kernel<H> {
         sc.global_budget.set(budget);
         if budget > 0 {
             me.global_from.set(now);
-            return false;
+            return None;
         }
-        // Until the share is back: then the call is made again.
-        let wait = ((-budget) as u128 * 1000 * n / GLOBAL_SHARE as u128) as u64 + 1;
-        let r = &self.thread(t).regs;
-        r[H::IP].set(r[H::IP].get().wrapping_sub(H::SYSCALL_LEN));
+        Some(((-budget) as u128 * 1000 * n / GLOBAL_SHARE as u128) as u64 + 1)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn throttle_as(&self, me: &Cpu, sc: &crate::sched::SchedCtx, t: Paddr, syscall: bool) -> bool {
+        let now = self.hal.now();
+        let Some(wait) = self.global_share(me, sc, now) else { return false };
+        // Until the share is back: then the call is made again (a fault
+        // needs nothing: the thread faults again where it was).
+        if syscall {
+            let r = &self.thread(t).regs;
+            r[H::IP].set(r[H::IP].get().wrapping_sub(H::SYSCALL_LEN));
+        }
         self.block(t, crate::thread::THROTTLED, 0, now.saturating_add(wait));
         true
     }
@@ -602,6 +708,9 @@ impl<H: Hal> Kernel<H> {
 
     /// Back to holding only this processor's lock.
     pub(crate) fn go_local(&self) {
+        // What this entry unmapped, told to the others before they can
+        // run on it again.
+        self.shoot_pending();
         let cpu = self.hal.cpu();
         self.global.set(false);
         crate::lock::go_local(cpu, self.cpus.iter(self.ncpu()).map(|c| &c.lock));

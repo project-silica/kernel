@@ -17,7 +17,7 @@ fn root_task_starts_with_documented_layout() {
     assert_eq!(i.magic, ROOT_MAGIC);
     assert_eq!(i.capspace_slots, 4096);
     assert_eq!(&i.cmdline[..i.cmdline_len as usize], b"test=host");
-    assert_eq!(m.start_args[1..5], BOOT_SECRET.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>()[..]);
+    assert_eq!(m.start_args[1..5], kernel_core::ident::root_secret(&BOOT_SECRET)[..]);
     assert_eq!(m.cap(SLOT_THREAD).unwrap().ty, T::Thread);
     assert_eq!(m.cap(SLOT_THREAD).unwrap().obj, m.root);
     assert_eq!(m.cap(SLOT_CAPSPACE).unwrap().ty, T::CapSpace);
@@ -1292,19 +1292,24 @@ fn an_interrupt_line_follows_the_thread_waiting_on_it() {
 #[test]
 fn inspect_shows_slots_and_threads_without_changing_them() {
     let (m, t) = pair();
+    // The object is shown by an identity: the same through either
+    // capability, and not its physical address (`ident.rs`).
+    m.ok(S::Inspect, [SLOT_CAPSPACE, FREE, 0, 0, 0, 0]);
+    let id = m.arg(m.root, 3);
     m.ok(S::Inspect, [SLOT_CAPSPACE, FREE + 1, 0, 0, 0, 0]);
     let ep = m.cap(FREE).unwrap();
     assert_eq!(
         [m.arg(m.root, 0), m.arg(m.root, 1), m.arg(m.root, 3), m.arg(m.root, 4), m.arg(m.root, 5)],
-        [T::Endpoint as u64, 15, ep.obj, 77, 2]
+        [T::Endpoint as u64, 15, id, 77, 2]
     );
+    assert_ne!(id, ep.obj, "Inspect showed the endpoint's physical address");
     m.ok(S::Inspect, [SLOT_CAPSPACE, FREE + 30, 0, 0, 0, 0]);
     assert_eq!(m.arg(m.root, 0), 0, "an empty slot");
     assert_eq!(m.err(S::Inspect, [SLOT_CAPSPACE, 5000, 0, 0, 0, 0]), Error::BadCap);
     assert_eq!(m.err(S::Inspect, [FREE, 0, 0, 0, 0, 0]), Error::WrongType);
     assert!(m.sys_as(t, S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
     m.ok(S::Inspect, [FREE + 2, 0, 0, 0, 0, 0]);
-    assert_eq!([m.arg(m.root, 0), m.arg(m.root, 1), m.arg(m.root, 4)], [silica_abi::THREAD_RECEIVING, 0, ep.obj]);
+    assert_eq!([m.arg(m.root, 0), m.arg(m.root, 1), m.arg(m.root, 4)], [silica_abi::THREAD_RECEIVING, 0, id], "it waits on that identity");
 }
 
 #[test]

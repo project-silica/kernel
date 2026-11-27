@@ -284,9 +284,15 @@ impl<H: Hal> Kernel<H> {
         r[H::IP].set(elf.entry);
         r[H::SP].set(STACK_VADDR + (1 << STACK_BITS));
         r[H::ARG[0]].set(INFO_VADDR);
-        // The boot secret, in registers only (`silica_abi::root::secret`).
-        for (i, w) in spec.entropy.as_chunks::<8>().0.iter().enumerate() {
-            r[H::ARG[1 + i]].set(u64::from_le_bytes(*w));
+        // The identities Inspect shows are keyed from it (`ident.rs`).
+        let key = crate::ident::key_from(&spec.entropy);
+        self.ident_key[0].set(key[0]);
+        self.ident_key[1].set(key[1]);
+        // The boot secret, in registers only (`silica_abi::root::secret`):
+        // derived from the boot's entropy under a label of its own, so the
+        // identities' key above is not to be worked out from it.
+        for (i, w) in crate::ident::root_secret(&spec.entropy).into_iter().enumerate() {
+            r[H::ARG[1 + i]].set(w);
         }
         r[H::FLAGS].set(H::FLAGS_INIT);
         // The first time there is: one fair share of this processor, which

@@ -153,7 +153,10 @@ pub enum Syscall {
     /// right: `NoRights` without it), changing nothing.
     /// `a0` a CapSpace and `a1` a slot index: what that slot holds. Returns
     /// `a0` object type (0: empty), `a1` rights, `a2` size in bits, `a3` the
-    /// object's identity (equal for capabilities to one object), `a4` badge,
+    /// object's identity (equal for capabilities to one object, different
+    /// for different objects, and nothing of where the object is in memory:
+    /// a keyed permutation made at boot; a hardware capability's range
+    /// start for a hardware capability), `a4` badge,
     /// `a5` depth in the derivation tree (bits 0..16) and, from bit 16, whether an
     /// address space is isolated against speculation (`INSPECT_ISOLATED`) and
     /// whether capabilities derived from this one still exist

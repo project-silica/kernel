@@ -106,6 +106,15 @@ pub struct Thread {
     /// (`Syscall::Console`), written out whole with the last piece.
     pub(crate) line: [Cell<u64>; LINE_WORDS],
     pub(crate) line_len: Cell<u64>,
+    /// The ticket of its Unmap of a range that stopped part way, kept in
+    /// that address space (`vm::Sweep`; 0: none). A thread made anew, or
+    /// started on a new program (`ThreadStart`), has none, so it never
+    /// goes on with another's.
+    pub(crate) sweep_ticket: Cell<u64>,
+    /// The slot (plus one) its `CapDelete` emptied while what that left to
+    /// empty was not done: the call, made again for that, does not look
+    /// at the slot again (where something else may be by then). 0: none.
+    pub(crate) deleted: Cell<u64>,
 }
 impl KObj for Thread {}
 
@@ -546,6 +555,9 @@ impl<H: Hal> Kernel<H> {
     fn expire(&self, now: u64) {
         let me = self.me();
         let mut global = false;
+        // The thread this entry took every lock for, whose share was asked
+        // before it did (the wait for the locks is its to pay for).
+        let mut entered_for = 0;
         loop {
             let t = me.timers.get();
             if t == 0 || self.thread(t).deadline.get() > now {
@@ -563,9 +575,30 @@ impl<H: Hal> Kernel<H> {
                 REPLY => true,
                 _ => false,
             };
-            if !global && self.ncpu() > 1 && elsewhere {
-                self.go_global();
-                global = true;
+            if self.ncpu() > 1 && elsewhere {
+                // Taking every lock for it is its context's to pay for, as
+                // a system call that does is, each one's for itself: one
+                // that has used its share has its timeout delivered when
+                // the share is back (before, only the first of an entry was
+                // asked and paid for every other: the review of
+                // audit-kernel-stalls).
+                if t != entered_for
+                    && let Some(wait) = self.share_back_in(me, t, now)
+                {
+                    self.timer_remove(t);
+                    self.timer_insert(t, now.saturating_add(wait));
+                    continue;
+                }
+                if !global {
+                    self.go_global();
+                    global = true;
+                    entered_for = t;
+                    continue;
+                }
+                entered_for = 0;
+                self.cancel(t, false);
+                self.wake(t, Err(Error::Timeout));
+                self.spent_global(me, t);
                 continue;
             }
             if th.state.get() == THROTTLED {

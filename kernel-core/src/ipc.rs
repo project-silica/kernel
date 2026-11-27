@@ -650,6 +650,21 @@ impl<H: Hal> Kernel<H> {
         let th = self.thread(t);
         let global = self.ncpu() > 1 && !th.fault_ep.cap().is_some_and(|c| self.queue_is_local(self.held(), t, &c));
         if global {
+            // Paid for as a system call that takes every lock is: a context
+            // that has used its share waits, then faults again. Only a
+            // fault the thread makes again where it was, a page fault or
+            // an instruction refused, can wait so; any other (a breakpoint,
+            // a trap after the instruction, a machine check consumed, a
+            // contained SError) would be lost, so it is sent and charged
+            // after (the review of audit-kernel-stalls). Each blocks its
+            // thread until it is answered.
+            if matches!(kind, Fault::Page | Fault::Instruction) {
+                if self.throttled_fault(me, t) {
+                    return;
+                }
+            } else {
+                me.global_from.set(self.hal.now());
+            }
             self.go_global();
             if me.cur.get() != t || th.state.get() != crate::thread::RUNNABLE {
                 me.dirty.set(true);
@@ -668,6 +683,7 @@ impl<H: Hal> Kernel<H> {
             _ => self.fault_unheard(t, kind, addr, code),
         }
         if global {
+            self.spent_global(me, t);
             self.go_local();
         }
     }

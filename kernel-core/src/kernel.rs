@@ -37,6 +37,11 @@ pub struct Kernel<H: Hal> {
     /// Held, with the holder's own processor lock, while mapping.
     pub(crate) structure: crate::lock::Lock,
     pub(crate) globals: Cell<u64>,
+    /// The key of the identities `Inspect` shows (`ident.rs`), set at boot.
+    pub(crate) ident_key: [Cell<u64>; 2],
+    /// The last ticket given to an Unmap of a range that stopped part way
+    /// (`vm::Sweep`): every one different, so none is taken for another.
+    pub(crate) sweep_tickets: Cell<u64>,
     /// Objects waiting to be emptied (only used holding every lock).
     pub(crate) reap: Cell<u64>,
     /// The CapSpace being emptied, part done (0: none; `cap::drain_reap`).
@@ -68,6 +73,8 @@ impl<H: Hal> Kernel<H> {
             global: Cell::new(false),
             structure: crate::lock::Lock::new(),
             globals: Cell::new(0),
+            ident_key: [Cell::new(0), Cell::new(0)],
+            sweep_tickets: Cell::new(0),
             reap: Cell::new(0),
             reaping: Cell::new(0),
             irqs: [const { (Cell::new(0), Cell::new(0)) }; silica_abi::IRQ_LINES as usize],
@@ -605,13 +612,25 @@ impl<H: Hal> Kernel<H> {
             }
             Syscall::CapDelete => {
                 let s = self.cslot(t, a[0])?;
+                // Made again only to finish emptying what it destroyed
+                // (done by now: dispatch finishes the emptying first): the
+                // slot it emptied may hold something else by now, which is
+                // not this call's to delete (the review of
+                // audit-kernel-stalls).
+                if self.thread(t).deleted.replace(0) == s + 1 {
+                    return Ok(Exit::Done);
+                }
                 if !self.revoke(s) {
                     return Ok(Exit::Preempted);
                 }
                 self.delete(s);
                 // Made again until what it destroyed is emptied: the
                 // deleter pays for it, not the next caller.
-                Ok(if self.reap_pending() { Exit::Preempted } else { Exit::Done })
+                if self.reap_pending() {
+                    self.thread(t).deleted.set(s + 1);
+                    return Ok(Exit::Preempted);
+                }
+                Ok(Exit::Done)
             }
             Syscall::CapRevoke => {
                 let s = self.cslot(t, a[0])?;
@@ -637,7 +656,8 @@ impl<H: Hal> Kernel<H> {
                             return Err(Error::NoRights);
                         }
                         let end = a[1].checked_add(a[2]).ok_or(Error::BadArg)?;
-                        let n = self.unmap_range(cap.obj, a[1], end);
+                        // Made again where it stopped (`unmap_range`).
+                        let Some(n) = self.unmap_range(t, cap.obj, a[1], end) else { return Ok(Exit::Preempted) };
                         self.thread(t).regs[H::ARG[0]].set(n);
                     }
                     _ => return Err(Error::WrongType),
@@ -709,6 +729,9 @@ impl<H: Hal> Kernel<H> {
                 }
                 self.cancel(th.obj, false);
                 self.fresh_extended_state(th.obj);
+                // A new program: no Unmap of the last one is gone on with.
+                self.thread(th.obj).sweep_ticket.set(0);
+                self.thread(th.obj).deleted.set(0);
                 let r = &self.thread(th.obj).regs;
                 for c in r.iter() {
                     c.set(0);
@@ -906,7 +929,8 @@ impl<H: Hal> Kernel<H> {
                 let r = &self.thread(t).regs;
                 let thread = |obj: Paddr| {
                     let th = self.thread(obj);
-                    [th.state.get(), th.cpu.get(), th.regs[H::IP].get(), th.regs[H::SP].get(), th.blocked_on.get(), 0]
+                    // What it waits on, by identity (`ident.rs`).
+                    [th.state.get(), th.cpu.get(), th.regs[H::IP].get(), th.regs[H::SP].get(), self.identity(th.blocked_on.get()), 0]
                 };
                 let isolated = |c: &crate::cap::Cap| {
                     let yes = c.ty == ObjectType::AddressSpace && c.flags & crate::cap::FLAG_ISOLATED != 0;
@@ -930,7 +954,10 @@ impl<H: Hal> Kernel<H> {
                                 v.cap.ty as u64,
                                 v.cap.rights.0 as u64,
                                 v.cap.bits as u64,
-                                v.cap.obj,
+                                // An identity, not the physical address
+                                // (`ident.rs`); a hardware capability's
+                                // range is its holder's to know.
+                                if v.cap.ty == ObjectType::Hw { v.cap.obj } else { self.identity(v.cap.obj) },
                                 v.cap.badge,
                                 v.depth as u64 | isolated(&v.cap) | derived(s),
                             ],

@@ -22,7 +22,7 @@ use silica_abi::{Error, ObjectType, Rights, SLOT_BITS};
 
 /// Slots a CapSpace being emptied gives up between looks for a pending
 /// interrupt (`drain_reap`).
-const REAP_STEP: u64 = 256;
+pub(crate) const REAP_STEP: u64 = 256;
 
 /// Capability flag: device memory, mapped with device attributes
 /// (uncached; on Arm also no unaligned access). Always also [`FLAG_KEPT`].
@@ -216,14 +216,11 @@ impl<H: Hal> Kernel<H> {
         }
         if cap.ty == ObjectType::AddressSpace && cap.flags & FLAG_IO == 0 {
             // It may be a running thread's own, on any processor: each
-            // looks again at what it should have loaded.
+            // looks again at what it should have loaded, told once when
+            // this entry lets go of every lock (`shoot_pending`), not once
+            // a capability (deleting many kicked every processor as often).
             self.me().dirty.set(true);
-            if self.ncpu() > 1 {
-                for (i, cpu) in self.others() {
-                    cpu.dirty.set(true);
-                    self.hal.kick(i, true);
-                }
-            }
+            self.me().reload.set(true);
         }
         let last = !self.same_obj(slot.prev.get(), &cap) && !self.same_obj(slot.next.get(), &cap);
         let (p, n) = (slot.prev.get(), slot.next.get());
@@ -333,6 +330,7 @@ impl<H: Hal> Kernel<H> {
     /// free: every system call that could reuse memory takes every lock and
     /// finishes this first ([`Kernel::reap_pending`]).
     pub(crate) fn drain_reap(&self) -> bool {
+        let mut steps = 0u64;
         loop {
             let e = self.reaping.get();
             if e != 0 {
@@ -342,9 +340,15 @@ impl<H: Hal> Kernel<H> {
                 let n = 1u64 << s0.badge.get();
                 let mut i = s0.aux.get().max(1);
                 while i < n {
-                    self.delete_shallow(e + (i << SLOT_BITS));
+                    // A slot's capability and everything derived from it,
+                    // a step a capability: where it stops, the slot's
+                    // children that are left are where it goes on.
+                    if !self.delete_counted(e + (i << SLOT_BITS), &mut steps) {
+                        s0.aux.set(i);
+                        return false;
+                    }
                     i += 1;
-                    if i.is_multiple_of(REAP_STEP) && i < n && self.hal.irq_pending() {
+                    if steps.is_multiple_of(REAP_STEP) && i < n && self.must_pause() {
                         s0.aux.set(i);
                         return false;
                     }
@@ -356,6 +360,16 @@ impl<H: Hal> Kernel<H> {
             let e = self.reap.get();
             if e == 0 {
                 return true;
+            }
+            if e & 3 == 2 {
+                // A destroyed address space's frames (`finalise_aspace`):
+                // it stays first on the list until they are all let go of.
+                let a = e & !3;
+                if !self.forget_maps(a, &mut steps) {
+                    return false;
+                }
+                self.reap.set(self.aspace(a).reap_next.get());
+                continue;
             }
             if e & 1 == 1 {
                 let t = e & !1;
@@ -388,6 +402,27 @@ impl<H: Hal> Kernel<H> {
         self.delete_shallow(s);
     }
 
+    /// Delete the capability in `s` and everything derived from it, a
+    /// capability at a time, counting each in `steps`: every [`REAP_STEP`]
+    /// of them it asks whether to stop ([`Kernel::must_pause`]), and returns
+    /// `false` with what is left of the subtree still in place, to go on
+    /// from there. A capability may have as many descendants as there is
+    /// memory for slots (64 bytes each): one slot's, emptied in one go
+    /// holding every lock, was a stall of the whole machine as long as a
+    /// program cared to make it (the 2026-11-27 audit: N1).
+    fn delete_counted(&self, s: Paddr, steps: &mut u64) -> bool {
+        while self.has_children(s) {
+            self.clear_slot(self.slot(s).next.get());
+            *steps += 1;
+            if steps.is_multiple_of(REAP_STEP) && self.must_pause() {
+                return false;
+            }
+        }
+        self.clear_slot(s);
+        *steps += 1;
+        true
+    }
+
     /// Delete the capability in `s` and everything derived from it.
     fn delete_shallow(&self, s: Paddr) {
         while self.has_children(s) {
@@ -407,9 +442,17 @@ impl<H: Hal> Kernel<H> {
     /// Delete every capability derived from the one in `s`. Returns `false`
     /// when an interrupt is pending and work remains; the caller restarts.
     pub(crate) fn revoke(&self, s: Paddr) -> bool {
+        let mut steps = 0u64;
         while self.has_children(s) {
             self.clear_slot(self.slot(s).next.get());
-            if !self.drain_reap() || (self.hal.irq_pending() && self.has_children(s)) {
+            steps += 1;
+            // Every REAP_STEP capabilities, whether to stop for an
+            // interrupt or a processor waiting for a lock (`must_pause`):
+            // the interrupt alone left a processor with none pending
+            // revoking for as long as the subtree lasted.
+            if !self.drain_reap()
+                || (self.has_children(s) && (self.hal.irq_pending() || (steps.is_multiple_of(REAP_STEP) && self.must_pause())))
+            {
                 return false;
             }
         }
@@ -448,6 +491,12 @@ impl<H: Hal> Kernel<H> {
             self.slot(mp).mnext.set(dst);
         }
         if s.cap().is_some_and(|c| c.ty == ObjectType::Frame) && s.badge.get() & MAPPED != 0 {
+            // An unmap of a range that stopped at this mapping goes on
+            // from it in its new slot (`unmap_range`).
+            let h = self.aspace(s.aux.get());
+            if h.nsweeps.get() != 0 {
+                self.sweeps_moved(h, src, dst);
+            }
             if mp != 0 {
                 self.slot(mp).mnext.set(dst);
             } else {

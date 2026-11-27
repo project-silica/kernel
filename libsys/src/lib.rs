@@ -514,7 +514,8 @@ pub struct SlotInfo {
     pub rights: Rights,
     /// The object's size in bits (for a CapSpace, its slots).
     pub bits: u8,
-    /// Equal for all capabilities to one object, and to nothing else.
+    /// Equal for all capabilities to one object, and to nothing else; not
+    /// where the object is (for a hardware capability, its range's start).
     pub object: u64,
     /// The badge (endpoints and notifications).
     pub badge: u64,

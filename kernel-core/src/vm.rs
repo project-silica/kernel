@@ -11,7 +11,7 @@
 //! at. Its first table page is put under the root's entry 0 when it is
 //! made, so an IOMMU that walks one level less can be pointed at it.
 
-use crate::cap::{FLAG_DEVICE, MAPPED};
+use crate::cap::{FLAG_DEVICE, MAPPED, REAP_STEP};
 use crate::hal::Hal;
 use crate::kernel::Kernel;
 use crate::mem::{KObj, Paddr};
@@ -40,8 +40,40 @@ pub struct AsHeader {
     /// by whoever attached a device (`DeviceAttach`).
     pub(crate) faults: Cell<u64>,
     pub(crate) fault_note: crate::cap::Slot,
+    /// Not 0: its last capability is gone, and its frames' slots are let
+    /// go of a part at a time from the reap list (`drain_reap`), linked
+    /// through `reap_next`, while nothing can reuse its memory
+    /// ([`Kernel::reap_pending`]). A frame mapped in it is free to map
+    /// again meanwhile (`map_locked` lets go of it there).
+    pub(crate) dead: Cell<u64>,
+    pub(crate) reap_next: Cell<Paddr>,
+    /// The unmaps of a range that stopped part way (`unmap_range`), one a
+    /// thread, and how many are in use.
+    pub(crate) sweeps: [Sweep; SWEEPS],
+    pub(crate) nsweeps: Cell<u64>,
 }
 impl KObj for AsHeader {}
+
+/// Unmaps of a range stopped part way kept at once in one address space:
+/// a seventeenth, made beside sixteen others stopped in the same space,
+/// takes the oldest one's place (that call starts over), so only so many
+/// holders of the space's write right at once can hold one another back.
+pub(crate) const SWEEPS: usize = 16;
+
+/// An unmap of a range that stopped part way (`unmap_range`): the ticket
+/// of the thread making it (`Thread::sweep_ticket`; 0: unused), its range,
+/// the mapping it goes on from (0: none left) and how many it unmapped.
+/// Nobody else's unmapping or moving a frame loses it: an unmap of the
+/// mapping it goes on from moves it to the next one (`unmap_slot`), and a
+/// move of that frame's capability takes it along (`move_slot`).
+#[repr(C)]
+pub(crate) struct Sweep {
+    pub(crate) ticket: Cell<u64>,
+    pub(crate) start: Cell<u64>,
+    pub(crate) end: Cell<u64>,
+    pub(crate) at: Cell<Paddr>,
+    pub(crate) n: Cell<u64>,
+}
 // The page's upper half is the architecture's (processors' identifiers, the
 // IOMMU's domain).
 const _: () = assert!(core::mem::size_of::<AsHeader>() <= 2048);
@@ -172,6 +204,14 @@ impl<H: Hal> Kernel<H> {
         let shared = self.ncpu() > 1 && !self.global.get();
         if shared {
             self.structure.lock();
+        } else {
+            // In a global entry that removed mappings (`shoot_later`), the
+            // others are told before a table page or a frame given back
+            // can be used again: one of them may still cache a table at
+            // the level it was, and walk it as whatever it becomes (the
+            // review of audit-kernel-stalls). (A local entry has nothing
+            // to tell: it is told when every lock goes.)
+            self.shoot_pending();
         }
         let r = self.map_locked::<IO>(a, fs, vaddr, rights);
         if shared {
@@ -185,7 +225,15 @@ impl<H: Hal> Kernel<H> {
         let slot = self.slot(fs);
         let cap = slot.cap().ok_or(Error::BadCap)?;
         if slot.badge.get() & MAPPED != 0 {
-            return Err(Error::Mapped);
+            // Still listed in an address space that is gone, whose frames
+            // are let go of a part at a time (`finalise_aspace`): it is
+            // not mapped anywhere, and is taken off that list here. (The
+            // list is changed only holding this lock or every lock.)
+            let was = self.aspace(slot.aux.get());
+            if was.dead.get() == 0 {
+                return Err(Error::Mapped);
+            }
+            self.forget_mapping(was, fs);
         }
         if !cap.rights.has(rights) || !rights.has(Rights::READ) || rights.has(Rights(Rights::WRITE.0 | Rights::EXEC.0)) {
             // W^X: no mapping is both writable and executable.
@@ -247,6 +295,11 @@ impl<H: Hal> Kernel<H> {
         }
         let (a, vaddr) = (slot.aux.get(), slot.badge.get() & !(PAGE - 1));
         let h = self.aspace(a);
+        // An unmap of a range that stopped here goes on from the next
+        // mapping (`unmap_range`): this one is going.
+        if h.nsweeps.get() != 0 {
+            self.sweeps_moved(h, fs, slot.mnext.get());
+        }
         let io = h.io.get() != 0;
         let (level, step) = self.leaf(cap.bits, io);
         let size = 1u64 << cap.bits;
@@ -284,7 +337,7 @@ impl<H: Hal> Kernel<H> {
             }
         } else {
             self.hal.tlb_flush(a + PAGE, vaddr, size);
-            self.shoot_down(a + PAGE);
+            self.shoot_later(a + PAGE);
         }
         let (p, n) = (slot.mprev.get(), slot.mnext.get());
         if p != 0 {
@@ -336,8 +389,40 @@ impl<H: Hal> Kernel<H> {
     /// Remove every mapping of address space `a` that overlaps `start` to
     /// `end`, each whole, whoever holds its frame; returns how many. One
     /// pass over the space's mapped frames.
-    pub(crate) fn unmap_range(&self, a: Paddr, start: u64, end: u64) -> u64 {
-        let (mut s, mut n) = (self.aspace(a).maps.get(), 0);
+    ///
+    /// For thread `t`, holding every lock: a space may have as many
+    /// mappings as there is memory for frames, so every [`REAP_STEP`]
+    /// mappings looked at it asks whether to stop ([`Kernel::must_pause`])
+    /// and returns `None`, to be made again (one pass over every mapping
+    /// held the machine as long as the space lasted: the 2026-11-27 audit,
+    /// H4). Where it was and how many it unmapped are kept in the space
+    /// under the thread's ticket ([`Sweep`]), and the call made again by
+    /// that thread for that range goes on from there with its count. Each
+    /// thread's is its own: another holder's unmap, or a frame's holder
+    /// unmapping or moving it, does not lose it (the review of
+    /// audit-kernel-stalls: a single kept place, taken by whoever called
+    /// last, had two holders start each other over for ever). A mapping
+    /// made meanwhile ahead of where it is may be left: it came after the
+    /// call.
+    pub(crate) fn unmap_range(&self, t: Paddr, a: Paddr, start: u64, end: u64) -> Option<u64> {
+        let h = self.aspace(a);
+        let th = self.thread(t);
+        let ticket = th.sweep_ticket.replace(0);
+        let mut from = None;
+        if ticket != 0 && h.nsweeps.get() != 0 {
+            for w in &h.sweeps {
+                if w.ticket.get() == ticket {
+                    if (w.start.get(), w.end.get()) == (start, end) {
+                        from = Some((w.at.get(), w.n.get()));
+                    }
+                    w.ticket.set(0);
+                    h.nsweeps.set(h.nsweeps.get() - 1);
+                    break;
+                }
+            }
+        }
+        let (mut s, mut n) = from.unwrap_or((h.maps.get(), 0));
+        let mut steps = 0u64;
         while s != 0 {
             let slot = self.slot(s);
             let next = slot.mnext.get();
@@ -348,8 +433,47 @@ impl<H: Hal> Kernel<H> {
                 n += 1;
             }
             s = next;
+            steps += 1;
+            if s != 0 && steps.is_multiple_of(REAP_STEP) && self.must_pause() {
+                self.keep_sweep(h, th, start, end, s, n);
+                return None;
+            }
         }
-        n
+        Some(n)
+    }
+
+    /// Keep where thread `th`'s unmap of `start` to `end` stopped: at the
+    /// mapping in slot `at`, `n` unmapped so far. In a free place of the
+    /// space's, else the oldest one's (that call starts over).
+    fn keep_sweep(&self, h: &AsHeader, th: &crate::thread::Thread, start: u64, end: u64, at: Paddr, n: u64) {
+        let ticket = self.sweep_tickets.get() + 1;
+        self.sweep_tickets.set(ticket);
+        let w = match h.sweeps.iter().find(|w| w.ticket.get() == 0) {
+            Some(w) => {
+                h.nsweeps.set(h.nsweeps.get() + 1);
+                w
+            }
+            None => h.sweeps.iter().min_by_key(|w| w.ticket.get()).unwrap_or(&h.sweeps[0]),
+        };
+        w.ticket.set(ticket);
+        w.start.set(start);
+        w.end.set(end);
+        w.at.set(at);
+        w.n.set(n);
+        th.sweep_ticket.set(ticket);
+    }
+
+    /// The mapping in slot `from` goes (it is unmapped: `to` is the next
+    /// one, or 0) or moves (to slot `to`): an unmap of a range that stopped
+    /// at it goes on from `to`.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn sweeps_moved(&self, h: &AsHeader, from: Paddr, to: Paddr) {
+        for w in &h.sweeps {
+            if w.ticket.get() != 0 && w.at.get() == from {
+                w.at.set(to);
+            }
+        }
     }
 
     /// A table page for address space `a`: one given back, else a new one
@@ -358,6 +482,10 @@ impl<H: Hal> Kernel<H> {
     fn take_table(&self, a: Paddr, h: &AsHeader) -> Paddr {
         let f = h.free.get();
         if f != 0 {
+            // A table page given back may still be cached by another
+            // processor at whatever level it was: it is reused only once
+            // they have been told (`map_with_lock` sees to it).
+            debug_assert!(self.me().shoot.get() != a + PAGE, "a table page is reused before the others are told it was given back");
             h.free.set(self.phys.word(f).get());
             self.phys.word(f).set(0);
             h.nfree.set(h.nfree.get() - 1);
@@ -460,18 +588,58 @@ impl<H: Hal> Kernel<H> {
         true
     }
 
+    /// Let go of the frames still mapped in the destroyed address space `a`
+    /// (`dead`), counting each in `steps`: every [`REAP_STEP`] of them it
+    /// asks whether to stop ([`Kernel::must_pause`]) and returns `false`,
+    /// the rest still listed in the space. Its tables are not touched: no
+    /// processor runs on them any more (`finalise_aspace`).
+    pub(crate) fn forget_maps(&self, a: Paddr, steps: &mut u64) -> bool {
+        let h = self.aspace(a);
+        loop {
+            let s = h.maps.get();
+            if s == 0 {
+                return true;
+            }
+            self.forget_mapping(h, s);
+            *steps += 1;
+            if steps.is_multiple_of(REAP_STEP) && h.maps.get() != 0 && self.must_pause() {
+                return false;
+            }
+        }
+    }
+
+    /// Take frame slot `s` off the list of address space `h` (destroyed) and
+    /// make it unmapped.
+    fn forget_mapping(&self, h: &AsHeader, s: Paddr) {
+        let slot = self.slot(s);
+        let (p, n) = (slot.mprev.get(), slot.mnext.get());
+        if p != 0 {
+            self.slot(p).mnext.set(n);
+        } else {
+            h.maps.set(n);
+        }
+        if n != 0 {
+            self.slot(n).mprev.set(p);
+        }
+        slot.badge.set(0);
+        slot.aux.set(0);
+        slot.mprev.set(0);
+        slot.mnext.set(0);
+    }
+
     /// The last capability to address space `a` is gone: its frames become unmapped.
+    ///
+    /// Its frames' slots, as many as there was memory for frames, are let
+    /// go of from the reap list a part at a time ([`Kernel::forget_maps`]):
+    /// in one pass here, holding every lock, they held the machine as long
+    /// as the list was (the 2026-11-27 audit, H4). Nothing reuses its
+    /// memory until they are ([`Kernel::reap_pending`]).
     pub(crate) fn finalise_aspace(&self, a: Paddr) {
         let h = self.aspace(a);
-        let mut s = h.maps.replace(0);
-        while s != 0 {
-            let slot = self.slot(s);
-            let n = slot.mnext.get();
-            slot.badge.set(0);
-            slot.aux.set(0);
-            slot.mprev.set(0);
-            slot.mnext.set(0);
-            s = n;
+        h.dead.set(1);
+        if h.maps.get() != 0 {
+            h.reap_next.set(self.reap.get());
+            self.reap.set(a | 2);
         }
         if h.io.get() != 0 {
             // Whoever was told of its devices' faults is not any more.
@@ -501,6 +669,10 @@ impl<H: Hal> Kernel<H> {
     /// its watch: into waiting for its lock), and answers there; this waits
     /// for every answer. Elsewhere the shoot-down is enough.
     fn evict(&self, root: Paddr) {
+        // This covers anything left to tell of that root (`shoot_later`).
+        if self.me().shoot.get() == root {
+            self.me().shoot.set(0);
+        }
         if !H::KERNEL_IN_ROOT || self.ncpu() == 1 {
             self.shoot_down(root);
             return;
@@ -520,6 +692,53 @@ impl<H: Hal> Kernel<H> {
             if cpu.runs_on(root) {
                 self.hal.wait_left(i, &cpu.leave);
                 cpu.forget_root();
+            }
+        }
+    }
+
+    /// A mapping of address space `root` was removed in this global entry
+    /// (every lock held): the other processors are told when the entry lets
+    /// go of the locks ([`Kernel::shoot_pending`], from `go_local`), once
+    /// for every mapping it removed in that space. Told at each mapping,
+    /// an unmap of many frames brought every processor running in the
+    /// space into the kernel, its translations dropped, once a frame, as
+    /// often as a program cared to ask (the 2026-11-27 audit: N3). Nothing
+    /// can come of the delay: the caller is still in its call, and nobody
+    /// else runs kernel code before the locks go. A second space's removal
+    /// tells the first's at once.
+    /// (With one processor nothing is told: `shoot_down` returns at once.)
+    #[inline(always)]
+    fn shoot_later(&self, root: Paddr) {
+        debug_assert!(self.global.get() || self.ncpu() == 1, "a mapping removed without every lock");
+        let was = self.me().shoot.replace(root);
+        if was != 0 && was != root {
+            self.shoot_down(was);
+        }
+    }
+
+    /// Tell the other processors of what this global entry unmapped
+    /// ([`Kernel::shoot_later`]). Called holding every lock.
+    #[inline(always)]
+    pub(crate) fn shoot_pending(&self) {
+        let me = self.me();
+        let r = me.shoot.replace(0);
+        if r != 0 {
+            self.shoot_down(r);
+        }
+        if me.reload.replace(false) {
+            self.reload_others();
+        }
+    }
+
+    /// Capabilities to address spaces went (`clear_slot`): each other
+    /// processor looks again at what it should have loaded.
+    #[cold]
+    #[inline(never)]
+    fn reload_others(&self) {
+        if self.ncpu() > 1 {
+            for (i, cpu) in self.others() {
+                cpu.dirty.set(true);
+                self.hal.kick(i, true);
             }
         }
     }

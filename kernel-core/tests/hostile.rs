@@ -378,10 +378,10 @@ fn tables_given_back(bits: u64, io: bool) {
 #[test]
 fn the_boot_secret_is_in_no_frame_the_root_task_lends() {
     let m = Machine::new(16);
-    let secret = support::BOOT_SECRET;
+    // The root task's secret, derived from the boot's entropy (`ident.rs`).
+    let words = kernel_core::ident::root_secret(&support::BOOT_SECRET);
     let info = m.mem(m.info, 4096);
-    assert!(!info.windows(8).any(|w| secret.chunks(8).any(|c| c == w)), "the RootInfo frame holds the boot secret");
-    let words: Vec<u64> = secret.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+    assert!(!info.windows(8).any(|w| words.iter().any(|s| s.to_le_bytes() == w)), "the RootInfo frame holds the boot secret");
     assert_eq!(m.start_args[1..5], words[..], "the root thread does not start with the boot secret");
 }
 
@@ -1021,4 +1021,600 @@ fn watching_many_lines_takes_no_watch_from_anyone() {
     m.ok(S::Recv, [FREE, 1, 0, 0, 0, 0]);
     m.irq(71);
     assert_eq!(m.err(S::Recv, [FREE, 1, 0, 0, 0, 0]), Error::WouldBlock);
+}
+
+/// One kernel entry of system call `n` as the root task, with processor 1
+/// waiting for a lock throughout (each look for a pending interrupt counts
+/// a turn of its wait): whether it stopped to be made again.
+fn one_entry_beside_a_waiter(m: &Machine, n: S, a: [u64; 6]) -> bool {
+    m.k.hal.contender.set(m.k.lock_wait_turns(1));
+    let r = m.k.regs(m.root);
+    r[TestHal::IP].set(0x40_0002);
+    r[TestHal::SYS].set(n as u64);
+    r[TestHal::BY_SYSCALL].set(1);
+    for (i, v) in a.iter().enumerate() {
+        r[TestHal::ARG[i]].set(*v);
+    }
+    m.k.enter();
+    m.k.syscall();
+    m.k.leave();
+    m.k.hal.contender.set(core::ptr::null());
+    r[TestHal::IP].get() == 0x40_0000
+}
+
+/// How many capabilities derive from the one in slot `s` of the root CapSpace.
+fn children(m: &Machine, s: u64) -> usize {
+    let at = m.k.slot_addr(&m.cs, s).unwrap();
+    let Some(v) = m.k.view(at) else { return 0 };
+    let (mut n, mut next) = (0, v.next);
+    while let Some(c) = (next != 0).then(|| m.k.view(next)).flatten().filter(|c| c.depth > v.depth) {
+        n += 1;
+        next = c.next;
+    }
+    n
+}
+
+/// A capability may have as many descendants as there is memory for slots
+/// (64 bytes each), and deleting it empties them holding every lock. It
+/// stopped only for an interrupt pending on its own processor, which a
+/// processor with no timer armed may never have: one `Delete` held every
+/// other processor for as long as the memory a program had paid for let it
+/// make (the 2026-11-27 audit: H4, N1). It stops for a processor waiting
+/// for a lock too, a bounded number of capabilities after it began, and
+/// is made again until it is done.
+#[test]
+fn a_delete_of_many_children_stops_for_a_processor_waiting() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.retype(ut, T::CapSpace, 14, FREE + 1, 1);
+    let many = if cfg!(miri) { 1200 } else { 10_000 };
+    for i in 1..=many {
+        m.ok(S::CapCopy, [FREE + 1, i, FREE, 15, 0, 0]);
+    }
+    assert_eq!(children(&m, FREE), many as usize);
+    assert!(one_entry_beside_a_waiter(&m, S::CapDelete, [FREE, 0, 0, 0, 0, 0]), "one entry deleted all {many} children");
+    let left = children(&m, FREE);
+    assert!(left > 0 && (many as usize - left) <= 1024, "one entry deleted {} children", many as usize - left);
+    // Made again, it finishes.
+    m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
+    assert!(m.cap(FREE).is_none() && m.cap(FREE + 1).is_some());
+    assert!(m.k.view(m.k.slot_addr(&m.cs, FREE + 1).unwrap()).is_some());
+}
+
+/// The same for a CapSpace being emptied: one of its slots may hold a
+/// capability with as many descendants, which the emptying deleted in one
+/// go whatever was pending.
+#[test]
+fn emptying_a_capspace_stops_inside_one_slot_for_a_processor_waiting() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.retype(ut, T::CapSpace, 4, FREE + 1, 1);
+    m.retype(ut, T::CapSpace, 14, FREE + 3, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2, FREE, 15, 0, 0]);
+    let many = if cfg!(miri) { 1200 } else { 10_000 };
+    for i in 1..=many {
+        m.ok(S::CapCopy, [FREE + 3, i, FREE + 2, 15, 0, 0]);
+    }
+    // The parent of them all goes into the small CapSpace, which is deleted.
+    m.ok(S::CapMove, [FREE + 1, 1, FREE + 2, 0, 0, 0]);
+    assert_eq!(children(&m, FREE), many as usize + 1);
+    assert!(one_entry_beside_a_waiter(&m, S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]), "one entry emptied the slot's {many} descendants");
+    let left = children(&m, FREE);
+    assert!(left > 0 && (many as usize + 1 - left) <= 1024, "one entry deleted {} capabilities", many as usize + 1 - left);
+    m.ok(S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]);
+    assert_eq!(children(&m, FREE), 0, "the emptying was finished");
+}
+
+/// An unmap of many frames tells each other processor once that the
+/// address space's mappings changed, not once a frame: told at each frame,
+/// every processor running in the space was brought into the kernel and
+/// dropped its translations, once a frame, as often as a program asked
+/// (the 2026-11-27 audit: N3). Here the other processor has the space not
+/// loaded, so it forgets what it cached: once.
+#[test]
+fn an_unmap_of_many_frames_tells_each_processor_once() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 16, FREE, 1);
+    let frames = 64u64;
+    for k in (0..frames).step_by(250) {
+        m.retype(ut, T::Frame, 12, FREE + 1 + k, 250.min(frames - k));
+    }
+    for i in 0..frames {
+        m.ok(S::Map, [FREE, FREE + 1 + i, 0x10_0000 + i * 0x1000, 3, 0, 0]);
+    }
+    let before = m.k.hal.forgets.get();
+    m.ok(S::Unmap, [FREE, 0x10_0000, frames * 0x1000, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), frames, "every frame was unmapped");
+    let told = m.k.hal.forgets.get() - before;
+    assert!(told <= 1, "the other processor was told {told} times for one unmap of {frames} frames");
+    // Deleting many mapped frames at once, likewise.
+    for i in 0..frames {
+        m.ok(S::Map, [FREE, FREE + 1 + i, 0x10_0000 + i * 0x1000, 3, 0, 0]);
+    }
+    let before = m.k.hal.forgets.get();
+    m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
+    let told = m.k.hal.forgets.get() - before;
+    assert!(told <= 2, "the other processor was told {told} times when the address space went");
+}
+
+/// An address space may have as many mappings as there is memory for
+/// frames, and both an unmap of a range and the space's destruction went
+/// through all of them holding every lock, whatever was waiting (the
+/// 2026-11-27 audit: H4). Beside a processor waiting for a lock, an unmap
+/// of a range stops a bounded number of mappings in and is made again from
+/// where it stopped, its count whole; if the mapping it stopped at goes
+/// meanwhile it starts over, and still unmaps exactly what is in range.
+#[test]
+fn an_unmap_of_a_large_range_stops_for_a_processor_waiting_and_goes_on() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 20, FREE, 1);
+    let frames = if cfg!(miri) { 600 } else { 2000 };
+    for k in (0..frames).step_by(250) {
+        m.retype(ut, T::Frame, 12, FREE + 1 + k, 250.min(frames - k));
+    }
+    let at = |i: u64| 0x10_0000 + i * 0x1000;
+    for i in 0..frames {
+        m.ok(S::Map, [FREE, FREE + 1 + i, at(i), 3, 0, 0]);
+    }
+    let mapped = |m: &Machine| {
+        (0..frames).filter(|&i| m.k.view(m.k.slot_addr(&m.cs, FREE + 1 + i).unwrap()).unwrap().mapped.is_some()).count() as u64
+    };
+    // Everything but the first frame is in range.
+    let range = [FREE, at(1), (frames - 1) * 0x1000, 0, 0, 0];
+    assert!(one_entry_beside_a_waiter(&m, S::Unmap, range), "one entry unmapped all of {frames} frames");
+    let left = mapped(&m);
+    assert!(left > 1 && frames - left <= 1024, "one entry unmapped {} frames", frames - left);
+    // The frame it goes on from is deleted meanwhile (its slot emptied).
+    m.k.hal.contender.set(core::ptr::null());
+    let gone = (1..frames).find(|&i| m.k.view(m.k.slot_addr(&m.cs, FREE + 1 + i).unwrap()).unwrap().mapped.is_some()).unwrap();
+    m.ok(S::CapDelete, [FREE + 1 + gone, 0, 0, 0, 0, 0]);
+    m.ok(S::Unmap, range);
+    let still: Vec<u64> = (0..frames)
+        .filter(|&i| m.cap(FREE + 1 + i).is_some() && m.k.view(m.k.slot_addr(&m.cs, FREE + 1 + i).unwrap()).unwrap().mapped.is_some())
+        .collect();
+    assert_eq!(still, [0], "exactly the frame out of range is still mapped");
+}
+
+/// The destruction of an address space with many mappings stops likewise,
+/// and its frames can be mapped elsewhere at once, before every one has
+/// been let go of.
+#[test]
+fn destroying_an_address_space_of_many_mappings_stops_for_a_processor_waiting() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 20, FREE, 1);
+    m.retype(ut, T::AddressSpace, 16, FREE + 1, 1);
+    let frames = if cfg!(miri) { 600 } else { 2000 };
+    for k in (0..frames).step_by(250) {
+        m.retype(ut, T::Frame, 12, FREE + 2 + k, 250.min(frames - k));
+    }
+    for i in 0..frames {
+        m.ok(S::Map, [FREE, FREE + 2 + i, 0x10_0000 + i * 0x1000, 3, 0, 0]);
+    }
+    let mapped = |m: &Machine| {
+        (0..frames).filter(|&i| m.k.view(m.k.slot_addr(&m.cs, FREE + 2 + i).unwrap()).unwrap().mapped.is_some()).count() as u64
+    };
+    assert!(one_entry_beside_a_waiter(&m, S::CapDelete, [FREE, 0, 0, 0, 0, 0]), "one entry let go of all {frames} mappings");
+    assert!(m.cap(FREE).is_none(), "the address space itself is gone at once");
+    let left = mapped(&m);
+    assert!(left > 0 && frames - left <= 1024, "one entry let go of {} mappings", frames - left);
+    // A frame still listed in the gone space maps elsewhere at once.
+    let last = FREE + 2 + frames - 1;
+    m.ok(S::Map, [FREE + 1, last, 0x20_0000, 3, 0, 0]);
+    let v = m.k.view(m.k.slot_addr(&m.cs, last).unwrap()).unwrap();
+    assert_eq!(v.mapped.map(|(a, _)| a), Some(m.cap(FREE + 1).unwrap().obj), "mapped in the new space");
+    // The next system call that takes every lock finishes the rest.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2050, FREE + 1, 15, 0, 0]);
+    assert_eq!(mapped(&m), 1, "only the frame mapped again is mapped");
+}
+
+/// A fault whose fault endpoint another processor owns, or nobody yet,
+/// is sent holding every lock, and faults cost a program nothing to make:
+/// unlike a system call that takes every lock, they were never paid for
+/// (the 2026-11-27 audit: M10). They are now, out of the same share of the
+/// faulting thread's context: a flood of them is held back (the thread
+/// waits, to fault again where it was), and a program beside it carries on.
+#[test]
+fn a_flood_of_faults_that_take_every_lock_is_held_back() {
+    use kernel_core::thread::THROTTLED;
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.spawn(ut, FREE + 20);
+    m.move_to(FREE + 20, 1);
+    m.settle(1);
+    m.on(0);
+    m.retype(ut, T::SchedContext, 0, FREE, 1);
+    m.ok(S::SchedConfigure, [FREE, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    // Nobody receives on the fault endpoint: it is no processor's, so each
+    // fault sent to it takes every lock.
+    m.retype(ut, T::Endpoint, 0, FREE + 1, 1);
+    let threads: Vec<_> = (0..1800u64)
+        .map(|i| {
+            let slot = FREE + 100 + i;
+            let t = m.spawn(ut, slot);
+            m.ok(S::ThreadConfigure, [slot, KEEP, KEEP, FREE + 1, KEEP, 0]);
+            m.ok(S::ThreadControl, [slot, 2, FREE, 0, 0, 0]);
+            // Suspended until its turn: the flood is the faults, not a
+            // run queue of threads to yield through.
+            m.ok(S::ThreadControl, [slot, 0, 0, 0, 0, 0]);
+            t
+        })
+        .collect();
+    // During each fault every reading of the clock is 10 us later than
+    // the last: a fault that takes every lock holds them that long at least.
+    let mut faults = 0;
+    let mut throttled = false;
+    for (i, &t) in threads.iter().enumerate() {
+        m.ok(S::ThreadControl, [FREE + 100 + i as u64, 1, 0, 0, 0, 0]);
+        m.sys_as(t, S::Yield, [0; 6]);
+        while m.k.current() != t {
+            m.sys(S::Yield, [0; 6]);
+        }
+        m.k.hal.now_step.set(10_000);
+        m.fault(Fault::Page, 0xdead_0000, 6);
+        m.k.hal.now_step.set(0);
+        faults += 1;
+        if m.k.thread_view(t).state == THROTTLED {
+            throttled = true;
+            break;
+        }
+    }
+    assert!(throttled, "{faults} faults that took every lock were never held back");
+}
+
+/// Inspect shows no physical address: what it gives as an object's
+/// identity is equal for all capabilities to one object and different for
+/// different objects, but none of the frame's, the Untyped's, the
+/// endpoint's or (as what a thread waits on) the queue's physical address,
+/// nor anything that keeps their order or distance (the 2026-11-27 audit:
+/// M13, N4: Inspect gave out physical addresses, a thread's `waits_on`
+/// among them, and with them the machine's memory layout).
+#[test]
+fn inspect_shows_identities_not_physical_addresses() {
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Frame, 12, FREE, 2);
+    m.retype(ut, T::Endpoint, 0, FREE + 2, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 3, FREE + 2, 15, 9, 0]);
+    let shown = |m: &Machine, s: u64| {
+        m.ok(S::Inspect, [SLOT_CAPSPACE, s, 0, 0, 0, 0]);
+        m.arg(m.root, 3)
+    };
+    let [f0, f1, e, e2, u] = [shown(&m, FREE), shown(&m, FREE + 1), shown(&m, FREE + 2), shown(&m, FREE + 3), shown(&m, ut)];
+    let addr = |s: u64| m.cap(s).unwrap().obj;
+    for (id, s) in [(f0, FREE), (f1, FREE + 1), (e, FREE + 2), (u, ut)] {
+        assert_ne!(id, addr(s), "Inspect showed the physical address of slot {s}'s object");
+    }
+    assert_eq!(e, e2, "two capabilities to one endpoint show one identity");
+    assert!(f0 != f1 && f0 != e && f1 != e, "different objects show different identities");
+    // Neighbouring frames 4 KiB apart are not shown 4 KiB apart.
+    assert_ne!(f1.wrapping_sub(f0), addr(FREE + 1).wrapping_sub(addr(FREE)));
+    // A thread waiting on the endpoint shows that identity.
+    let t = m.spawn(ut, FREE + 4);
+    assert!(m.sys_as(t, S::Recv, [FREE + 2, 0, 0, 0, 0, 0]).blocked);
+    m.ok(S::Inspect, [FREE + 4, 0, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 4), e, "what it waits on, by identity");
+}
+
+/// Deleting a capability to an address space made every other processor
+/// look again at what it should have loaded, through a kick it waited
+/// for, once a capability: deleting many such capabilities kicked every
+/// processor as often (the 2026-11-27 audit, beside N3). It is told once,
+/// when the entry lets go of every lock.
+#[test]
+fn deleting_many_address_space_capabilities_kicks_each_processor_once() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 16, FREE, 1);
+    m.retype(ut, T::CapSpace, 10, FREE + 1, 1);
+    for i in 1..=500 {
+        m.ok(S::CapCopy, [FREE + 1, i, FREE, 15, 0, 0]);
+    }
+    let before = m.k.hal.kicks.borrow().len();
+    m.ok(S::CapRevoke, [FREE, 0, 0, 0, 0, 0]);
+    let kicks = m.k.hal.kicks.borrow()[before..].iter().filter(|k| k.0 == 1).count();
+    assert!(kicks <= 1, "processor 1 was kicked {kicks} times for one revoke of 500 copies");
+}
+
+/// A page table given back (its last mapping gone) may still be cached by
+/// another processor, at whatever level it was, until that processor is
+/// told the space's mappings changed; the telling is put off to the end of
+/// the global entry (`shoot_later`). Reused before that, in the same
+/// entry, as a table of another level, it would give that processor a walk
+/// through whatever the new table points at: any physical memory (the
+/// review of audit-kernel-stalls). Here one global entry finishes emptying
+/// a CapSpace, unmapping a frame alone in its tables, and then answers a
+/// fault by mapping a frame where new tables are needed: the others are
+/// told before any table given back is taken again.
+#[test]
+fn a_table_given_back_is_not_reused_before_the_others_are_told() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Endpoint, 0, FREE, 1);
+    m.retype(ut, T::CapSpace, 12, FREE + 1, 1);
+    m.retype(ut, T::Frame, 12, FREE + 2, 2);
+    let asp = m.cap(SLOT_ASPACE).unwrap().obj;
+    // A frame alone in its tables, its capability late in a CapSpace whose
+    // emptying stops before it reaches it.
+    m.ok(S::Map, [SLOT_ASPACE, FREE + 2, 0x6000_0000, 3, 0, 0]);
+    m.ok(S::CapMove, [FREE + 1, 3000, FREE + 2, 0, 0, 0]);
+    // A thread of this space faults to the root task.
+    let t = m.spawn(ut, FREE + 4);
+    m.ok(S::ThreadConfigure, [FREE + 4, KEEP, KEEP, FREE, KEEP, 0]);
+    while m.k.current() != t {
+        m.sys(S::Yield, [0; 6]);
+    }
+    m.fault(Fault::Page, 0x7000_0123, 6);
+    m.ok(S::Recv, [FREE, 0, 0, 0, 0, 0]);
+    assert!(one_entry_beside_a_waiter(&m, S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]));
+    assert!(m.k.translate(asp, 0x6000_0000).is_some(), "the emptying reached the frame in its first entry");
+    // The answer (a capability in it: the general path, every lock) maps
+    // a frame where new tables are needed, in the entry that finishes the
+    // emptying and so gives the frame's tables back.
+    m.ok(S::ReplyRecv, [0, MsgInfo::with_caps(0, 4, 1).0, silica_abi::FAULT_MAP, SLOT_ASPACE, FREE + 3, 0x7000_0000 | 3]);
+    assert!(m.k.translate(asp, 0x6000_0000).is_none());
+    assert_eq!(m.k.translate(asp, 0x7000_0123), Some(m.cap(FREE + 3).unwrap().obj + 0x123));
+}
+
+/// One kernel entry of system call `n` as thread `t` (others yield until it
+/// runs), processor 1 waiting for a lock throughout: whether it stopped.
+fn one_entry_as_beside_a_waiter(m: &Machine, t: u64, n: S, a: [u64; 6]) -> bool {
+    while m.k.current() != t {
+        let c = m.k.current();
+        m.k.regs(c)[TestHal::SYS].set(S::Yield as u64);
+        m.k.enter();
+        m.k.syscall();
+        m.k.schedule();
+        m.k.leave();
+    }
+    m.k.hal.contender.set(m.k.lock_wait_turns(1));
+    let r = m.k.regs(t);
+    r[TestHal::IP].set(0x40_0002);
+    r[TestHal::SYS].set(n as u64);
+    r[TestHal::BY_SYSCALL].set(1);
+    for (i, v) in a.iter().enumerate() {
+        r[TestHal::ARG[i]].set(*v);
+    }
+    m.k.enter();
+    m.k.syscall();
+    m.k.leave();
+    m.k.hal.contender.set(core::ptr::null());
+    r[TestHal::IP].get() == 0x40_0000
+}
+
+/// Two holders of one address space unmapping ranges of it at once, each
+/// stopping beside a processor waiting, both finish, each with its whole
+/// count, and a frame's holder moving its capability meanwhile loses
+/// neither place. With one place kept a space, taken by whoever called
+/// last, each started the other over: with more mappings in neither range
+/// at the head of the list than one entry gets through, neither ever got
+/// past them (the review of audit-kernel-stalls).
+#[test]
+fn two_holders_unmapping_ranges_of_one_space_both_finish() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 20, FREE, 1);
+    let (a_n, b_n, c_n) = if cfg!(miri) { (100u64, 100u64, 600u64) } else { (300, 300, 600) };
+    let total = a_n + b_n + c_n;
+    for k in (0..total).step_by(250) {
+        m.retype(ut, T::Frame, 12, FREE + 1 + k, 250.min(total - k));
+    }
+    let at = |i: u64| 0x10_0000 + i * 0x1000;
+    // A's range first, then B's, then the rest last (the head of the list).
+    for i in 0..total {
+        m.ok(S::Map, [FREE, FREE + 1 + i, at(i), 3, 0, 0]);
+    }
+    let a_range = [FREE, at(0), a_n * 0x1000, 0, 0, 0];
+    let b_range = [FREE, at(a_n), b_n * 0x1000, 0, 0, 0];
+    let a = m.spawn(ut, FREE + 1990);
+    let b = m.spawn(ut, FREE + 1991);
+    let (mut a_done, mut b_done) = (None, None);
+    for _ in 0..200 {
+        if a_done.is_none() && !one_entry_as_beside_a_waiter(&m, a, S::Unmap, a_range) {
+            a_done = Some(m.arg(a, 0));
+        }
+        if b_done.is_none() && !one_entry_as_beside_a_waiter(&m, b, S::Unmap, b_range) {
+            b_done = Some(m.arg(b, 0));
+        }
+    }
+    assert_eq!((a_done, b_done), (Some(a_n), Some(b_n)), "the two unmaps, alternating, did not both finish with their counts");
+}
+
+/// The same for an unmap whose place a frame's holder moves: the head's
+/// frames' capabilities are moved between its entries.
+#[test]
+fn an_unmap_of_a_range_finishes_while_frames_are_moved() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 20, FREE, 1);
+    let (a_n, b_n, c_n) = if cfg!(miri) { (100u64, 100u64, 600u64) } else { (300, 300, 600) };
+    let total = a_n + b_n + c_n;
+    for k in (0..total).step_by(250) {
+        m.retype(ut, T::Frame, 12, FREE + 1 + k, 250.min(total - k));
+    }
+    let at = |i: u64| 0x10_0000 + i * 0x1000;
+    for i in 0..total {
+        m.ok(S::Map, [FREE, FREE + 1 + i, at(i), 3, 0, 0]);
+    }
+    let a_range = [FREE, at(0), a_n * 0x1000, 0, 0, 0];
+    let a = m.spawn(ut, FREE + 1990);
+    let mut a_done = None;
+    for round in 0..200u64 {
+        if !one_entry_as_beside_a_waiter(&m, a, S::Unmap, a_range) {
+            a_done = Some(m.arg(a, 0));
+            break;
+        }
+        for i in a_n + b_n..total {
+            let (from, to) = if round % 2 == 0 { (FREE + 1 + i, FREE + 1 + i + 700) } else { (FREE + 1 + i + 700, FREE + 1 + i) };
+            if to < 4096 {
+                m.ok(S::CapMove, [SLOT_CAPSPACE, to, from, 0, 0, 0]);
+            }
+        }
+    }
+    assert_eq!(a_done, Some(a_n), "an unmap whose place a frame's holder moved meanwhile did not finish with its count");
+}
+
+/// Timeouts of waiters in a queue another processor owns are delivered
+/// holding every lock, each paid for by its own thread's context: in one
+/// pass over the timers, one whose context has used its share has its
+/// timeout delivered when the share is back, even after another's took
+/// every lock (before, only the first was asked, and it paid for all: the
+/// review of audit-kernel-stalls).
+#[test]
+fn every_timeout_that_takes_every_lock_is_paid_for_by_its_own_context() {
+    use kernel_core::thread::{RECEIVING, THROTTLED};
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    // An endpoint, and a thread on processor 1 that receives on it too.
+    m.retype(ut, T::Endpoint, 0, FREE, 1);
+    m.spawn(ut, FREE + 20);
+    m.move_to(FREE + 20, 1);
+    m.settle(1);
+    m.on(0);
+    // Two contexts on processor 0: the victim's, and the flood's.
+    m.retype(ut, T::SchedContext, 0, FREE + 1, 2);
+    for g in [FREE + 1, FREE + 2] {
+        m.ok(S::SchedConfigure, [g, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    }
+    let bind = |slot: u64, g: u64| {
+        let t = m.spawn(ut, slot);
+        m.ok(S::ThreadControl, [slot, 2, g, 0, 0, 0]);
+        t
+    };
+    let victim = bind(FREE + 3, FREE + 1);
+    let flooder = bind(FREE + 4, FREE + 2);
+    let flood = bind(FREE + 5, FREE + 2);
+    // Both wait on the endpoint with deadlines, the victim's first.
+    let deadline = m.k.hal.now.get() + 1_000;
+    assert!(m.sys_as(victim, S::Recv, [FREE, deadline, 0, 0, 0, 0]).blocked);
+    assert!(m.sys_as(flooder, S::Recv, [FREE, deadline + 1, 0, 0, 0, 0]).blocked);
+    // The queue becomes processor 1's: the last to wait on it is there.
+    m.on(1);
+    assert!(m.sys_as(m.cap(FREE + 20).unwrap().obj, S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(0);
+    // The flood uses up its context's share of time holding every lock.
+    m.k.hal.now_step.set(10_000);
+    m.retype(ut, T::Endpoint, 0, FREE + 6, 1);
+    let mut calls = 0;
+    while m.k.thread_view(flood).state != THROTTLED {
+        let call = if m.cap(FREE + 7).is_none() {
+            (S::CapCopy, [SLOT_CAPSPACE, FREE + 7, FREE + 6, 15, 0, 0])
+        } else {
+            (S::CapDelete, [FREE + 7, 0, 0, 0, 0, 0])
+        };
+        m.sys_as(flood, call.0, call.1);
+        calls += 1;
+        assert!(calls < 100_000);
+    }
+    m.k.hal.now_step.set(0);
+    // Both deadlines pass, close enough that the flood's share is not back.
+    m.k.hal.now.set(m.k.hal.now.get().max(deadline + 2));
+    m.tick();
+    assert_eq!(m.k.thread_view(victim).state, RUNNABLE, "the victim's timeout was delivered");
+    assert_eq!(m.k.thread_view(flooder).state, RECEIVING, "a timeout whose context had used its share rode on another's");
+}
+
+/// A fault the thread would not make again where it was (a breakpoint: the
+/// saved instruction pointer is past it) is never held back for its
+/// context's share: held back, the thread went on past it when the share
+/// came back and the fault was lost (the review of audit-kernel-stalls). It
+/// is sent, and charged after.
+#[test]
+fn a_fault_that_does_not_recur_is_sent_when_its_context_has_no_share_left() {
+    use kernel_core::thread::{SENDING, THROTTLED};
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.spawn(ut, FREE + 20);
+    m.move_to(FREE + 20, 1);
+    m.settle(1);
+    m.on(0);
+    m.retype(ut, T::SchedContext, 0, FREE, 1);
+    m.ok(S::SchedConfigure, [FREE, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    m.retype(ut, T::Endpoint, 0, FREE + 1, 2);
+    let bind = |slot: u64| {
+        let t = m.spawn(ut, slot);
+        m.ok(S::ThreadControl, [slot, 2, FREE, 0, 0, 0]);
+        t
+    };
+    let flood = bind(FREE + 3);
+    let x = bind(FREE + 4);
+    // Nobody receives on its fault endpoint: the fault takes every lock.
+    m.ok(S::ThreadConfigure, [FREE + 4, KEEP, KEEP, FREE + 1, KEEP, 0]);
+    m.ok(S::ThreadControl, [FREE + 4, 0, 0, 0, 0, 0]);
+    // The context's share of time holding every lock is used up.
+    m.k.hal.now_step.set(10_000);
+    let mut calls = 0;
+    while m.k.thread_view(flood).state != THROTTLED {
+        let call = if m.cap(FREE + 5).is_none() {
+            (S::CapCopy, [SLOT_CAPSPACE, FREE + 5, FREE + 2, 15, 0, 0])
+        } else {
+            (S::CapDelete, [FREE + 5, 0, 0, 0, 0, 0])
+        };
+        m.sys_as(flood, call.0, call.1);
+        calls += 1;
+        assert!(calls < 100_000);
+    }
+    m.k.hal.now_step.set(0);
+    m.ok(S::ThreadControl, [FREE + 4, 1, 0, 0, 0, 0]);
+    m.sys_as(x, S::Yield, [0; 6]);
+    while m.k.current() != x {
+        m.sys(S::Yield, [0; 6]);
+    }
+    // A breakpoint (x86 vector 3: a trap, its instruction pointer past it).
+    m.fault(Fault::Exception, 3, 0);
+    assert_eq!(m.k.thread_view(x).state, SENDING, "a breakpoint was held back, to be lost when the share came back");
+}
+
+/// A CapDelete made again only to finish emptying what it destroyed does
+/// not look at its slot again: by then another capability may be there
+/// (received, or put there by another thread of the CapSpace), which is
+/// not the call's to delete (the review of audit-kernel-stalls).
+#[test]
+fn a_capdelete_made_again_does_not_delete_what_came_into_its_slot() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Endpoint, 0, FREE, 1);
+    m.retype(ut, T::CapSpace, 12, FREE + 1, 1);
+    for i in 1..2000 {
+        m.ok(S::CapCopy, [FREE + 1, i, FREE, 15, 0, 0]);
+    }
+    let other = m.spawn(ut, FREE + 2);
+    // The CapSpace goes, its emptying stopped beside a waiting processor:
+    // the call will be made again to finish it.
+    assert!(one_entry_beside_a_waiter(&m, S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]));
+    assert!(m.cap(FREE + 1).is_none());
+    // Meanwhile another thread of this CapSpace puts a capability there.
+    assert_eq!(m.sys_as(other, S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 15, 7, 0]).status, 0);
+    // The CapDelete, made again, finishes without touching it.
+    assert!(!one_entry_as_beside_a_waiter(&m, m.root, S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]));
+    assert!(m.cap(FREE + 1).is_some(), "the CapDelete made again deleted a capability that came into its slot meanwhile");
+}
+
+/// The root task holds the boot secret it was started with: it must not
+/// be able to work out from it the key of the identities Inspect shows
+/// (with it, identities turn back into physical addresses). Here it tries:
+/// it takes its start registers for the entropy the key is made from,
+/// makes the key as the kernel does, and predicts an endpoint's identity.
+/// Before, the key was made from the very bytes the root task was given
+/// (the review of audit-kernel-stalls).
+#[test]
+fn the_root_task_cannot_work_out_the_identities_key_from_its_secret() {
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Endpoint, 0, FREE, 1);
+    let mut given = [0u8; 32];
+    for (i, w) in m.start_args[1..5].iter().enumerate() {
+        given[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    let key = kernel_core::ident::key_from(&given);
+    let predicted = kernel_core::ident::permute(key, m.cap(FREE).unwrap().obj);
+    m.ok(S::Inspect, [SLOT_CAPSPACE, FREE, 0, 0, 0, 0]);
+    assert_ne!(m.arg(m.root, 3), predicted, "the root task worked out an identity from its own boot secret");
 }

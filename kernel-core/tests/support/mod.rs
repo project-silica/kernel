@@ -81,6 +81,11 @@ pub struct TestHal {
     /// watches.
     pub spy: Cell<*const u32>,
     pub spied: Cell<u32>,
+    /// Another processor's count of turns waiting for a lock
+    /// (`Kernel::lock_wait_turns`; null: none): each look for a pending
+    /// interrupt counts one more, as a processor waiting while the kernel
+    /// works would (the test machine's processors do not run at once).
+    pub contender: Cell<*const core::sync::atomic::AtomicU64>,
     /// The machine's IOMMU: how far device addresses reach (0: no IOMMU),
     /// whether it maps 2 MiB with one entry, which device identity is
     /// attached to which root table, and how often its cache was flushed.
@@ -234,6 +239,12 @@ impl Hal for TestHal {
         self.armed[c].set(deadline != u64::MAX);
     }
     fn irq_pending(&self) -> bool {
+        let c = self.contender.get();
+        if !c.is_null() {
+            // SAFETY: set by a test to a counter of the kernel it runs,
+            // which outlives every call into that kernel.
+            unsafe { &*c }.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         let n = self.pending.get();
         if n > 0 {
             self.pending.set(n - 1);
@@ -470,6 +481,7 @@ impl Machine {
             watch_wakes: Cell::new(0),
             watch_ends: Cell::new(0),
             spy: Cell::new(core::ptr::null()),
+            contender: Cell::new(core::ptr::null()),
             spied: Cell::new(0),
             io_top: Cell::new(1 << 48),
             io_large: Cell::new(true),

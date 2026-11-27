@@ -159,7 +159,10 @@ pub const LAST_PANIC: usize = 4096;
 /// The boot secret from the root thread's start registers: the second to
 /// fifth argument registers (`a1` to `a4`), little-endian, in order. 32
 /// bytes, independent of the kernel's own randomness (its address slide):
-/// knowing one says nothing about the other.
+/// knowing one says nothing about the other. The kernel derives it from
+/// the boot's entropy under a label of its own, and what it keeps for
+/// itself (the key of the identities `Inspect` shows) under another, so
+/// the root task cannot work out the kernel's from it.
 pub fn secret(words: [u64; 4]) -> [u8; 32] {
     let mut s = [0u8; 32];
     for (i, w) in words.iter().enumerate() {
