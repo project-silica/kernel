@@ -17,7 +17,7 @@ fn root_task_starts_with_documented_layout() {
     assert_eq!(i.magic, ROOT_MAGIC);
     assert_eq!(i.capspace_slots, 4096);
     assert_eq!(&i.cmdline[..i.cmdline_len as usize], b"test=host");
-    assert_eq!(m.start_args[1..5], BOOT_SECRET.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>()[..]);
+    assert_eq!(m.start_args[1..5], kernel_core::ident::root_secret(&BOOT_SECRET)[..]);
     assert_eq!(m.cap(SLOT_THREAD).unwrap().ty, T::Thread);
     assert_eq!(m.cap(SLOT_THREAD).unwrap().obj, m.root);
     assert_eq!(m.cap(SLOT_CAPSPACE).unwrap().ty, T::CapSpace);

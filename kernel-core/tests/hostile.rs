@@ -378,10 +378,10 @@ fn tables_given_back(bits: u64, io: bool) {
 #[test]
 fn the_boot_secret_is_in_no_frame_the_root_task_lends() {
     let m = Machine::new(16);
-    let secret = support::BOOT_SECRET;
+    // The root task's secret, derived from the boot's entropy (`ident.rs`).
+    let words = kernel_core::ident::root_secret(&support::BOOT_SECRET);
     let info = m.mem(m.info, 4096);
-    assert!(!info.windows(8).any(|w| secret.chunks(8).any(|c| c == w)), "the RootInfo frame holds the boot secret");
-    let words: Vec<u64> = secret.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+    assert!(!info.windows(8).any(|w| words.iter().any(|s| s.to_le_bytes() == w)), "the RootInfo frame holds the boot secret");
     assert_eq!(m.start_args[1..5], words[..], "the root thread does not start with the boot secret");
 }
 
@@ -1595,4 +1595,26 @@ fn a_capdelete_made_again_does_not_delete_what_came_into_its_slot() {
     // The CapDelete, made again, finishes without touching it.
     assert!(!one_entry_as_beside_a_waiter(&m, m.root, S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]));
     assert!(m.cap(FREE + 1).is_some(), "the CapDelete made again deleted a capability that came into its slot meanwhile");
+}
+
+/// The root task holds the boot secret it was started with: it must not
+/// be able to work out from it the key of the identities Inspect shows
+/// (with it, identities turn back into physical addresses). Here it tries:
+/// it takes its start registers for the entropy the key is made from,
+/// makes the key as the kernel does, and predicts an endpoint's identity.
+/// Before, the key was made from the very bytes the root task was given
+/// (the review of audit-kernel-stalls).
+#[test]
+fn the_root_task_cannot_work_out_the_identities_key_from_its_secret() {
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Endpoint, 0, FREE, 1);
+    let mut given = [0u8; 32];
+    for (i, w) in m.start_args[1..5].iter().enumerate() {
+        given[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    let key = kernel_core::ident::key_from(&given);
+    let predicted = kernel_core::ident::permute(key, m.cap(FREE).unwrap().obj);
+    m.ok(S::Inspect, [SLOT_CAPSPACE, FREE, 0, 0, 0, 0]);
+    assert_ne!(m.arg(m.root, 3), predicted, "the root task worked out an identity from its own boot secret");
 }

@@ -11,19 +11,21 @@
 //! exactly where the addresses are, and with a key made at boot from the
 //! boot's entropy that no program learns, unrelated to the address.
 //!
-//! The permutation is four rounds of a Feistel network over the two
+//! The permutation is eight rounds of a Feistel network over the two
 //! halves of the 64-bit address, each round's function SipHash-2-4 of the
-//! round and the half (a pseudorandom function, so the four rounds make a
-//! pseudorandom permutation: Luby and Rackoff). The key is SipHash of a
-//! constant under the boot entropy's two halves: the entropy itself (the
-//! root task's boot secret) is not kept.
+//! round and the half (a pseudorandom function: the rounds make a
+//! pseudorandom permutation, Luby and Rackoff; eight, as four over 32-bit
+//! halves can be told from random after some 2^16 values). The key is
+//! derived from the boot's entropy under a label of its own, and the root
+//! task's boot secret under another ([`root_secret`]): the entropy itself
+//! is not kept, and the root task cannot work out the key from its secret.
 
 use crate::hal::Hal;
 use crate::kernel::Kernel;
 
 /// SipHash-2-4 of the single 64-bit word `m` under key `k` (Aumasson and
 /// Bernstein, 2012; the eight-byte message little-endian).
-pub(crate) fn siphash(k: [u64; 2], m: u64) -> u64 {
+pub fn siphash(k: [u64; 2], m: u64) -> u64 {
     let mut v = [k[0] ^ 0x736f_6d65_7073_6575, k[1] ^ 0x646f_7261_6e64_6f6d, k[0] ^ 0x6c79_6765_6e65_7261, k[1] ^ 0x7465_6462_7974_6573];
     fn round(v: &mut [u64; 4]) {
         v[0] = v[0].wrapping_add(v[1]);
@@ -51,21 +53,42 @@ pub(crate) fn siphash(k: [u64; 2], m: u64) -> u64 {
     v[0] ^ v[1] ^ v[2] ^ v[3]
 }
 
-/// The permutation of `x` under key `k` (four Feistel rounds).
-pub(crate) fn permute(k: [u64; 2], x: u64) -> u64 {
+/// The permutation of `x` under key `k`: eight Feistel rounds (four over
+/// 32-bit halves can be told from a random permutation after some 2^16
+/// values: the review of audit-kernel-stalls).
+pub fn permute(k: [u64; 2], x: u64) -> u64 {
     let (mut l, mut r) = (x >> 32, x & 0xFFFF_FFFF);
-    for i in 0..4u64 {
+    for i in 0..8u64 {
         (l, r) = (r, l ^ (siphash(k, i << 32 | r) & 0xFFFF_FFFF));
     }
     l << 32 | r
 }
 
+/// Word `i` of what the boot's 32 bytes of entropy give under `label`:
+/// SipHash of the label and `i` under each half of the entropy, the two
+/// combined, so each word depends on all of it. Under different labels the
+/// words are unrelated: knowing what one label gave tells nothing of
+/// another's (SipHash is a pseudorandom function of its key).
+fn derive(entropy: &[u8; 32], label: u64, i: u64) -> u64 {
+    let w = |j: usize| u64::from_le_bytes(entropy[j * 8..j * 8 + 8].try_into().unwrap_or([0; 8]));
+    siphash([w(0), w(1)], label ^ i) ^ siphash([w(2), w(3)], label.rotate_left(32) ^ i)
+}
+
+/// "identity" and "rootsecr", little-endian.
+const IDENTITY: u64 = 0x7974_6974_6e65_6469;
+const ROOT: u64 = 0x7263_6573_746f_6f72;
+
 /// The key of the identities, from the boot's 32 bytes of entropy.
-pub(crate) fn key_from(entropy: &[u8; 32]) -> [u64; 2] {
-    let w = |i: usize| u64::from_le_bytes(entropy[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
-    // "identity", once under each half of the entropy.
-    const LABEL: u64 = 0x7974_6974_6e65_6469;
-    [siphash([w(0), w(1)], LABEL), siphash([w(2), w(3)], LABEL ^ 1)]
+pub fn key_from(entropy: &[u8; 32]) -> [u64; 2] {
+    [derive(entropy, IDENTITY, 0), derive(entropy, IDENTITY, 1)]
+}
+
+/// The root task's boot secret, from the same entropy under another label:
+/// the root task, which holds it, cannot work out the identities' key from
+/// it (it was the entropy itself, from which it could: the review of
+/// audit-kernel-stalls).
+pub fn root_secret(entropy: &[u8; 32]) -> [u64; 4] {
+    core::array::from_fn(|i| derive(entropy, ROOT, i as u64))
 }
 
 impl<H: Hal> Kernel<H> {

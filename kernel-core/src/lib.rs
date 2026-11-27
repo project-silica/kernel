@@ -22,7 +22,7 @@ pub use silica_formats::{acpi, elf, ramdisk};
 #[cfg(test)]
 mod exhaustive;
 pub mod hal;
-mod ident;
+pub mod ident;
 pub mod ipc;
 pub mod kernel;
 pub mod lock;
