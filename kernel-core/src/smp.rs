@@ -359,7 +359,7 @@ impl<H: Hal> Kernel<H> {
 
     /// Processor `cpu`'s count of turns spent waiting for a lock: what a
     /// long operation holding every lock looks at to know that another
-    /// processor waits for it ([`Kernel::must_pause`]). For tests, whose
+    /// processor waits for it (`Kernel::must_pause`). For tests, whose
     /// processors do not run at once and so count for one that waits.
     pub fn lock_wait_turns(&self, cpu: usize) -> &core::sync::atomic::AtomicU64 {
         &self.cpus.get(cpu).spins
