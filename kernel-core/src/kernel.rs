@@ -637,7 +637,8 @@ impl<H: Hal> Kernel<H> {
                             return Err(Error::NoRights);
                         }
                         let end = a[1].checked_add(a[2]).ok_or(Error::BadArg)?;
-                        let n = self.unmap_range(cap.obj, a[1], end);
+                        // Made again where it stopped (`unmap_range`).
+                        let Some(n) = self.unmap_range(t, cap.obj, a[1], end) else { return Ok(Exit::Preempted) };
                         self.thread(t).regs[H::ARG[0]].set(n);
                     }
                     _ => return Err(Error::WrongType),

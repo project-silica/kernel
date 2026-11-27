@@ -1119,7 +1119,9 @@ fn an_unmap_of_many_frames_tells_each_processor_once() {
     let (ut, _) = m.big_untyped();
     m.retype(ut, T::AddressSpace, 16, FREE, 1);
     let frames = 64u64;
-    m.retype(ut, T::Frame, 12, FREE + 1, frames);
+    for k in (0..frames).step_by(250) {
+        m.retype(ut, T::Frame, 12, FREE + 1 + k, 250.min(frames - k));
+    }
     for i in 0..frames {
         m.ok(S::Map, [FREE, FREE + 1 + i, 0x10_0000 + i * 0x1000, 3, 0, 0]);
     }
@@ -1136,4 +1138,76 @@ fn an_unmap_of_many_frames_tells_each_processor_once() {
     m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
     let told = m.k.hal.forgets.get() - before;
     assert!(told <= 2, "the other processor was told {told} times when the address space went");
+}
+
+/// An address space may have as many mappings as there is memory for
+/// frames, and both an unmap of a range and the space's destruction went
+/// through all of them holding every lock, whatever was waiting (the
+/// 2026-11-27 audit: H4). Beside a processor waiting for a lock, an unmap
+/// of a range stops a bounded number of mappings in and is made again from
+/// where it stopped, its count whole; if the mapping it stopped at goes
+/// meanwhile it starts over, and still unmaps exactly what is in range.
+#[test]
+fn an_unmap_of_a_large_range_stops_for_a_processor_waiting_and_goes_on() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 20, FREE, 1);
+    let frames = if cfg!(miri) { 600 } else { 2000 };
+    for k in (0..frames).step_by(250) {
+        m.retype(ut, T::Frame, 12, FREE + 1 + k, 250.min(frames - k));
+    }
+    let at = |i: u64| 0x10_0000 + i * 0x1000;
+    for i in 0..frames {
+        m.ok(S::Map, [FREE, FREE + 1 + i, at(i), 3, 0, 0]);
+    }
+    let mapped = |m: &Machine| {
+        (0..frames).filter(|&i| m.k.view(m.k.slot_addr(&m.cs, FREE + 1 + i).unwrap()).unwrap().mapped.is_some()).count() as u64
+    };
+    // Everything but the first frame is in range.
+    let range = [FREE, at(1), (frames - 1) * 0x1000, 0, 0, 0];
+    assert!(one_entry_beside_a_waiter(&m, S::Unmap, range), "one entry unmapped all of {frames} frames");
+    let left = mapped(&m);
+    assert!(left > 1 && frames - left <= 1024, "one entry unmapped {} frames", frames - left);
+    // The frame it goes on from is deleted meanwhile (its slot emptied).
+    m.k.hal.contender.set(core::ptr::null());
+    let gone = (1..frames).find(|&i| m.k.view(m.k.slot_addr(&m.cs, FREE + 1 + i).unwrap()).unwrap().mapped.is_some()).unwrap();
+    m.ok(S::CapDelete, [FREE + 1 + gone, 0, 0, 0, 0, 0]);
+    m.ok(S::Unmap, range);
+    let still: Vec<u64> = (0..frames)
+        .filter(|&i| m.cap(FREE + 1 + i).is_some() && m.k.view(m.k.slot_addr(&m.cs, FREE + 1 + i).unwrap()).unwrap().mapped.is_some())
+        .collect();
+    assert_eq!(still, [0], "exactly the frame out of range is still mapped");
+}
+
+/// The destruction of an address space with many mappings stops likewise,
+/// and its frames can be mapped elsewhere at once, before every one has
+/// been let go of.
+#[test]
+fn destroying_an_address_space_of_many_mappings_stops_for_a_processor_waiting() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 20, FREE, 1);
+    m.retype(ut, T::AddressSpace, 16, FREE + 1, 1);
+    let frames = if cfg!(miri) { 600 } else { 2000 };
+    for k in (0..frames).step_by(250) {
+        m.retype(ut, T::Frame, 12, FREE + 2 + k, 250.min(frames - k));
+    }
+    for i in 0..frames {
+        m.ok(S::Map, [FREE, FREE + 2 + i, 0x10_0000 + i * 0x1000, 3, 0, 0]);
+    }
+    let mapped = |m: &Machine| {
+        (0..frames).filter(|&i| m.k.view(m.k.slot_addr(&m.cs, FREE + 2 + i).unwrap()).unwrap().mapped.is_some()).count() as u64
+    };
+    assert!(one_entry_beside_a_waiter(&m, S::CapDelete, [FREE, 0, 0, 0, 0, 0]), "one entry let go of all {frames} mappings");
+    assert!(m.cap(FREE).is_none(), "the address space itself is gone at once");
+    let left = mapped(&m);
+    assert!(left > 0 && frames - left <= 1024, "one entry let go of {} mappings", frames - left);
+    // A frame still listed in the gone space maps elsewhere at once.
+    let last = FREE + 2 + frames - 1;
+    m.ok(S::Map, [FREE + 1, last, 0x20_0000, 3, 0, 0]);
+    let v = m.k.view(m.k.slot_addr(&m.cs, last).unwrap()).unwrap();
+    assert_eq!(v.mapped.map(|(a, _)| a), Some(m.cap(FREE + 1).unwrap().obj), "mapped in the new space");
+    // The next system call that takes every lock finishes the rest.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2050, FREE + 1, 15, 0, 0]);
+    assert_eq!(mapped(&m), 1, "only the frame mapped again is mapped");
 }

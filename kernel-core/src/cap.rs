@@ -22,7 +22,7 @@ use silica_abi::{Error, ObjectType, Rights, SLOT_BITS};
 
 /// Slots a CapSpace being emptied gives up between looks for a pending
 /// interrupt (`drain_reap`).
-const REAP_STEP: u64 = 256;
+pub(crate) const REAP_STEP: u64 = 256;
 
 /// Capability flag: device memory, mapped with device attributes
 /// (uncached; on Arm also no unaligned access). Always also [`FLAG_KEPT`].
@@ -364,6 +364,16 @@ impl<H: Hal> Kernel<H> {
             if e == 0 {
                 return true;
             }
+            if e & 3 == 2 {
+                // A destroyed address space's frames (`finalise_aspace`):
+                // it stays first on the list until they are all let go of.
+                let a = e & !3;
+                if !self.forget_maps(a, &mut steps) {
+                    return false;
+                }
+                self.reap.set(self.aspace(a).reap_next.get());
+                continue;
+            }
             if e & 1 == 1 {
                 let t = e & !1;
                 self.reap.set(self.thread(t).reap_next.get());
@@ -484,6 +494,12 @@ impl<H: Hal> Kernel<H> {
             self.slot(mp).mnext.set(dst);
         }
         if s.cap().is_some_and(|c| c.ty == ObjectType::Frame) && s.badge.get() & MAPPED != 0 {
+            // An unmap of a range that stopped at this slot starts over
+            // (`unmap_range`): it is no longer where it was.
+            let h = self.aspace(s.aux.get());
+            if h.sweep_at.get() == src {
+                h.sweep_at.set(0);
+            }
             if mp != 0 {
                 self.slot(mp).mnext.set(dst);
             } else {
