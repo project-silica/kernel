@@ -8,6 +8,14 @@
 //! space is gone. Units of other segments get an empty root table: their
 //! devices reach nothing at all (attaching them is `Unsupported`).
 //!
+//! A device of segment 0 is attached only where a driven unit translates
+//! it: a unit that covers every device no other unit names
+//! (INCLUDE_PCI_ALL), or a device scope that names the device or the bridge
+//! it is below (read from configuration space when it is attached). Any
+//! other device reaches memory whatever it is attached to, so attaching it
+//! is `Unsupported` too, and the device manager, which asks before it lets
+//! a device master the bus, starts no driver that does DMA for it.
+//!
 //! Tables are in the legacy second-level format, which is the processor's
 //! own radix with read and write bits, so `kernel-core` walks them with the
 //! same code. A unit that translates 48 bits is given the address space's
@@ -126,6 +134,15 @@ struct State {
     /// Each I/O APIC's identifier and source identifier, from the DMAR.
     ioapics: [(u8, u16); MAX_IOAPICS],
     ioapic_count: usize,
+    /// Which devices of segment 0 the driven units translate
+    /// (`kernel_core::x86::covered`): all of them (a unit with
+    /// INCLUDE_PCI_ALL), else those their device scopes name.
+    all_covered: bool,
+    scopes: [kernel_core::x86::Scope; kernel_core::x86::MAX_SCOPES],
+    nscopes: usize,
+    /// Segment 0's configuration space (MCFG): its window and first and
+    /// last bus, for the bridges a scope names (0: none known).
+    ecam: (u64, u8, u8),
 }
 
 struct Racy(UnsafeCell<State>);
@@ -151,6 +168,11 @@ static STATE: Racy = Racy(UnsafeCell::new(State {
     eime: false,
     ioapics: [(0, 0); MAX_IOAPICS],
     ioapic_count: 0,
+    all_covered: false,
+    scopes: [kernel_core::x86::Scope { sub: false, start_bus: 0, path: [(0, 0); kernel_core::x86::MAX_PATH], len: 0 };
+        kernel_core::x86::MAX_SCOPES],
+    nscopes: 0,
+    ecam: (0, 0, 0),
 }));
 static LOCK: Lock = Lock::new();
 /// `top` again, readable without the lock: 0 until the units translate.
@@ -278,6 +300,11 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
             use kernel_core::x86::{UnitUse, unit_use};
             let usage = unit_use(base, segment, bi.phys_map_len, s.n, MAX_UNITS);
             if usage == UnitUse::Drive {
+                // Which devices it translates: every one no other unit
+                // names (INCLUDE_PCI_ALL), else those its scopes name.
+                if field(4, 1).unwrap_or(0) as u8 & kernel_core::x86::INCLUDE_PCI_ALL != 0 {
+                    s.all_covered = true;
+                }
                 s.units[s.n].base = base;
                 s.n += 1;
                 // Its device scopes: an I/O APIC's (type 3) gives the source
@@ -286,6 +313,27 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
                 while let (Some(kind), Some(n)) = (field(at, 1), field(at + 1, 1)) {
                     if n < 6 || at + n as usize > len as usize {
                         break;
+                    }
+                    // A PCI endpoint (1) or sub-hierarchy (2): its start bus
+                    // and path of (device, function) pairs. One past what is
+                    // kept, or with a longer path, is not kept: the devices
+                    // only it names are not confined (refused).
+                    if let (1 | 2, Some(bus)) = (kind, field(at + 5, 1)) {
+                        let elems = (n as usize - 6) / 2;
+                        if s.nscopes < kernel_core::x86::MAX_SCOPES && (1..=kernel_core::x86::MAX_PATH).contains(&elems) {
+                            let mut scope =
+                                kernel_core::x86::Scope { sub: kind == 2, start_bus: bus as u8, len: elems as u8, ..Default::default() };
+                            for (i, p) in scope.path[..elems].iter_mut().enumerate() {
+                                *p = (field(at + 6 + 2 * i, 1).unwrap_or(0) as u8, field(at + 7 + 2 * i, 1).unwrap_or(0) as u8);
+                            }
+                            s.scopes[s.nscopes] = scope;
+                            s.nscopes += 1;
+                        } else {
+                            klog!(
+                                super::kernel(),
+                                "kernel: a device scope of the IOMMU at {base:#x} is past what the kernel keeps; its devices are not confined"
+                            );
+                        }
                     }
                     if let (3, Some(id), Some(bus), Some(dev), Some(func)) =
                         (kind, field(at + 4, 1), field(at + 5, 1), field(at + 6, 1), field(at + 7, 1))
@@ -359,6 +407,19 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
     // number: a server with devices past bus 64 had them refused.
     s.contexts =
         super::acpi_table(bi, phys, b"MCFG").and_then(|t| silica_formats::acpi::mcfg_buses(t, 0)).unwrap_or(CONTEXT_TABLES).clamp(1, 256);
+    // Where segment 0's bridges are read (a scope's path crosses them, and a
+    // sub-hierarchy is the buses below one): the MCFG's window, used only
+    // inside the physical map. Without it, no device below a bridge a scope
+    // names is confined.
+    if let Some((base, first, last)) = super::acpi_table(bi, phys, b"MCFG").and_then(|t| silica_formats::acpi::mcfg_window(t, 0))
+        && base.is_multiple_of(1 << 20)
+        && base.checked_add((last as u64 - first as u64 + 1) << 20).is_some_and(|end| end <= bi.phys_map_len)
+    {
+        s.ecam = (base, first, last);
+    }
+    if !s.all_covered && s.nscopes == 0 {
+        klog!(super::kernel(), "kernel: the IOMMUs name no device and cover none of the rest: no device is confined");
+    }
     let pages = 5 + s.contexts + (s.n + others) as u64;
     let Some(mem) = table.carve(pages * PAGE, PAGE, 1 << 20, bi.phys_map_len) else {
         klog!(super::kernel(), "kernel: no memory for the IOMMU's tables; devices are not confined");
@@ -464,6 +525,11 @@ const fn empty() -> State {
         eime: false,
         ioapics: [(0, 0); MAX_IOAPICS],
         ioapic_count: 0,
+        all_covered: false,
+        scopes: [kernel_core::x86::Scope { sub: false, start_bus: 0, path: [(0, 0); kernel_core::x86::MAX_PATH], len: 0 };
+            kernel_core::x86::MAX_SCOPES],
+        nscopes: 0,
+        ecam: (0, 0, 0),
     }
 }
 
@@ -563,9 +629,34 @@ pub fn attach(phys: &Phys, id: u64, root: Paddr) -> Result<Paddr, Error> {
     LOCK.lock();
     // SAFETY: under `LOCK`.
     let s = unsafe { &mut *STATE.0.get() };
-    let r = attach_locked(phys, s, id, root);
+    // A device no driven unit translates reaches memory whatever it is
+    // attached to: it is attached to nothing (`kernel_core::x86::covered`).
+    let translated = {
+        let st: &State = s;
+        kernel_core::x86::covered(id as u32, st.all_covered, &st.scopes[..st.nscopes], |bus, devfn| bridge(phys, st, bus, devfn))
+    };
+    let r = if translated { attach_locked(phys, s, id, root) } else { Err(Error::Unsupported) };
     LOCK.unlock();
     r
+}
+
+/// A bridge's secondary and subordinate bus numbers, read from segment 0's
+/// configuration space where `init` found it (`State::ecam`): `None` for a
+/// function that is not a bridge, absent, or outside the window.
+fn bridge(phys: &Phys, s: &State, bus: u8, devfn: u8) -> Option<(u8, u8)> {
+    let (base, first, last) = s.ecam;
+    if base == 0 || bus < first || bus > last {
+        return None;
+    }
+    let at = base + (((bus - first) as u64) << 20 | (devfn as u64) << 12);
+    // SAFETY: a dword of segment 0's configuration space window, which
+    // `init` checked lies inside the physical map; reading it has no effect.
+    let read = |reg: u64| unsafe { phys.ptr(at + reg).cast::<u32>().read_volatile() };
+    if read(0) & 0xFFFF == 0xFFFF || (read(0x0C) >> 16) & 0x7F != 1 {
+        return None;
+    }
+    let buses = read(0x18);
+    Some(((buses >> 8) as u8, (buses >> 16) as u8))
 }
 
 fn attach_locked(phys: &Phys, s: &mut State, id: u64, root: Paddr) -> Result<Paddr, Error> {

@@ -102,6 +102,71 @@ pub fn unit_use(base: u64, segment: u64, limit: u64, driven: usize, max: usize) 
     }
 }
 
+/// The DMAR hardware unit flag that a unit covers every device of its
+/// segment that no other unit's device scope names.
+pub const INCLUDE_PCI_ALL: u8 = 1;
+
+/// The most device scopes the kernel keeps of the units it drives; a
+/// device named only by a scope past them is not confined (it is refused).
+pub const MAX_SCOPES: usize = 64;
+/// The longest path of a device scope the kernel follows (bridges to cross
+/// and the device): a longer one names nothing it confines.
+pub const MAX_PATH: usize = 4;
+
+/// One DMAR device scope of a unit the kernel drives (VT-d section 8.3.1):
+/// a PCI endpoint (`sub` false) or a PCI sub-hierarchy (`sub`: a bridge and
+/// every bus below it), found from `start_bus` through `path`, each element
+/// a (device, function) whose secondary bus the next element is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Scope {
+    pub sub: bool,
+    pub start_bus: u8,
+    pub path: [(u8, u8); MAX_PATH],
+    pub len: u8,
+}
+
+/// Whether device `id` of segment 0 (bus << 8 | device << 3 | function) is
+/// translated by a unit the kernel drives: by one that covers every device
+/// no other unit names (`all`, `INCLUDE_PCI_ALL`), or by a scope that names
+/// the device or, a sub-hierarchy, the bridge it is below. `bridge(bus,
+/// devfn)` reads a bridge's secondary and subordinate bus numbers from its
+/// configuration space (`None`: no bridge there, or none readable). A
+/// device no scope reaches is translated by no unit and would reach memory
+/// whatever it is attached to, so the kernel attaches it to nothing
+/// (`Unsupported`), and the device manager starts no driver that does DMA
+/// for it (the review of 2026-11-27: every device of segment 0 was taken
+/// to be translated, whatever the units named).
+pub fn covered(id: u32, all: bool, scopes: &[Scope], bridge: impl Fn(u8, u8) -> Option<(u8, u8)>) -> bool {
+    // Segment 0's units translate segment 0's devices alone.
+    if id >> 16 != 0 {
+        return false;
+    }
+    if all {
+        return true;
+    }
+    let (bus, devfn) = ((id >> 8) as u8, id as u8);
+    scopes.iter().any(|s| {
+        let n = s.len as usize;
+        if n == 0 || n > MAX_PATH {
+            return false;
+        }
+        // Down the bridges to the last element's bus.
+        let mut at = s.start_bus;
+        for &(d, f) in &s.path[..n - 1] {
+            match bridge(at, d << 3 | f) {
+                Some((secondary, _)) => at = secondary,
+                None => return false,
+            }
+        }
+        let (d, f) = s.path[n - 1];
+        let target = d << 3 | f;
+        if (bus, devfn) == (at, target) {
+            return true;
+        }
+        s.sub && bridge(at, target).is_some_and(|(secondary, subordinate)| secondary != 0 && (secondary..=subordinate).contains(&bus))
+    })
+}
+
 /// Compare a remote timestamp sampled between two local counter reads.
 /// Waiting for two distinct publications excludes a timestamp that was
 /// already sampled, but not yet published, at the first local read.

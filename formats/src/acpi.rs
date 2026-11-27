@@ -341,9 +341,37 @@ pub fn mcfg_buses(mcfg: &[u8], segment: u16) -> Option<u64> {
         .max()
 }
 
+/// Where segment `segment`'s configuration space is (MCFG, PCI Firmware
+/// Specification 3.2 section 4.1.2): the physical address of its window,
+/// and the first and last bus the window covers (the window begins at the
+/// first bus's). The first entry for the segment, if any.
+pub fn mcfg_window(mcfg: &[u8], segment: u16) -> Option<(u64, u8, u8)> {
+    let entries = mcfg.get(44..)?;
+    entries.as_chunks::<16>().0.iter().find(|e| u16::from_le_bytes([e[8], e[9]]) == segment && e[10] <= e[11]).map(|e| {
+        let base = u64::from_le_bytes([e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]]);
+        (base, e[10], e[11])
+    })
+}
+
 #[cfg(test)]
 mod mcfg {
-    use super::mcfg_buses;
+    use super::{mcfg_buses, mcfg_window};
+
+    #[test]
+    fn a_segments_window_is_its_first_entry() {
+        let mut t = std::vec![0u8; 44];
+        for (base, seg, start, end) in [(0xB000_0000u64, 1u16, 0u8, 7u8), (0xE000_0000, 0, 0, 255), (0xF000_0000, 0, 0, 3)] {
+            let mut e = std::vec![0u8; 16];
+            e[..8].copy_from_slice(&base.to_le_bytes());
+            e[8..10].copy_from_slice(&seg.to_le_bytes());
+            (e[10], e[11]) = (start, end);
+            t.extend(e);
+        }
+        assert_eq!(mcfg_window(&t, 0), Some((0xE000_0000, 0, 255)));
+        assert_eq!(mcfg_window(&t, 1), Some((0xB000_0000, 0, 7)));
+        assert_eq!(mcfg_window(&t, 2), None);
+        assert_eq!(mcfg_window(&t[..50], 0), None, "a truncated entry is none");
+    }
     extern crate std;
 
     #[test]
