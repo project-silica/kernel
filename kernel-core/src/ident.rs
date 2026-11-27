@@ -7,7 +7,7 @@
 //! machine's memory layout, which memory a program's objects came from and
 //! where they lie beside others' (the 2026-11-27 audit: M13, N4), and no
 //! program needs it to tell objects apart. What `Inspect` shows now is a
-//! keyed permutation of it ([`Kernel::identity`]): one-to-one, so equal
+//! keyed permutation of it (`Kernel::identity`): one-to-one, so equal
 //! exactly where the addresses are, and with a key made at boot from the
 //! boot's entropy that no program learns, unrelated to the address.
 //!
