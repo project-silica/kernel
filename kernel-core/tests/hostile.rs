@@ -1233,29 +1233,25 @@ fn a_flood_of_faults_that_take_every_lock_is_held_back() {
     // Nobody receives on the fault endpoint: it is no processor's, so each
     // fault sent to it takes every lock.
     m.retype(ut, T::Endpoint, 0, FREE + 1, 1);
-    let threads: Vec<_> = (0..1800u64)
-        .map(|i| {
-            let slot = FREE + 100 + i;
-            let t = m.spawn(ut, slot);
-            m.ok(S::ThreadConfigure, [slot, KEEP, KEEP, FREE + 1, KEEP, 0]);
-            m.ok(S::ThreadControl, [slot, 2, FREE, 0, 0, 0]);
-            // Suspended until its turn: the flood is the faults, not a
-            // run queue of threads to yield through.
-            m.ok(S::ThreadControl, [slot, 0, 0, 0, 0, 0]);
-            t
-        })
-        .collect();
-    // During each fault every reading of the clock is 10 us later than
-    // the last: a fault that takes every lock holds them that long at least.
+    // During each fault every reading of the clock is 100 us later than
+    // the last: a fault that takes every lock holds them that long at least,
+    // so the context's burst is spent in tens of faults, not hundreds. Each
+    // faulting thread is made at its turn, so the run queue holds only it
+    // and the root, and the test makes only as many as the kernel lets
+    // fault. (Under Miri each costs about 18 s: 1800 made up front and 590
+    // faults of 10 us took over eight hours.)
     let mut faults = 0;
     let mut throttled = false;
-    for (i, &t) in threads.iter().enumerate() {
-        m.ok(S::ThreadControl, [FREE + 100 + i as u64, 1, 0, 0, 0, 0]);
+    for i in 0..1800u64 {
+        let slot = FREE + 100 + i;
+        let t = m.spawn(ut, slot);
+        m.ok(S::ThreadConfigure, [slot, KEEP, KEEP, FREE + 1, KEEP, 0]);
+        m.ok(S::ThreadControl, [slot, 2, FREE, 0, 0, 0]);
         m.sys_as(t, S::Yield, [0; 6]);
         while m.k.current() != t {
             m.sys(S::Yield, [0; 6]);
         }
-        m.k.hal.now_step.set(10_000);
+        m.k.hal.now_step.set(100_000);
         m.fault(Fault::Page, 0xdead_0000, 6);
         m.k.hal.now_step.set(0);
         faults += 1;
