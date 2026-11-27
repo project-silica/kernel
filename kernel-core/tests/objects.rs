@@ -1961,6 +1961,20 @@ fn a_server_loop_and_its_client_hand_off_through_notifications() {
     assert_eq!(Error::result(m.status(server)), Err(Error::WouldBlock));
     m.ok(S::Recv, [mine, 1, 0, 0, 0, 0]);
     assert_eq!(m.arg(m.root, 0), 0b10, "the poll signalled the client");
+    // The server signals the notification it listens on: it receives its
+    // own signal at once, as a listener does.
+    let r = m.sys_as(server, S::SignalRecv, [serve, 0, 0, FREE + 24, 0, 0]);
+    assert!(!r.blocked);
+    assert_eq!((m.status(server), m.arg(server, 0), m.arg(server, 1)), (0, 0b100, MsgInfo::NOTIFIED.0));
+    check(&m);
+    // A deadline already past: the client is signalled, the receive times out.
+    let past = m.k.hal.now.get().max(2);
+    m.k.hal.now.set(past + 10);
+    assert!(!m.sys_as(server, S::SignalRecv, [serve, past, 0, FREE + 25, 0, 0]).blocked);
+    assert_eq!(Error::result(m.status(server)), Err(Error::Timeout));
+    m.ok(S::Recv, [mine, 1, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 0b10, "the timed-out receive signalled the client");
+    check(&m);
     // A message still reaches the server in its loop.
     assert!(m.sys_as(server, S::SignalRecv, [serve, 0, 0, FREE + 25, 0, 0]).blocked);
     m.ok(S::Recv, [mine, 1, 0, 0, 0, 0]);
