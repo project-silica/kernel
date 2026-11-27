@@ -150,12 +150,16 @@ pub fn covered(id: u32, all: bool, scopes: &[Scope], bridge: impl Fn(u8, u8) -> 
         if n == 0 || n > MAX_PATH {
             return false;
         }
-        // Down the bridges to the last element's bus.
+        // Down the bridges to the last element's bus. A bridge leads to
+        // buses below its own only once they are numbered (`at < secondary
+        // <= subordinate`, as the device manager's scan requires): an
+        // unnumbered one (secondary 0) leads nowhere, not back to bus 0.
+        let below = |at: u8, (secondary, subordinate): (u8, u8)| at < secondary && secondary <= subordinate;
         let mut at = s.start_bus;
         for &(d, f) in &s.path[..n - 1] {
             match bridge(at, d << 3 | f) {
-                Some((secondary, _)) => at = secondary,
-                None => return false,
+                Some(b) if below(at, b) => at = b.0,
+                _ => return false,
             }
         }
         let (d, f) = s.path[n - 1];
@@ -163,8 +167,31 @@ pub fn covered(id: u32, all: bool, scopes: &[Scope], bridge: impl Fn(u8, u8) -> 
         if (bus, devfn) == (at, target) {
             return true;
         }
-        s.sub && bridge(at, target).is_some_and(|(secondary, subordinate)| secondary != 0 && (secondary..=subordinate).contains(&bus))
+        s.sub && bridge(at, target).is_some_and(|b| below(at, b) && (b.0..=b.1).contains(&bus))
     })
+}
+
+/// The configuration windows of segment 0 the kernel keeps (MCFG entries).
+pub const MAX_WINDOWS: usize = 4;
+
+/// Where bus `bus`, function `devfn` has its configuration space, in one of
+/// `windows` (MCFG entries of segment 0: base, first bus, last bus). A
+/// window's base is bus 0's address whatever bus the window starts at
+/// (PCI Firmware Specification 3.2, table 4-3), so the function is at
+/// `base + (bus << 20 | devfn << 12)`. `None` on a bus outside every window.
+pub fn ecam_address(windows: &[(u64, u8, u8)], bus: u8, devfn: u8) -> Option<u64> {
+    windows
+        .iter()
+        .find(|&&(base, first, last)| base != 0 && (first..=last).contains(&bus))
+        .map(|&(base, _, _)| base + ((bus as u64) << 20 | (devfn as u64) << 12))
+}
+
+/// Whether window `(base, first, last)` can be read through the first
+/// `limit` bytes of physical memory (the kernel's map): its base on a 1 MiB
+/// boundary and its last bus's space, up to `base + (last + 1) << 20`,
+/// inside the map.
+pub fn ecam_window_fits((base, first, last): (u64, u8, u8), limit: u64) -> bool {
+    first <= last && base.is_multiple_of(1 << 20) && base.checked_add(((last as u64) + 1) << 20).is_some_and(|end| end <= limit)
 }
 
 /// Compare a remote timestamp sampled between two local counter reads.

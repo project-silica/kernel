@@ -140,9 +140,10 @@ struct State {
     all_covered: bool,
     scopes: [kernel_core::x86::Scope; kernel_core::x86::MAX_SCOPES],
     nscopes: usize,
-    /// Segment 0's configuration space (MCFG): its window and first and
-    /// last bus, for the bridges a scope names (0: none known).
-    ecam: (u64, u8, u8),
+    /// Segment 0's configuration windows (MCFG: base, first and last bus),
+    /// for the bridges a scope names: those inside the physical map.
+    ecam: [(u64, u8, u8); kernel_core::x86::MAX_WINDOWS],
+    windows: usize,
 }
 
 struct Racy(UnsafeCell<State>);
@@ -172,7 +173,8 @@ static STATE: Racy = Racy(UnsafeCell::new(State {
     scopes: [kernel_core::x86::Scope { sub: false, start_bus: 0, path: [(0, 0); kernel_core::x86::MAX_PATH], len: 0 };
         kernel_core::x86::MAX_SCOPES],
     nscopes: 0,
-    ecam: (0, 0, 0),
+    ecam: [(0, 0, 0); kernel_core::x86::MAX_WINDOWS],
+    windows: 0,
 }));
 static LOCK: Lock = Lock::new();
 /// `top` again, readable without the lock: 0 until the units translate.
@@ -331,7 +333,9 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
                         } else {
                             klog!(
                                 super::kernel(),
-                                "kernel: a device scope of the IOMMU at {base:#x} is past what the kernel keeps; its devices are not confined"
+                                "kernel: a device scope of the IOMMU at {base:#x} has an empty path or one longer than {} elements, or is past the {} kept; the devices only it names are not confined",
+                                kernel_core::x86::MAX_PATH,
+                                kernel_core::x86::MAX_SCOPES
                             );
                         }
                     }
@@ -408,14 +412,33 @@ pub fn init(bi: &BootInfo, phys: &Phys, table: &mut RegionTable, reserved: &mut 
     s.contexts =
         super::acpi_table(bi, phys, b"MCFG").and_then(|t| silica_formats::acpi::mcfg_buses(t, 0)).unwrap_or(CONTEXT_TABLES).clamp(1, 256);
     // Where segment 0's bridges are read (a scope's path crosses them, and a
-    // sub-hierarchy is the buses below one): the MCFG's window, used only
-    // inside the physical map. Without it, no device below a bridge a scope
-    // names is confined.
-    if let Some((base, first, last)) = super::acpi_table(bi, phys, b"MCFG").and_then(|t| silica_formats::acpi::mcfg_window(t, 0))
-        && base.is_multiple_of(1 << 20)
-        && base.checked_add((last as u64 - first as u64 + 1) << 20).is_some_and(|end| end <= bi.phys_map_len)
-    {
-        s.ecam = (base, first, last);
+    // sub-hierarchy is the buses below one): the MCFG's windows, each used
+    // only where it lies inside the physical map. Without one, no device
+    // below a bridge a scope names is confined.
+    match super::acpi_table(bi, phys, b"MCFG") {
+        None => klog!(super::kernel(), "kernel: no MCFG: no device below a bridge an IOMMU names is confined"),
+        Some(t) => {
+            for w in silica_formats::acpi::mcfg_windows(t, 0) {
+                if !kernel_core::x86::ecam_window_fits(w, bi.phys_map_len) {
+                    klog!(
+                        super::kernel(),
+                        "kernel: the MCFG window at {:#x} (buses {:#x} to {:#x}) is outside the physical map; devices below its bridges are not confined",
+                        w.0,
+                        w.1,
+                        w.2
+                    );
+                } else if s.windows == kernel_core::x86::MAX_WINDOWS {
+                    klog!(
+                        super::kernel(),
+                        "kernel: segment 0 has more than {} MCFG windows; devices below the bridges of the rest are not confined",
+                        s.windows
+                    );
+                } else {
+                    s.ecam[s.windows] = w;
+                    s.windows += 1;
+                }
+            }
+        }
     }
     if !s.all_covered && s.nscopes == 0 {
         klog!(super::kernel(), "kernel: the IOMMUs name no device and cover none of the rest: no device is confined");
@@ -529,7 +552,8 @@ const fn empty() -> State {
         scopes: [kernel_core::x86::Scope { sub: false, start_bus: 0, path: [(0, 0); kernel_core::x86::MAX_PATH], len: 0 };
             kernel_core::x86::MAX_SCOPES],
         nscopes: 0,
-        ecam: (0, 0, 0),
+        ecam: [(0, 0, 0); kernel_core::x86::MAX_WINDOWS],
+        windows: 0,
     }
 }
 
@@ -641,16 +665,13 @@ pub fn attach(phys: &Phys, id: u64, root: Paddr) -> Result<Paddr, Error> {
 }
 
 /// A bridge's secondary and subordinate bus numbers, read from segment 0's
-/// configuration space where `init` found it (`State::ecam`): `None` for a
-/// function that is not a bridge, absent, or outside the window.
+/// configuration space where `init` found it (`State::ecam`,
+/// `kernel_core::x86::ecam_address`): `None` for a function that is not a
+/// bridge, absent, or on a bus outside every window.
 fn bridge(phys: &Phys, s: &State, bus: u8, devfn: u8) -> Option<(u8, u8)> {
-    let (base, first, last) = s.ecam;
-    if base == 0 || bus < first || bus > last {
-        return None;
-    }
-    let at = base + (((bus - first) as u64) << 20 | (devfn as u64) << 12);
-    // SAFETY: a dword of segment 0's configuration space window, which
-    // `init` checked lies inside the physical map; reading it has no effect.
+    let at = kernel_core::x86::ecam_address(&s.ecam[..s.windows], bus, devfn)?;
+    // SAFETY: a dword of segment 0's configuration space, in a window `init`
+    // checked lies inside the physical map; reading it has no effect.
     let read = |reg: u64| unsafe { phys.ptr(at + reg).cast::<u32>().read_volatile() };
     if read(0) & 0xFFFF == 0xFFFF || (read(0x0C) >> 16) & 0x7F != 1 {
         return None;

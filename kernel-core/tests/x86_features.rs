@@ -128,3 +128,60 @@ fn only_a_device_a_driven_unit_covers_is_confined() {
     assert!(!covered(1 << 16 | id(0, 1, 0), true, &scopes, bridge), "another segment's device");
     assert!(!covered(id(0, 1, 0), false, &[], bridge), "no scope and no unit covering the rest: nothing");
 }
+
+/// A bridge whose buses are not numbered (secondary 0, as an empty root
+/// port's may be) leads nowhere: a path crossing it names nothing, and a
+/// sub-hierarchy below it holds no bus. Crossing one fell back to bus 0,
+/// so a scope through an unnumbered 00:02.0 to (5, 0) covered 00:05.0
+/// (the review of 2026-11-27). Each crossing needs the bridge's buses
+/// below its own (`at < secondary <= subordinate`), as the device
+/// manager's scan requires.
+#[test]
+fn a_path_through_an_unnumbered_bridge_reaches_nothing() {
+    use kernel_core::x86::{Scope, covered};
+    let scope = |sub: bool, path: &[(u8, u8)]| {
+        let mut s = Scope { sub, start_bus: 0, len: path.len() as u8, ..Default::default() };
+        s.path[..path.len()].copy_from_slice(path);
+        s
+    };
+    let id = |bus: u32, dev: u32, func: u32| bus << 8 | dev << 3 | func;
+    let unnumbered = |bus: u8, devfn: u8| ((bus, devfn) == (0, 0x10)).then_some((0, 0));
+    assert!(!covered(id(0, 5, 0), false, &[scope(false, &[(2, 0), (5, 0)])], unnumbered), "a path through an unnumbered bridge");
+    assert!(!covered(id(0, 1, 0), false, &[scope(true, &[(2, 0)])], unnumbered), "below an unnumbered bridge");
+    // Buses that go backwards or upside down are no more numbered.
+    let backwards = |bus: u8, devfn: u8| ((bus, devfn) == (3, 0x10)).then_some((2, 5));
+    let mut s = scope(false, &[(2, 0), (5, 0)]);
+    s.start_bus = 3;
+    assert!(!covered(id(2, 5, 0), false, &[s], backwards), "a secondary bus at or before the bridge's own");
+    let inverted = |bus: u8, devfn: u8| ((bus, devfn) == (0, 0x10)).then_some((4, 2));
+    assert!(!covered(id(3, 0, 0), false, &[scope(true, &[(2, 0)])], inverted), "a subordinate bus before the secondary");
+    // Numbered, the same scopes reach what is below.
+    let numbered = |bus: u8, devfn: u8| ((bus, devfn) == (0, 0x10)).then_some((1, 1));
+    assert!(covered(id(1, 5, 0), false, &[scope(false, &[(2, 0), (5, 0)])], numbered));
+    assert!(covered(id(1, 0, 0), false, &[scope(true, &[(2, 0)])], numbered));
+}
+
+/// Configuration space is at the MCFG window's base plus the bus's own
+/// offset: the base is bus 0's address even when the window starts at a
+/// later bus (PCI Firmware Specification 3.2, table 4-3). Counting from the
+/// window's first bus read another bus's devices (the review of
+/// 2026-11-27). A bus outside every window has none; a window is used only
+/// where its buses lie inside the kernel's physical map.
+#[test]
+fn configuration_space_is_found_from_bus_zero_s_address() {
+    use kernel_core::x86::{ecam_address, ecam_window_fits};
+    let windows = [(0xE000_0000u64, 0x10u8, 0x1Fu8), (0xF000_0000, 0x80, 0x80)];
+    assert_eq!(ecam_address(&windows, 0x10, 0), Some(0xE000_0000 + (0x10 << 20)));
+    assert_eq!(ecam_address(&windows, 0x1F, 0xFF), Some(0xE000_0000 + (0x1F << 20 | 0xFF << 12)));
+    assert_eq!(ecam_address(&windows, 0x80, 0x08), Some(0xF000_0000 + (0x80 << 20 | 0x08 << 12)));
+    assert_eq!(ecam_address(&windows, 0x0F, 0), None, "before the first window");
+    assert_eq!(ecam_address(&windows, 0x20, 0), None, "between windows");
+    assert_eq!(ecam_address(&[], 0, 0), None);
+    let limit = 0x1_0000_0000;
+    assert!(ecam_window_fits((0xE000_0000, 0x10, 0x1F), limit));
+    assert!(ecam_window_fits((0xF000_0000, 0x00, 0xFF), limit), "its last bus ending at the map's end");
+    assert!(!ecam_window_fits((0xF010_0000, 0x00, 0xFF), limit), "its last bus past the map");
+    assert!(ecam_window_fits((0xF000_0000, 0x00, 0x0F), limit));
+    assert!(!ecam_window_fits((0xE000_8000, 0x00, 0x0F), limit), "a base not on a 1 MiB boundary");
+    assert!(!ecam_window_fits((!0xF_FFFF, 0, 0xFF), u64::MAX), "a window whose end wraps");
+}

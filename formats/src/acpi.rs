@@ -342,23 +342,28 @@ pub fn mcfg_buses(mcfg: &[u8], segment: u16) -> Option<u64> {
 }
 
 /// Where segment `segment`'s configuration space is (MCFG, PCI Firmware
-/// Specification 3.2 section 4.1.2): the physical address of its window,
-/// and the first and last bus the window covers (the window begins at the
-/// first bus's). The first entry for the segment, if any.
-pub fn mcfg_window(mcfg: &[u8], segment: u16) -> Option<(u64, u8, u8)> {
-    let entries = mcfg.get(44..)?;
-    entries.as_chunks::<16>().0.iter().find(|e| u16::from_le_bytes([e[8], e[9]]) == segment && e[10] <= e[11]).map(|e| {
-        let base = u64::from_le_bytes([e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]]);
-        (base, e[10], e[11])
-    })
+/// Specification 3.2 section 4.1.2): each of its entries' base address and
+/// first and last bus. The base is bus 0's address whatever bus the entry
+/// starts at: bus `b` of the entry is at `base + (b << 20)`.
+pub fn mcfg_windows(mcfg: &[u8], segment: u16) -> impl Iterator<Item = (u64, u8, u8)> + '_ {
+    mcfg.get(44..)
+        .unwrap_or(&[])
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .filter(move |e| u16::from_le_bytes([e[8], e[9]]) == segment && e[10] <= e[11])
+        .map(|e| {
+            let base = u64::from_le_bytes([e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]]);
+            (base, e[10], e[11])
+        })
 }
 
 #[cfg(test)]
 mod mcfg {
-    use super::{mcfg_buses, mcfg_window};
+    use super::{mcfg_buses, mcfg_windows};
 
     #[test]
-    fn a_segments_window_is_its_first_entry() {
+    fn a_segments_windows_are_its_entries() {
         let mut t = std::vec![0u8; 44];
         for (base, seg, start, end) in [(0xB000_0000u64, 1u16, 0u8, 7u8), (0xE000_0000, 0, 0, 255), (0xF000_0000, 0, 0, 3)] {
             let mut e = std::vec![0u8; 16];
@@ -367,10 +372,11 @@ mod mcfg {
             (e[10], e[11]) = (start, end);
             t.extend(e);
         }
-        assert_eq!(mcfg_window(&t, 0), Some((0xE000_0000, 0, 255)));
-        assert_eq!(mcfg_window(&t, 1), Some((0xB000_0000, 0, 7)));
-        assert_eq!(mcfg_window(&t, 2), None);
-        assert_eq!(mcfg_window(&t[..50], 0), None, "a truncated entry is none");
+        let all = |s: u16| mcfg_windows(&t, s).collect::<std::vec::Vec<_>>();
+        assert_eq!(all(0), [(0xE000_0000, 0, 255), (0xF000_0000, 0, 3)]);
+        assert_eq!(all(1), [(0xB000_0000, 0, 7)]);
+        assert!(all(2).is_empty());
+        assert_eq!(mcfg_windows(&t[..50], 0).count(), 0, "a truncated entry is none");
     }
     extern crate std;
 
