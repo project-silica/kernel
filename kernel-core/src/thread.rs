@@ -551,7 +551,9 @@ impl<H: Hal> Kernel<H> {
     fn expire(&self, now: u64) {
         let me = self.me();
         let mut global = false;
-        let mut payer = 0;
+        // The thread this entry took every lock for, whose share was asked
+        // before it did (the wait for the locks is its to pay for).
+        let mut entered_for = 0;
         loop {
             let t = me.timers.get();
             if t == 0 || self.thread(t).deadline.get() > now {
@@ -569,18 +571,30 @@ impl<H: Hal> Kernel<H> {
                 REPLY => true,
                 _ => false,
             };
-            if !global && self.ncpu() > 1 && elsewhere {
+            if self.ncpu() > 1 && elsewhere {
                 // Taking every lock for it is its context's to pay for, as
-                // a system call that does is: one that has used its share
-                // has its timeout delivered when the share is back.
-                if let Some(wait) = self.share_back_in(me, t, now) {
+                // a system call that does is, each one's for itself: one
+                // that has used its share has its timeout delivered when
+                // the share is back (before, only the first of an entry was
+                // asked and paid for every other: the review of
+                // audit-kernel-stalls).
+                if t != entered_for
+                    && let Some(wait) = self.share_back_in(me, t, now)
+                {
                     self.timer_remove(t);
                     self.timer_insert(t, now.saturating_add(wait));
                     continue;
                 }
-                self.go_global();
-                global = true;
-                payer = t;
+                if !global {
+                    self.go_global();
+                    global = true;
+                    entered_for = t;
+                    continue;
+                }
+                entered_for = 0;
+                self.cancel(t, false);
+                self.wake(t, Err(Error::Timeout));
+                self.spent_global(me, t);
                 continue;
             }
             if th.state.get() == THROTTLED {
@@ -593,7 +607,6 @@ impl<H: Hal> Kernel<H> {
             self.wake(t, Err(Error::Timeout));
         }
         if global {
-            self.spent_global(me, payer);
             self.go_local();
         }
         if now >= me.preempt_at.get() {

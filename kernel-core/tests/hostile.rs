@@ -1458,3 +1458,64 @@ fn an_unmap_of_a_range_finishes_while_frames_are_moved() {
     }
     assert_eq!(a_done, Some(a_n), "an unmap whose place a frame's holder moved meanwhile did not finish with its count");
 }
+
+/// Timeouts of waiters in a queue another processor owns are delivered
+/// holding every lock, each paid for by its own thread's context: in one
+/// pass over the timers, one whose context has used its share has its
+/// timeout delivered when the share is back, even after another's took
+/// every lock (before, only the first was asked, and it paid for all: the
+/// review of audit-kernel-stalls).
+#[test]
+fn every_timeout_that_takes_every_lock_is_paid_for_by_its_own_context() {
+    use kernel_core::thread::{RECEIVING, THROTTLED};
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    // An endpoint, and a thread on processor 1 that receives on it too.
+    m.retype(ut, T::Endpoint, 0, FREE, 1);
+    m.spawn(ut, FREE + 20);
+    m.move_to(FREE + 20, 1);
+    m.settle(1);
+    m.on(0);
+    // Two contexts on processor 0: the victim's, and the flood's.
+    m.retype(ut, T::SchedContext, 0, FREE + 1, 2);
+    for g in [FREE + 1, FREE + 2] {
+        m.ok(S::SchedConfigure, [g, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    }
+    let bind = |slot: u64, g: u64| {
+        let t = m.spawn(ut, slot);
+        m.ok(S::ThreadControl, [slot, 2, g, 0, 0, 0]);
+        t
+    };
+    let victim = bind(FREE + 3, FREE + 1);
+    let flooder = bind(FREE + 4, FREE + 2);
+    let flood = bind(FREE + 5, FREE + 2);
+    // Both wait on the endpoint with deadlines, the victim's first.
+    let deadline = m.k.hal.now.get() + 1_000;
+    assert!(m.sys_as(victim, S::Recv, [FREE, deadline, 0, 0, 0, 0]).blocked);
+    assert!(m.sys_as(flooder, S::Recv, [FREE, deadline + 1, 0, 0, 0, 0]).blocked);
+    // The queue becomes processor 1's: the last to wait on it is there.
+    m.on(1);
+    assert!(m.sys_as(m.cap(FREE + 20).unwrap().obj, S::Recv, [FREE, 0, 0, 0, 0, 0]).blocked);
+    m.on(0);
+    // The flood uses up its context's share of time holding every lock.
+    m.k.hal.now_step.set(10_000);
+    m.retype(ut, T::Endpoint, 0, FREE + 6, 1);
+    let mut calls = 0;
+    while m.k.thread_view(flood).state != THROTTLED {
+        let call = if m.cap(FREE + 7).is_none() {
+            (S::CapCopy, [SLOT_CAPSPACE, FREE + 7, FREE + 6, 15, 0, 0])
+        } else {
+            (S::CapDelete, [FREE + 7, 0, 0, 0, 0, 0])
+        };
+        m.sys_as(flood, call.0, call.1);
+        calls += 1;
+        assert!(calls < 100_000);
+    }
+    m.k.hal.now_step.set(0);
+    // Both deadlines pass, close enough that the flood's share is not back.
+    m.k.hal.now.set(m.k.hal.now.get().max(deadline + 2));
+    m.tick();
+    assert_eq!(m.k.thread_view(victim).state, RUNNABLE, "the victim's timeout was delivered");
+    assert_eq!(m.k.thread_view(flooder).state, RECEIVING, "a timeout whose context had used its share rode on another's");
+}
