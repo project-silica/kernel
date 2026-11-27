@@ -252,6 +252,55 @@ pub fn crc32c(data: &[u8]) -> u32 {
     !crc32c_update(!0, data)
 }
 
+/// How many bytes the archive of `entries` (name and bytes) takes, or
+/// `None` when they make no archive: too many, a name the format does not
+/// allow (or one twice), a size past the address space.
+pub fn archive_len(entries: &[(&str, &[u8])]) -> Option<usize> {
+    if entries.len() > MAX_ENTRIES {
+        return None;
+    }
+    for (i, (name, _)) in entries.iter().enumerate() {
+        if !name_ok(name.as_bytes()) || entries[..i].iter().any(|(n, _)| n == name) {
+            return None;
+        }
+    }
+    let mut len = align(HEADER.checked_add(ENTRY.checked_mul(entries.len())?)?)?;
+    for (_, data) in entries {
+        len = align(len.checked_add(data.len())?)?;
+    }
+    Some(len)
+}
+
+/// Write the archive of `entries` (name and bytes, in this order) into the
+/// start of `out`, which must be zeros for at least [`archive_len`] bytes
+/// (padding is not written), and return its length. What it writes passes
+/// [`check`]: the archive a loader or a program makes is read by the same
+/// rules as the image builder's. `None`, with nothing written, when the
+/// entries make no archive or `out` is too short. `crc` continues a CRC32C
+/// as for [`check`].
+pub fn write(entries: &[(&str, &[u8])], out: &mut [u8], crc: impl Fn(u32, &[u8]) -> u32) -> Option<usize> {
+    let len = archive_len(entries)?;
+    let out = out.get_mut(..len)?;
+    let table_end = HEADER + ENTRY * entries.len();
+    let mut at = align(table_end)?;
+    for (i, (name, data)) in entries.iter().enumerate() {
+        let e = HEADER + i * ENTRY;
+        out[e..e + name.len()].copy_from_slice(name.as_bytes());
+        out[e + 32..e + 40].copy_from_slice(&(at as u64).to_le_bytes());
+        out[e + 40..e + 48].copy_from_slice(&(data.len() as u64).to_le_bytes());
+        out[at..at + data.len()].copy_from_slice(data);
+        at = align(at + data.len())?;
+    }
+    out[..8].copy_from_slice(&MAGIC);
+    out[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    out[12..16].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    out[16..24].copy_from_slice(&(len as u64).to_le_bytes());
+    // The checksum, over the archive with its own field (still zeros).
+    let sum = !crc(!0, out);
+    out[24..28].copy_from_slice(&sum.to_le_bytes());
+    Some(len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +318,29 @@ mod tests {
         for split in [0, 1, 7, 8, 9, 500, 999, 1000] {
             assert_eq!(!crc32c_update(crc32c_update(!0, &data[..split]), &data[split..]), crc32c(&data));
         }
+    }
+
+    /// What [`write`] makes passes [`check`] and reads back as it was
+    /// given; what makes no archive is refused with nothing written.
+    #[test]
+    fn what_is_written_is_an_archive_of_what_was_given() {
+        let big: std::vec::Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
+        for given in [
+            &[][..],
+            &[("drivers", &b"pci 1af4:1041 virtio-net\n"[..])][..],
+            &[("a", &[][..]), ("b.c", &big[..]), ("d-e_f", &[9; 17][..])][..],
+        ] {
+            let len = archive_len(given).unwrap();
+            let mut out = std::vec![0u8; len + 64];
+            assert_eq!(write(given, &mut out, crc32c_update), Some(len));
+            assert_eq!(check(&out[..len], crc32c_update), Ok(()));
+            let read: std::vec::Vec<_> = entries(&out[..len]).collect();
+            assert_eq!(read, given.to_vec());
+        }
+        let mut out = std::vec![0u8; 4096];
+        assert_eq!(write(&[("x", &[1][..]), ("x", &[2][..])], &mut out, crc32c_update), None, "a name twice");
+        assert_eq!(write(&[("no/slash", &[1][..])], &mut out, crc32c_update), None, "a name the format refuses");
+        assert_eq!(write(&[("x", &[1; 5000][..])], &mut out, crc32c_update), None, "too short a buffer");
+        assert!(out.iter().all(|&b| b == 0), "nothing was written");
     }
 }

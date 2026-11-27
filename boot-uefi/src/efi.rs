@@ -58,13 +58,32 @@ pub struct ConfigTable {
     pub table: *const c_void,
 }
 
-/// EFI_RUNTIME_SERVICES, up to GetTime.
+/// EFI_RUNTIME_SERVICES, up to SetVariable (UEFI 2.10, section 4.5).
 #[repr(C)]
 pub struct RuntimeServices {
     hdr: [u8; 24],
     /// GetTime(Time, Capabilities).
     pub get_time: unsafe extern "efiapi" fn(*mut Time, *mut c_void) -> Status,
+    set_time: usize,
+    get_wakeup_time: usize,
+    set_wakeup_time: usize,
+    set_virtual_address_map: usize,
+    convert_pointer: usize,
+    /// GetVariable(Name, VendorGuid, Attributes (optional), DataSize, Data).
+    pub get_variable: unsafe extern "efiapi" fn(*const u16, *const Guid, *mut u32, *mut usize, *mut c_void) -> Status,
+    get_next_variable_name: usize,
+    /// SetVariable(Name, VendorGuid, Attributes, DataSize, Data).
+    pub set_variable: unsafe extern "efiapi" fn(*const u16, *const Guid, u32, usize, *const c_void) -> Status,
 }
+
+/// EFI_VARIABLE_NON_VOLATILE: kept across resets.
+pub const VARIABLE_NON_VOLATILE: u32 = 1;
+/// EFI_VARIABLE_BOOTSERVICE_ACCESS: readable while boot services run.
+/// Without EFI_VARIABLE_RUNTIME_ACCESS (4), not after ExitBootServices:
+/// no operating system can ask the firmware for it.
+pub const VARIABLE_BOOTSERVICE_ACCESS: u32 = 2;
+/// Silica's vendor GUID for its UEFI variables (generated for it).
+pub const SILICA_VARIABLES: Guid = Guid(0x5C1A_1CA0, 0x2026, 0x4B27, [0x9E, 0x5A, 0x71, 0xCA, 0x5E, 0xC2, 0xE7, 0x01]);
 
 /// EFI_TIME.
 #[repr(C)]
@@ -217,6 +236,9 @@ pub const MEM_BS_CODE: u32 = 3;
 pub const MEM_BS_DATA: u32 = 4;
 /// EfiConventionalMemory.
 pub const MEM_CONVENTIONAL: u32 = 7;
+/// EfiRuntimeServicesCode and EfiRuntimeServicesData.
+pub const MEM_RUNTIME_CODE: u32 = 5;
+pub const MEM_RUNTIME_DATA: u32 = 6;
 /// OS-defined memory type: the kernel image and boot page tables.
 pub const MEM_SILICA_KERNEL: u32 = 0x8000_0001;
 /// OS-defined memory type: the ramdisk.
