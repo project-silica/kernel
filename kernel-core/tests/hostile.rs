@@ -1320,3 +1320,43 @@ fn deleting_many_address_space_capabilities_kicks_each_processor_once() {
     let kicks = m.k.hal.kicks.borrow()[before..].iter().filter(|k| k.0 == 1).count();
     assert!(kicks <= 1, "processor 1 was kicked {kicks} times for one revoke of 500 copies");
 }
+
+/// A page table given back (its last mapping gone) may still be cached by
+/// another processor, at whatever level it was, until that processor is
+/// told the space's mappings changed; the telling is put off to the end of
+/// the global entry (`shoot_later`). Reused before that, in the same
+/// entry, as a table of another level, it would give that processor a walk
+/// through whatever the new table points at: any physical memory (the
+/// review of audit-kernel-stalls). Here one global entry finishes emptying
+/// a CapSpace, unmapping a frame alone in its tables, and then answers a
+/// fault by mapping a frame where new tables are needed: the others are
+/// told before any table given back is taken again.
+#[test]
+fn a_table_given_back_is_not_reused_before_the_others_are_told() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Endpoint, 0, FREE, 1);
+    m.retype(ut, T::CapSpace, 12, FREE + 1, 1);
+    m.retype(ut, T::Frame, 12, FREE + 2, 2);
+    let asp = m.cap(SLOT_ASPACE).unwrap().obj;
+    // A frame alone in its tables, its capability late in a CapSpace whose
+    // emptying stops before it reaches it.
+    m.ok(S::Map, [SLOT_ASPACE, FREE + 2, 0x6000_0000, 3, 0, 0]);
+    m.ok(S::CapMove, [FREE + 1, 3000, FREE + 2, 0, 0, 0]);
+    // A thread of this space faults to the root task.
+    let t = m.spawn(ut, FREE + 4);
+    m.ok(S::ThreadConfigure, [FREE + 4, KEEP, KEEP, FREE, KEEP, 0]);
+    while m.k.current() != t {
+        m.sys(S::Yield, [0; 6]);
+    }
+    m.fault(Fault::Page, 0x7000_0123, 6);
+    m.ok(S::Recv, [FREE, 0, 0, 0, 0, 0]);
+    assert!(one_entry_beside_a_waiter(&m, S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]));
+    assert!(m.k.translate(asp, 0x6000_0000).is_some(), "the emptying reached the frame in its first entry");
+    // The answer (a capability in it: the general path, every lock) maps
+    // a frame where new tables are needed, in the entry that finishes the
+    // emptying and so gives the frame's tables back.
+    m.ok(S::ReplyRecv, [0, MsgInfo::with_caps(0, 4, 1).0, silica_abi::FAULT_MAP, SLOT_ASPACE, FREE + 3, 0x7000_0000 | 3]);
+    assert!(m.k.translate(asp, 0x6000_0000).is_none());
+    assert_eq!(m.k.translate(asp, 0x7000_0123), Some(m.cap(FREE + 3).unwrap().obj + 0x123));
+}

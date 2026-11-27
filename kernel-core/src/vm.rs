@@ -188,6 +188,14 @@ impl<H: Hal> Kernel<H> {
         let shared = self.ncpu() > 1 && !self.global.get();
         if shared {
             self.structure.lock();
+        } else {
+            // In a global entry that removed mappings (`shoot_later`), the
+            // others are told before a table page or a frame given back
+            // can be used again: one of them may still cache a table at
+            // the level it was, and walk it as whatever it becomes (the
+            // review of audit-kernel-stalls). (A local entry has nothing
+            // to tell: it is told when every lock goes.)
+            self.shoot_pending();
         }
         let r = self.map_locked::<IO>(a, fs, vaddr, rights);
         if shared {
@@ -416,6 +424,10 @@ impl<H: Hal> Kernel<H> {
     fn take_table(&self, a: Paddr, h: &AsHeader) -> Paddr {
         let f = h.free.get();
         if f != 0 {
+            // A table page given back may still be cached by another
+            // processor at whatever level it was: it is reused only once
+            // they have been told (`map_with_lock` sees to it).
+            debug_assert!(self.me().shoot.get() != a + PAGE, "a table page is reused before the others are told it was given back");
             h.free.set(self.phys.word(f).get());
             self.phys.word(f).set(0);
             h.nfree.set(h.nfree.get() - 1);
