@@ -402,6 +402,14 @@ extern "rust-preserve-none" fn schedule_rust() {
 extern "rust-preserve-none" fn trap_user(vector: u64, err: u64) -> ! {
     let k = super::kernel();
     percpu().mode.enter_kernel();
+    // The platform's NMI, or the request to stop (`super::nmi`), before
+    // this processor's lock: a processor waiting for its lock, held by one
+    // that panicked, must still hear the request to stop. `nmi` takes no
+    // lock and reads no per-processor data.
+    if vector == 2 {
+        super::nmi();
+        unblock_nmis();
+    }
     k.enter();
     match vector {
         14 => {
@@ -415,11 +423,8 @@ extern "rust-preserve-none" fn trap_user(vector: u64, err: u64) -> ! {
             k.fault(Fault::Page, cr2, access);
         }
         6 => k.fault(Fault::Instruction, 0, 0),
-        // The platform's NMI, or the request to stop (`super::nmi`).
-        2 => {
-            super::nmi();
-            unblock_nmis();
-        }
+        // Handled above, before the lock.
+        2 => {}
         // A machine check consumed by the program: its fault (`super::machine_check_user`).
         18 => super::machine_check_user(k),
         8 => panic!("double fault (error {err:#x}) in user mode"),
