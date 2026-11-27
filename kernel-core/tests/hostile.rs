@@ -1519,3 +1519,55 @@ fn every_timeout_that_takes_every_lock_is_paid_for_by_its_own_context() {
     assert_eq!(m.k.thread_view(victim).state, RUNNABLE, "the victim's timeout was delivered");
     assert_eq!(m.k.thread_view(flooder).state, RECEIVING, "a timeout whose context had used its share rode on another's");
 }
+
+/// A fault the thread would not make again where it was (a breakpoint: the
+/// saved instruction pointer is past it) is never held back for its
+/// context's share: held back, the thread went on past it when the share
+/// came back and the fault was lost (the review of audit-kernel-stalls). It
+/// is sent, and charged after.
+#[test]
+fn a_fault_that_does_not_recur_is_sent_when_its_context_has_no_share_left() {
+    use kernel_core::thread::{SENDING, THROTTLED};
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.spawn(ut, FREE + 20);
+    m.move_to(FREE + 20, 1);
+    m.settle(1);
+    m.on(0);
+    m.retype(ut, T::SchedContext, 0, FREE, 1);
+    m.ok(S::SchedConfigure, [FREE, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    m.retype(ut, T::Endpoint, 0, FREE + 1, 2);
+    let bind = |slot: u64| {
+        let t = m.spawn(ut, slot);
+        m.ok(S::ThreadControl, [slot, 2, FREE, 0, 0, 0]);
+        t
+    };
+    let flood = bind(FREE + 3);
+    let x = bind(FREE + 4);
+    // Nobody receives on its fault endpoint: the fault takes every lock.
+    m.ok(S::ThreadConfigure, [FREE + 4, KEEP, KEEP, FREE + 1, KEEP, 0]);
+    m.ok(S::ThreadControl, [FREE + 4, 0, 0, 0, 0, 0]);
+    // The context's share of time holding every lock is used up.
+    m.k.hal.now_step.set(10_000);
+    let mut calls = 0;
+    while m.k.thread_view(flood).state != THROTTLED {
+        let call = if m.cap(FREE + 5).is_none() {
+            (S::CapCopy, [SLOT_CAPSPACE, FREE + 5, FREE + 2, 15, 0, 0])
+        } else {
+            (S::CapDelete, [FREE + 5, 0, 0, 0, 0, 0])
+        };
+        m.sys_as(flood, call.0, call.1);
+        calls += 1;
+        assert!(calls < 100_000);
+    }
+    m.k.hal.now_step.set(0);
+    m.ok(S::ThreadControl, [FREE + 4, 1, 0, 0, 0, 0]);
+    m.sys_as(x, S::Yield, [0; 6]);
+    while m.k.current() != x {
+        m.sys(S::Yield, [0; 6]);
+    }
+    // A breakpoint (x86 vector 3: a trap, its instruction pointer past it).
+    m.fault(Fault::Exception, 3, 0);
+    assert_eq!(m.k.thread_view(x).state, SENDING, "a breakpoint was held back, to be lost when the share came back");
+}
