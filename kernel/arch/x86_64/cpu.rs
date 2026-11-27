@@ -283,6 +283,13 @@ pub unsafe fn init(t: *mut Tables, index: usize, apic_id: u32, stack: (u64, u64)
         (*t).gdt[5] = 0x0000_8900_0000_0067 | (tss & 0xFF_FFFF) << 16 | (tss >> 24 & 0xFF) << 56;
         (*t).gdt[6] = tss >> 32;
         (*t).tss.rsp0 = stack.1;
+        // The NMI, double-fault and machine-check stack starts 16-byte
+        // aligned (the processor aligns it so, and the frame must be where
+        // `paranoid_common` looks), and the word above it holds this
+        // processor's PerCpu address: how that entry tells whose GS base is
+        // loaded, wherever it interrupted.
+        let ist = (ist - 16) & !15;
+        *(ist as *mut u64).add(1) = &raw const (*t).percpu as u64;
         (*t).tss.ist[0] = ist;
         (*t).percpu.kstack = stack.1;
         (*t).percpu.stack = stack;
@@ -409,7 +416,10 @@ extern "rust-preserve-none" fn trap_user(vector: u64, err: u64) -> ! {
         }
         6 => k.fault(Fault::Instruction, 0, 0),
         // The platform's NMI, or the request to stop (`super::nmi`).
-        2 => super::nmi(),
+        2 => {
+            super::nmi();
+            unblock_nmis();
+        }
         // A machine check consumed by the program: its fault (`super::machine_check_user`).
         18 => super::machine_check_user(k),
         8 => panic!("double fault (error {err:#x}) in user mode"),
@@ -650,9 +660,12 @@ trap_common:
 // NMI, double fault and machine check (on their own stack): from user mode
 // the ordinary entry; in the kernel they may arrive where GS is still the
 // user's (between `syscall` and its `swapgs`, or after the `swapgs` on the
-// way out), so the GS base itself says whose it is: a kernel address (bit
-// 63 set) is the kernel's, else it is swapped in now and back on the way
-// out. Ordinary interrupts never arrive there and keep the cheaper path.
+// way out), so the GS base is compared with this processor's own PerCpu
+// address, which `init` keeps in the word above this stack: the kernel's,
+// or it is swapped in now and back on the way out. (It was told by the
+// sign of the GS base, which a program can make negative with WRGSBASE:
+// such an NMI ran the kernel on the program's GS base.) Ordinary
+// interrupts never arrive there and keep the cheaper path.
 paranoid_common:
     cld
     test byte ptr [rsp + 24], 3
@@ -674,9 +687,13 @@ paranoid_common:
     push rax
     mov ecx, 0xC0000101
     rdmsr
+    shl rdx, 32
+    or rax, rdx
     xor r12d, r12d
-    test edx, edx
-    js 3f
+    // Above the 15 registers, the vector and error code, and the
+    // processor's 5 words: the word `init` put above the stack.
+    cmp rax, [rsp + 184]
+    je 3f
     swapgs
     mov r12d, 1
 3:
@@ -742,3 +759,32 @@ trap_stubs:
     trap_user = sym trap_user,
     trap_kernel = sym trap_kernel,
 );
+
+/// Let NMIs in again after one taken from user mode. The processor holds
+/// further NMIs off from the NMI until its next IRET, and the way back to
+/// user mode may be SYSRET (when the thread that runs next entered by a
+/// system call), which does not end that: until some later IRET, every NMI
+/// to this processor waited, a panic's request to stop among them (the
+/// review of kernel hot-paths). An IRET to the next instruction, in kernel
+/// mode on this stack with these flags (interrupts stay off), ends it.
+fn unblock_nmis() {
+    // SAFETY: builds an interrupt frame for the instruction after IRETQ,
+    // with this stack, these flags and the kernel's selectors, and returns
+    // to it; the kernel has no red zone below the stack pointer to clobber.
+    unsafe {
+        asm!(
+            "mov {t:e}, ss",
+            "push {t}",
+            "lea {t}, [rsp + 8]",
+            "push {t}",
+            "pushfq",
+            "mov {t:e}, cs",
+            "push {t}",
+            "lea {t}, [rip + 2f]",
+            "push {t}",
+            "iretq",
+            "2:",
+            t = out(reg) _,
+        );
+    }
+}
