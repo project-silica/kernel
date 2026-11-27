@@ -669,14 +669,20 @@ impl<H: Hal> Kernel<H> {
             }
             // Choose afresh: queue the running thread (behind its equals if
             // it yielded) and pick.
+            let mut next = 0;
             if cur_ok {
                 if me.yielded.replace(false) && me.fq_first.get() != 0 && self.dl_of(cur).is_none() {
-                    self.requeue_yielded(me, cur);
+                    next = self.yield_within(me, cur);
+                    if next == 0 {
+                        self.requeue_yielded(me, cur);
+                    }
                 } else {
                     self.enqueue(me, cur);
                 }
             }
-            let next = self.pick(me, now);
+            if next == 0 {
+                next = self.pick(me, now);
+            }
             if next != 0 {
                 me.cur.set(next);
                 me.account.set(next);

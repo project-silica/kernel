@@ -707,6 +707,7 @@ impl<H: Hal> Kernel<H> {
 impl<H: Hal> Kernel<H> {
     /// The endpoint or notification capability at `index` of `t`'s
     /// CapSpace with `rights`, and its slot.
+    #[inline(always)]
     fn fast_cap(&self, t: Paddr, index: u64, ty: ObjectType, rights: Rights) -> Option<(Paddr, crate::cap::Cap)> {
         let slot = self.cslot(t, index).ok()?;
         let cap = self.slot(slot).cap()?;
@@ -933,6 +934,115 @@ impl<H: Hal> Kernel<H> {
         self.q_push(&q.head, &q.tail, t);
         th.state.set(RECEIVING);
         th.blocked_on.set(ep.obj);
+        true
+    }
+
+    /// `SignalRecv` of thread `t` (current on this processor), when what it
+    /// touches is this processor's: how a driver and its client, or any two
+    /// threads sharing a ring, hand each other work. The signal wakes the
+    /// notification's waiter or its listener, or is kept; the receive is a
+    /// wait on a notification, or (a server's loop: `serve_events`) a
+    /// receive on an endpoint nobody sends to yet while listening on the
+    /// notification the thread already listens on through the same slot.
+    /// It does what the general path does in those cases (`signal`, then
+    /// `wait` or the receive `recv` makes), the same steps with the same
+    /// effects on the scheduler; what it leaves out is deciding whether the
+    /// call is local and looking each capability up a second time. The
+    /// conditions are what those steps touch: the queues they change and
+    /// the threads they wake, each this processor's. (The general path asks
+    /// more of a queue's head, such as a waiter's park and descriptor,
+    /// which `signal` and `wait` do not use.)
+    ///
+    /// A round trip of two hand-offs (`bench=notify`: a driver's loop on
+    /// one side, a client waiting for completions on the other) took 1926
+    /// instructions on the general path when both sides waited on
+    /// notifications, 576 of them deciding whether it was local.
+    #[inline(never)]
+    pub(crate) fn fast_signal_recv(&self, t: Paddr) -> bool {
+        let r = &self.thread(t).regs;
+        let a = [r[H::ARG[0]].get(), r[H::ARG[1]].get(), r[H::ARG[2]].get(), r[H::ARG[3]].get()];
+        if a[2] != 0 {
+            return false;
+        }
+        let Some((_, wake)) = self.fast_cap(t, a[3], ObjectType::Notification, Rights::WRITE) else { return false };
+        let me = self.hal.cpu() as u64;
+        let th = self.thread(t);
+        let local = |x: Paddr| x == 0 || self.thread(x).cpu.get() == me;
+        let wq = self.queue(wake.obj);
+        if wq.owner.get() != me + 1 || wq.kind.get() == PARKED || !local(th.caller.get()) {
+            return false;
+        }
+        // Whom the signal wakes: the thread waiting on the notification
+        // (and its caller, as `queue_is_local` asks of a head), or its
+        // listener and the endpoint that one waits on (`listener_is_local`).
+        if wq.kind.get() == RECEIVERS {
+            let w = wq.head.get();
+            if !local(w) || !local(self.thread(w).caller.get()) {
+                return false;
+            }
+        }
+        let l = wq.listener().get();
+        if l != 0 && (!local(l) || (self.listener(wake.obj) != 0 && self.queue(self.thread(l).blocked_on.get()).owner.get() != me + 1)) {
+            return false;
+        }
+        let Ok(slot) = self.cslot(t, recv_slot(a[0])) else { return false };
+        let Some(from) = self.slot(slot).cap() else { return false };
+        if !from.rights.has(Rights::READ) {
+            return false;
+        }
+        let listen = listen_slot(a[0]);
+        let status = match from.ty {
+            ObjectType::Notification if listen == 0 => {
+                let fq = self.queue(from.obj);
+                if fq.owner.get() != me + 1 || fq.kind.get() == PARKED || fq.listener().get() != 0 {
+                    return false;
+                }
+                self.signal(wake.obj, wake.badge.max(1));
+                th.via_slot.set(slot);
+                self.wait(t, from.obj, a[1])
+            }
+            ObjectType::Endpoint if listen != 0 => {
+                // The server loop's steady state: already this notification's
+                // listener through this slot, nothing parked on it or waiting
+                // on it directly, nobody waiting on the endpoint yet.
+                let Some((ls, lc)) = self.fast_cap(t, listen, ObjectType::Notification, Rights::READ) else { return false };
+                let (nq, eq) = (self.queue(lc.obj), self.queue(from.obj));
+                if th.listen.get() != lc.obj
+                    || th.listen_slot.get() != ls
+                    || nq.listener().get() != t
+                    || nq.owner.get() != me + 1
+                    || nq.kind.get() != 0
+                    || eq.owner.get() != me + 1
+                    || eq.kind.get() != 0
+                {
+                    return false;
+                }
+                self.signal(wake.obj, wake.badge.max(1));
+                th.via_slot.set(slot);
+                // `recv` with the listener in place: what is pending on the
+                // notification is received, or the thread waits on the
+                // endpoint. (Waking a listener cannot have touched this
+                // endpoint: nobody waited on it.)
+                let word = nq.word.replace(0);
+                self.release_lines(lc.obj);
+                if word != 0 {
+                    th.regs[H::ARG[0]].set(word);
+                    th.regs[H::ARG[1]].set(MsgInfo::NOTIFIED.0);
+                    Ok(Exit::Done)
+                } else {
+                    th.park.set(0);
+                    self.wait_on(t, from.obj, a[1])
+                }
+            }
+            _ => return false,
+        };
+        // As `syscall_general` reports it. (Neither receive is ever
+        // preempted, and each fails only on its deadline.)
+        match status {
+            Ok(Exit::Blocked) => {}
+            Ok(_) => th.regs[H::SYS].set(0),
+            Err(e) => th.regs[H::SYS].set(e as u64),
+        }
         true
     }
 }

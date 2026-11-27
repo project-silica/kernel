@@ -146,7 +146,7 @@ static KERNEL: Global = Global(Kernel::new(
     },
     // SAFETY: the loader maps all physical memory at PHYS_MAP_BASE and the
     // kernel only uses addresses from the boot regions through it.
-    unsafe { Phys::new(PHYS_MAP_BASE as *mut u8) },
+    unsafe { Phys::direct_map() },
 ));
 
 /// The kernel.
@@ -313,7 +313,16 @@ impl Hal for X86 {
     fn switch_thread(&self, phys: &Phys, from: Paddr, to: Paddr, root: Paddr) {
         let kind = self.xsave_kind.get();
         let to_regs = kernel().regs(to);
-        let (fs, gs) = (canonical(to_regs[REG_FS_BASE].get()), canonical(to_regs[REG_GS_BASE].get()));
+        // The writes below cannot fault: a frame's FS and GS bases are only
+        // ever what this function read from the processor or the zero
+        // ThreadStart writes, and no system call or message writes them.
+        // The processor reads back only values its own writes accept
+        // (user mode's WRFSBASE faults on any other, by the same rule of
+        // what is canonical, 48 or 57 bits, that the kernel's WRFSBASE and
+        // WRMSR apply). Making them 48-bit canonical here cost every switch
+        // eight instructions for a case that cannot arise, and on a
+        // processor with 5-level paging zeroed bases user mode had set.
+        let (fs, gs) = (to_regs[REG_FS_BASE].get(), to_regs[REG_GS_BASE].get());
         // Extended state. A thread that entered the kernel by a system call
         // has no vector or x87 data to keep: the ABI says a system call
         // clobbers them, as a function call does. Only its control words are
@@ -600,19 +609,37 @@ impl Hal for X86 {
 
     fn cpu_slot(&self) -> usize {
         let s: usize;
-        // SAFETY: reads this processor's slot from its `PerCpu`; it never
-        // changes, so the read is pure.
+        // SAFETY: reads this processor's slot from its `PerCpu`. Kernel code
+        // never moves between processors and the GS base is set before any
+        // kernel code runs (`cpu::init`, out of line), so for all the
+        // compiler can see the value is a constant: `nomem` lets it read
+        // it once per function instead of after every store (five times
+        // in a context switch).
         unsafe {
-            asm!("mov {}, gs:[{off}]", out(reg) s, off = const core::mem::offset_of!(cpu::PerCpu, slot), options(nostack, pure, readonly, preserves_flags))
+            asm!("mov {}, gs:[{off}]", out(reg) s, off = const core::mem::offset_of!(cpu::PerCpu, slot), options(nostack, pure, nomem, preserves_flags))
         }
         s
+    }
+
+    fn cpu_state<'a>(&self, cpus: &'a kernel_core::smp::CpuTable) -> &'a kernel_core::smp::Cpu {
+        let _ = cpus;
+        let p: u64;
+        // SAFETY: `PerCpu::state` is this processor's entry in the kernel's
+        // table (`Kernel::cpu_state_of`, written by `cpu::init` before any
+        // kernel code runs here), and there is one kernel, a static: `cpus`
+        // is that table, so the entry lives as long as it. Constant for
+        // all kernel code, as in `cpu_slot` (`nomem`).
+        unsafe {
+            asm!("mov {}, gs:[{off}]", out(reg) p, off = const core::mem::offset_of!(cpu::PerCpu, state), options(nostack, pure, nomem, preserves_flags));
+            &*(p as *const kernel_core::smp::Cpu)
+        }
     }
 
     fn cpu(&self) -> usize {
         let i: usize;
         // SAFETY: reads this processor's index from its `PerCpu` (offset 40
-        // in `cpu::PerCpu`); it never changes, so the read is pure.
-        unsafe { asm!("mov {}, gs:[40]", out(reg) i, options(nostack, pure, readonly, preserves_flags)) }
+        // in `cpu::PerCpu`); constant for all kernel code, as in `cpu_slot`.
+        unsafe { asm!("mov {}, gs:[40]", out(reg) i, options(nostack, pure, nomem, preserves_flags)) }
         i
     }
 
@@ -923,11 +950,6 @@ const WAKE_ADVANCE_MAX_NS: u64 = 50_000;
 /// MXCSR and the x87 control word as the processor's initial state has them.
 const MXCSR_DEFAULT: u32 = 0x1F80;
 const FCW_DEFAULT: u32 = 0x037F;
-
-/// A user FS or GS base the processor accepts (it faults on a non-canonical one).
-fn canonical(v: u64) -> u64 {
-    if v < 1 << 47 || v >= !0 << 47 { v } else { 0 }
-}
 
 /// An interrupt from the local APIC or a device. `locked`: it interrupted
 /// user code and this processor holds its lock; otherwise it interrupted
@@ -1506,6 +1528,15 @@ pub extern "C" fn kmain(info: u64) -> ! {
         let (base, top, ist) = cpu::boot_stacks();
         cpu::init(cpu::boot_tables(), 0, 0, (base, top), ist);
     }
+    kmain_on_cpu(entered, bi)
+}
+
+/// The rest of [`kmain`], once the GS base is set: out of line, so that no
+/// read of the processor's index or slot (constant to the compiler,
+/// `Hal::cpu_slot`) can be placed before `cpu::init`.
+#[inline(never)]
+fn kmain_on_cpu(entered: u64, bi: BootInfo) -> ! {
+    let k = kernel();
     STARTED.store(true, Ordering::Release);
     init_processor(true);
     let apic_id = rdmsr(0x802) as u32;

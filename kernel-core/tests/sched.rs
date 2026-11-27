@@ -109,6 +109,38 @@ fn equal_threads_take_turns_promptly() {
     assert!(worst <= 7 * MS, "a runnable thread waited {worst} ns for its turn");
 }
 
+/// Threads of one context yielding in turn take turns in one fixed order,
+/// every one of them once a round, however many wait: a yield puts the
+/// yielder behind every waiting thread of its context and runs the first
+/// (`yield_within`, which takes the first before queuing the yielder).
+/// Time passes between yields, so the yielder has run more than the
+/// others; the run queues stay well formed throughout.
+#[test]
+fn yields_rotate_through_every_waiting_thread_in_order() {
+    let (m, ut) = machine();
+    let threads: Vec<u64> = (0..3).map(|i| m.spawn(ut, FREE + i)).collect();
+    let mut order = Vec::new();
+    for round in 0..8 {
+        for _ in 0..4 {
+            let cur = m.k.current();
+            order.push(cur);
+            m.k.hal.now.set(m.k.hal.now.get() + 10_000 + round * 1000);
+            m.sys_as(cur, S::Yield, [0; 6]);
+            m.k.check_runqueues().unwrap();
+        }
+    }
+    let first: Vec<u64> = order[..4].to_vec();
+    let mut all = first.clone();
+    all.sort_unstable();
+    let mut want: Vec<u64> = threads.clone();
+    want.push(m.root);
+    want.sort_unstable();
+    assert_eq!(all, want, "every thread runs once in a round: {order:x?}");
+    for (i, t) in order.iter().enumerate() {
+        assert_eq!(*t, first[i % 4], "round {} breaks the order: {order:x?}", i / 4);
+    }
+}
+
 #[test]
 fn a_deadline_reservation_gets_its_budget_and_no_more() {
     let (m, ut) = machine();

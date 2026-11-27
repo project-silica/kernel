@@ -42,6 +42,9 @@ pub struct PerCpu {
     /// The address of this processor's kernel lock (`Kernel::cpu_lock`),
     /// which the system-call entry takes before it saves anything.
     pub lock: u64,
+    /// The address of this processor's state in the kernel's table
+    /// (`Kernel::cpu_state_of`), for `Hal::cpu_state`.
+    pub state: u64,
     /// Its x2APIC identifier.
     pub apic_id: u32,
     /// Where the processor is; read by other processors.
@@ -120,6 +123,7 @@ impl Tables {
                 watch: kernel_core::sched::Watch::new(),
                 slot: 0,
                 lock: 0,
+                state: 0,
             },
         }
     }
@@ -268,6 +272,9 @@ pub unsafe fn init_idt() {
 /// # Safety
 /// Once per processor, early, with interrupts off; `t` and the stacks must
 /// live for ever and belong to this processor alone.
+/// Out of line: it sets the GS base, which `Hal::cpu_slot` and `Hal::cpu`
+/// read as constant (`nomem`), so no read of either may be moved into it.
+#[inline(never)]
 pub unsafe fn init(t: *mut Tables, index: usize, apic_id: u32, stack: (u64, u64), ist: u64) {
     // SAFETY: exclusive access to this processor's tables during its boot;
     // the descriptors built here describe memory that lives for ever.
@@ -283,6 +290,7 @@ pub unsafe fn init(t: *mut Tables, index: usize, apic_id: u32, stack: (u64, u64)
         (*t).percpu.index = index;
         (*t).percpu.slot = kernel_core::smp::cpu_slot(index);
         (*t).percpu.lock = super::kernel().cpu_lock(index) as *const kernel_core::lock::Lock as u64;
+        (*t).percpu.state = core::ptr::from_ref(super::kernel().cpu_state_of(index)) as u64;
         (*t).percpu.apic_id = apic_id;
         CPUS[index].store(t, Ordering::Release);
         let gdtr: [u16; 5] = pseudo(&raw const (*t).gdt as u64, 7 * 8 - 1);
@@ -344,12 +352,14 @@ unsafe extern "C" {
 ///
 /// It does not return: it schedules and goes straight to `restore_user`.
 /// Everything the thread had is in its frame, so nothing this function is
-/// called with needs keeping, and a function that never returns saves no
-/// registers for its caller: returning to the stub and calling the
+/// called with needs keeping: returning to the stub and calling the
 /// scheduler from there cost each system call a second call and twelve
 /// saves and restores (`profile.sh --lines`: 16 instructions at each of
-/// the two functions' entry and exit per round trip).
-extern "C" fn syscall_rust(contended: u64) -> ! {
+/// the two functions' entry and exit per round trip). Under the C
+/// convention it still saved the five registers a C caller keeps (rbx,
+/// r12 to r15) on every system call, for a caller it never returns to;
+/// under `preserve_none` it keeps none of them (`contended` comes in r12).
+extern "rust-preserve-none" fn syscall_rust(contended: u64) -> ! {
     let k = super::kernel();
     percpu().mode.enter_kernel();
     if contended == 0 {
@@ -367,14 +377,22 @@ extern "C" fn syscall_rust(contended: u64) -> ! {
     unsafe { asm!("jmp {r}", r = sym restore_user, options(noreturn)) }
 }
 
-extern "C" fn schedule_rust() {
+/// The way out of the kernel for a processor that was not entered from
+/// user mode (`exit_to_user`): `preserve_none`, as `syscall_rust`, since the
+/// stub needs nothing kept across it.
+extern "rust-preserve-none" fn schedule_rust() {
     let k = super::kernel();
     k.schedule();
     percpu().mode.leave_to_user();
     k.leave();
 }
 
-extern "C" fn trap_user(vector: u64, err: u64) {
+/// A trap or interrupt from user mode (`vector`, the error code `err`, in
+/// r12 and r13). It does not return, as `syscall_rust` does not: it
+/// schedules and goes to `restore_user` itself. Returning to the stub to
+/// call `schedule_rust` cost every fault and interrupt a second call, and
+/// under the C convention each saved the five registers a C caller keeps.
+extern "rust-preserve-none" fn trap_user(vector: u64, err: u64) -> ! {
     let k = super::kernel();
     percpu().mode.enter_kernel();
     k.enter();
@@ -398,6 +416,11 @@ extern "C" fn trap_user(vector: u64, err: u64) {
         32.. => super::irq(vector, true),
         v => k.fault(Fault::Exception, v, err),
     }
+    k.schedule();
+    percpu().mode.leave_to_user();
+    k.leave();
+    // SAFETY: as in `syscall_rust`.
+    unsafe { asm!("jmp {r}", r = sym restore_user, options(noreturn)) }
 }
 
 /// Registers pushed by the kernel-mode trap path.
@@ -464,7 +487,12 @@ syscall_entry:
     mov rax, gs:[{lock}]
     mov bl, 1
     xchg [rax], bl
-    mov [rsp + 16], rcx
+    // rcx and r11 hold the return address and flags (saved below as
+    // rip and rflags): a thread that entered by `syscall` resumes by
+    // `sysret`, which loads them from there, so their own slots (16, 80)
+    // are not written. Only the `iret` way out reads those, for a thread
+    // that entered by a trap (which writes them) or was started afresh
+    // (all zero).
     mov [rsp + 24], rdx
     mov [rsp + 32], rsi
     mov [rsp + 40], rdi
@@ -472,7 +500,6 @@ syscall_entry:
     mov [rsp + 56], r8
     mov [rsp + 64], r9
     mov [rsp + 72], r10
-    mov [rsp + 80], r11
     mov [rsp + 88], r12
     mov [rsp + 96], r13
     mov [rsp + 104], r14
@@ -482,8 +509,7 @@ syscall_entry:
     mov rax, gs:[16]
     mov [rsp + 136], rax
     mov qword ptr [rsp + 160], 1
-    movzx edi, bl
-    mov rbx, [rsp + 8]
+    movzx r12d, bl
     mov rsp, gs:[0]
     xor ebp, ebp
     call {syscall}
@@ -578,12 +604,12 @@ trap_common:
     mov [rax + 128], rbx
     mov rbx, [rsp + 40]
     mov [rax + 136], rbx
-    mov rdi, [rsp]
-    mov rsi, [rsp + 8]
+    mov r12, [rsp]
+    mov r13, [rsp + 8]
     mov rsp, gs:[0]
     xor ebp, ebp
     call {trap_user}
-    jmp exit_to_user
+    ud2
 2:
     lfence
     push r15
