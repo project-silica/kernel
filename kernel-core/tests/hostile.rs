@@ -1266,3 +1266,37 @@ fn a_flood_of_faults_that_take_every_lock_is_held_back() {
     }
     assert!(throttled, "{faults} faults that took every lock were never held back");
 }
+
+/// Inspect shows no physical address: what it gives as an object's
+/// identity is equal for all capabilities to one object and different for
+/// different objects, but none of the frame's, the Untyped's, the
+/// endpoint's or (as what a thread waits on) the queue's physical address,
+/// nor anything that keeps their order or distance (the 2026-11-27 audit:
+/// M13, N4: Inspect gave out physical addresses, a thread's `waits_on`
+/// among them, and with them the machine's memory layout).
+#[test]
+fn inspect_shows_identities_not_physical_addresses() {
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Frame, 12, FREE, 2);
+    m.retype(ut, T::Endpoint, 0, FREE + 2, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 3, FREE + 2, 15, 9, 0]);
+    let shown = |m: &Machine, s: u64| {
+        m.ok(S::Inspect, [SLOT_CAPSPACE, s, 0, 0, 0, 0]);
+        m.arg(m.root, 3)
+    };
+    let [f0, f1, e, e2, u] = [shown(&m, FREE), shown(&m, FREE + 1), shown(&m, FREE + 2), shown(&m, FREE + 3), shown(&m, ut)];
+    let addr = |s: u64| m.cap(s).unwrap().obj;
+    for (id, s) in [(f0, FREE), (f1, FREE + 1), (e, FREE + 2), (u, ut)] {
+        assert_ne!(id, addr(s), "Inspect showed the physical address of slot {s}'s object");
+    }
+    assert_eq!(e, e2, "two capabilities to one endpoint show one identity");
+    assert!(f0 != f1 && f0 != e && f1 != e, "different objects show different identities");
+    // Neighbouring frames 4 KiB apart are not shown 4 KiB apart.
+    assert_ne!(f1.wrapping_sub(f0), addr(FREE + 1).wrapping_sub(addr(FREE)));
+    // A thread waiting on the endpoint shows that identity.
+    let t = m.spawn(ut, FREE + 4);
+    assert!(m.sys_as(t, S::Recv, [FREE + 2, 0, 0, 0, 0, 0]).blocked);
+    m.ok(S::Inspect, [FREE + 4, 0, 0, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 4), e, "what it waits on, by identity");
+}

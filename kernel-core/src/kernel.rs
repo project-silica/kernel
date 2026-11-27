@@ -37,6 +37,8 @@ pub struct Kernel<H: Hal> {
     /// Held, with the holder's own processor lock, while mapping.
     pub(crate) structure: crate::lock::Lock,
     pub(crate) globals: Cell<u64>,
+    /// The key of the identities `Inspect` shows (`ident.rs`), set at boot.
+    pub(crate) ident_key: [Cell<u64>; 2],
     /// Objects waiting to be emptied (only used holding every lock).
     pub(crate) reap: Cell<u64>,
     /// The CapSpace being emptied, part done (0: none; `cap::drain_reap`).
@@ -68,6 +70,7 @@ impl<H: Hal> Kernel<H> {
             global: Cell::new(false),
             structure: crate::lock::Lock::new(),
             globals: Cell::new(0),
+            ident_key: [Cell::new(0), Cell::new(0)],
             reap: Cell::new(0),
             reaping: Cell::new(0),
             irqs: [const { (Cell::new(0), Cell::new(0)) }; silica_abi::IRQ_LINES as usize],
@@ -907,7 +910,8 @@ impl<H: Hal> Kernel<H> {
                 let r = &self.thread(t).regs;
                 let thread = |obj: Paddr| {
                     let th = self.thread(obj);
-                    [th.state.get(), th.cpu.get(), th.regs[H::IP].get(), th.regs[H::SP].get(), th.blocked_on.get(), 0]
+                    // What it waits on, by identity (`ident.rs`).
+                    [th.state.get(), th.cpu.get(), th.regs[H::IP].get(), th.regs[H::SP].get(), self.identity(th.blocked_on.get()), 0]
                 };
                 let isolated = |c: &crate::cap::Cap| {
                     let yes = c.ty == ObjectType::AddressSpace && c.flags & crate::cap::FLAG_ISOLATED != 0;
@@ -930,7 +934,10 @@ impl<H: Hal> Kernel<H> {
                                 v.cap.ty as u64,
                                 v.cap.rights.0 as u64,
                                 v.cap.bits as u64,
-                                v.cap.obj,
+                                // An identity, not the physical address
+                                // (`ident.rs`); a hardware capability's
+                                // range is its holder's to know.
+                                if v.cap.ty == ObjectType::Hw { v.cap.obj } else { self.identity(v.cap.obj) },
                                 v.cap.badge,
                                 v.depth as u64 | isolated(&v.cap),
                             ],
