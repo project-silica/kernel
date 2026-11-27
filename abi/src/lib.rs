@@ -155,7 +155,9 @@ pub enum Syscall {
     /// `a0` object type (0: empty), `a1` rights, `a2` size in bits, `a3` the
     /// object's identity (equal for capabilities to one object), `a4` badge,
     /// `a5` depth in the derivation tree (bits 0..16) and, from bit 16, whether an
-    /// address space is isolated against speculation (`INSPECT_ISOLATED`).
+    /// address space is isolated against speculation (`INSPECT_ISOLATED`) and
+    /// whether capabilities derived from this one still exist
+    /// (`INSPECT_DERIVED`).
     /// `a0` a Thread and `a1` 0: returns `a0` state (the `THREAD_` values),
     /// `a1` processor, `a2` instruction pointer, `a3` stack pointer, `a4`
     /// the identity of what it waits on.
@@ -366,6 +368,12 @@ pub const ASPACE_ISOLATED: u64 = 1 << 9;
 /// isolated against speculation (`ASPACE_ISOLATED`), so an owner can see
 /// which programs are.
 pub const INSPECT_ISOLATED: u64 = 1 << 16;
+/// `Inspect` of a slot: set in `a5` while a capability derived from the one in
+/// the slot (at any depth) exists anywhere. A provider that derives what it
+/// gives a holder from a capability of its own learns from it, and from
+/// nothing else, when the last thing it gave out has gone: then the state it
+/// keeps for that holder is nobody's and can be given back.
+pub const INSPECT_DERIVED: u64 = 1 << 17;
 /// `Console`: more of the same text follows this piece (bit 63 of `a1`).
 pub const CONSOLE_MORE: u64 = 1 << 63;
 
