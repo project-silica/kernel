@@ -348,7 +348,12 @@ fn mapped(p: u64, len: u64) -> bool {
     let Some(end) = p.checked_add(len) else { return false };
     let mut page = p & !0xFFF;
     while page < end {
-        let held = regions.iter().any(|r| r.kind != RegionKind::Firmware as u32 && r.base <= page && page < r.base.saturating_add(r.len));
+        let held = regions.iter().any(|r| {
+            r.kind != RegionKind::Firmware as u32
+                && r.kind != RegionKind::Withheld as u32
+                && r.base <= page
+                && page < r.base.saturating_add(r.len)
+        });
         if !held {
             return false;
         }

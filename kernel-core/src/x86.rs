@@ -102,6 +102,98 @@ pub fn unit_use(base: u64, segment: u64, limit: u64, driven: usize, max: usize) 
     }
 }
 
+/// The DMAR hardware unit flag that a unit covers every device of its
+/// segment that no other unit's device scope names.
+pub const INCLUDE_PCI_ALL: u8 = 1;
+
+/// The most device scopes the kernel keeps of the units it drives; a
+/// device named only by a scope past them is not confined (it is refused).
+pub const MAX_SCOPES: usize = 64;
+/// The longest path of a device scope the kernel follows (bridges to cross
+/// and the device): a longer one names nothing it confines.
+pub const MAX_PATH: usize = 4;
+
+/// One DMAR device scope of a unit the kernel drives (VT-d section 8.3.1):
+/// a PCI endpoint (`sub` false) or a PCI sub-hierarchy (`sub`: a bridge and
+/// every bus below it), found from `start_bus` through `path`, each element
+/// a (device, function) whose secondary bus the next element is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Scope {
+    pub sub: bool,
+    pub start_bus: u8,
+    pub path: [(u8, u8); MAX_PATH],
+    pub len: u8,
+}
+
+/// Whether device `id` of segment 0 (bus << 8 | device << 3 | function) is
+/// translated by a unit the kernel drives: by one that covers every device
+/// no other unit names (`all`, `INCLUDE_PCI_ALL`), or by a scope that names
+/// the device or, a sub-hierarchy, the bridge it is below. `bridge(bus,
+/// devfn)` reads a bridge's secondary and subordinate bus numbers from its
+/// configuration space (`None`: no bridge there, or none readable). A
+/// device no scope reaches is translated by no unit and would reach memory
+/// whatever it is attached to, so the kernel attaches it to nothing
+/// (`Unsupported`), and the device manager starts no driver that does DMA
+/// for it (the review of 2026-11-27: every device of segment 0 was taken
+/// to be translated, whatever the units named).
+pub fn covered(id: u32, all: bool, scopes: &[Scope], bridge: impl Fn(u8, u8) -> Option<(u8, u8)>) -> bool {
+    // Segment 0's units translate segment 0's devices alone.
+    if id >> 16 != 0 {
+        return false;
+    }
+    if all {
+        return true;
+    }
+    let (bus, devfn) = ((id >> 8) as u8, id as u8);
+    scopes.iter().any(|s| {
+        let n = s.len as usize;
+        if n == 0 || n > MAX_PATH {
+            return false;
+        }
+        // Down the bridges to the last element's bus. A bridge leads to
+        // buses below its own only once they are numbered (`at < secondary
+        // <= subordinate`, as the device manager's scan requires): an
+        // unnumbered one (secondary 0) leads nowhere, not back to bus 0.
+        let below = |at: u8, (secondary, subordinate): (u8, u8)| at < secondary && secondary <= subordinate;
+        let mut at = s.start_bus;
+        for &(d, f) in &s.path[..n - 1] {
+            match bridge(at, d << 3 | f) {
+                Some(b) if below(at, b) => at = b.0,
+                _ => return false,
+            }
+        }
+        let (d, f) = s.path[n - 1];
+        let target = d << 3 | f;
+        if (bus, devfn) == (at, target) {
+            return true;
+        }
+        s.sub && bridge(at, target).is_some_and(|b| below(at, b) && (b.0..=b.1).contains(&bus))
+    })
+}
+
+/// The configuration windows of segment 0 the kernel keeps (MCFG entries).
+pub const MAX_WINDOWS: usize = 4;
+
+/// Where bus `bus`, function `devfn` has its configuration space, in one of
+/// `windows` (MCFG entries of segment 0: base, first bus, last bus). A
+/// window's base is bus 0's address whatever bus the window starts at
+/// (PCI Firmware Specification 3.2, table 4-3), so the function is at
+/// `base + (bus << 20 | devfn << 12)`. `None` on a bus outside every window.
+pub fn ecam_address(windows: &[(u64, u8, u8)], bus: u8, devfn: u8) -> Option<u64> {
+    windows
+        .iter()
+        .find(|&&(base, first, last)| base != 0 && (first..=last).contains(&bus))
+        .map(|&(base, _, _)| base + ((bus as u64) << 20 | (devfn as u64) << 12))
+}
+
+/// Whether window `(base, first, last)` can be read through the first
+/// `limit` bytes of physical memory (the kernel's map): its base on a 1 MiB
+/// boundary and its last bus's space, up to `base + (last + 1) << 20`,
+/// inside the map.
+pub fn ecam_window_fits((base, first, last): (u64, u8, u8), limit: u64) -> bool {
+    first <= last && base.is_multiple_of(1 << 20) && base.checked_add(((last as u64) + 1) << 20).is_some_and(|end| end <= limit)
+}
+
 /// Compare a remote timestamp sampled between two local counter reads.
 /// Waiting for two distinct publications excludes a timestamp that was
 /// already sampled, but not yet published, at the first local read.

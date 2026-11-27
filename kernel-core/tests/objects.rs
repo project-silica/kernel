@@ -2166,3 +2166,33 @@ fn a_call_with_a_time_limit_ends_at_it() {
     let r = m.sys_as(t, S::Call, [(FREE + 1) | NONBLOCK, MsgInfo::new(3, 0).0, 0, 0, 0, 0]);
     assert_eq!((Error::result(r.status), r.blocked), (Err(Error::BadArg), false));
 }
+
+/// `Inspect` of a slot says whether capabilities derived from it still
+/// exist (`INSPECT_DERIVED`): a provider that gives each holder a
+/// capability derived from one of its own learns from the kernel when the
+/// holder's are all gone, duplicates included, and can give back what it
+/// kept for that holder; it cannot learn it any other way.
+#[test]
+fn inspect_says_whether_derived_capabilities_exist() {
+    use silica_abi::INSPECT_DERIVED;
+    let m = Machine::new(16);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    let derived = |m: &Machine, i: u64| {
+        m.ok(S::Inspect, [SLOT_CAPSPACE, i, 0, 0, 0, 0]);
+        m.arg(m.root, 5) & INSPECT_DERIVED != 0
+    };
+    assert!(!derived(&m, FREE), "a capability nothing was derived from");
+    // A child, and a duplicate of the child (beside it, the same parent).
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 15, 5, 0]);
+    assert!(derived(&m, FREE));
+    assert!(!derived(&m, FREE + 1), "the child has nothing derived from it");
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2, FREE + 1, 15, 0, 1]);
+    m.ok(S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]);
+    assert!(derived(&m, FREE), "the child's duplicate is still derived from it");
+    // A sibling of the source (a duplicate of it) is not derived from it.
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 3, FREE, 15, 0, 1]);
+    m.ok(S::CapDelete, [FREE + 2, 0, 0, 0, 0, 0]);
+    assert!(!derived(&m, FREE), "every derived capability is gone");
+    assert!(!derived(&m, FREE + 3));
+}

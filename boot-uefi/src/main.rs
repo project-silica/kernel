@@ -253,6 +253,144 @@ impl Tables<'_> {
     }
 }
 
+/// The boot archive's entry that carries the machine's secret to the
+/// service manager: added here, in memory, never on the boot volume.
+const SECRET_ENTRY: &str = "machine.secret";
+/// The UEFI variable that keeps it, UCS-2 and NUL-terminated.
+const SECRET_VARIABLE: [u16; 20] = {
+    let name = b"SilicaMachineSecret";
+    let mut w = [0u16; 20];
+    let mut i = 0;
+    while i < name.len() {
+        w[i] = name[i] as u16;
+        i += 1;
+    }
+    w
+};
+
+/// This machine's own secret, 32 bytes that last across boots, into `out`:
+/// what the keys of its services that must outlive a boot are made from
+/// (the remote service's machine key), so that no such key is stored on a
+/// disk, where every program that reaches the disk's blocks could read it.
+/// Kept in a non-volatile UEFI variable with boot-services access alone,
+/// which the firmware answers only before ExitBootServices: to a loader,
+/// not to any operating system.
+///
+/// - What is kept, exactly so (32 bytes, those attributes), is used.
+/// - Not found, or found otherwise (another size, or runtime access, which
+///   a running system could have set or read): made from `seed` and kept,
+///   but only when the loader trusts a source of randomness that went into
+///   the seed (`trusted`): a seed of timing jitter alone would be a
+///   guessable secret for good. Untrusted, one for this boot alone, said.
+/// - Any other answer (the store could not be read): one for this boot
+///   alone, said, and what is kept is left as it is, so that a passing
+///   fault does not change the machine's keys.
+/// - Where the firmware cannot keep one it made: this boot's alone, said.
+///
+/// No copy of the secret is left here: it is written into `out` alone.
+fn machine_secret(rt: *const efi::RuntimeServices, seed: &[u8; 32], trusted: bool, out: &mut [u8; 32]) {
+    let want = efi::VARIABLE_NON_VOLATILE | efi::VARIABLE_BOOTSERVICE_ACCESS;
+    let (mut size, mut attrs) = (out.len(), 0u32);
+    // SAFETY: runtime services are valid while boot services run; the name
+    // is NUL-terminated, and `out` holds `size` bytes.
+    let st =
+        unsafe { ((*rt).get_variable)(SECRET_VARIABLE.as_ptr(), &efi::SILICA_VARIABLES, &mut attrs, &mut size, out.as_mut_ptr().cast()) };
+    use kernel_core::boot::{SecretKept, SecretPlan, secret_plan};
+    let kept = match st {
+        efi::SUCCESS if size == out.len() && attrs == want => SecretKept::Exactly,
+        efi::SUCCESS | efi::BUFFER_TOO_SMALL => SecretKept::Otherwise,
+        efi::NOT_FOUND => SecretKept::Missing,
+        _ => SecretKept::Unreadable,
+    };
+    let plan = secret_plan(kept, trusted);
+    if plan == SecretPlan::Use {
+        return;
+    }
+    let mut made = Blake2s::keyed(seed).update(b"machine secret").finish();
+    out.copy_from_slice(&made);
+    silica_formats::blake2s::zero(&mut made);
+    if plan == SecretPlan::ThisBoot {
+        print(if kept == SecretKept::Unreadable {
+            "WARNING: loader: the firmware could not say what it keeps of this machine's secret: keys made from it last this boot only\r\n"
+        } else {
+            "WARNING: loader: no source of randomness the loader trusts: this machine's secret is not made to last; keys made from it last this boot only\r\n"
+        });
+        return;
+    }
+    // SAFETY: as above. A variable of the name with other attributes is
+    // deleted first (size 0), as SetVariable cannot change attributes.
+    let stored = unsafe {
+        let _ = ((*rt).set_variable)(SECRET_VARIABLE.as_ptr(), &efi::SILICA_VARIABLES, 0, 0, ptr::null());
+        ((*rt).set_variable)(SECRET_VARIABLE.as_ptr(), &efi::SILICA_VARIABLES, want, out.len(), out.as_ptr().cast())
+    };
+    if stored == efi::SUCCESS {
+        print("loader: made this machine's secret; the firmware keeps it for its loader alone\r\n");
+    } else {
+        print("WARNING: loader: the firmware cannot keep this machine's secret: keys made from it last this boot only\r\n");
+    }
+}
+
+/// The boot archive to hand over: the one read from the boot volume
+/// (`read`: its address and length, in loader memory) with the machine's
+/// secret added as [`SECRET_ENTRY`], in memory of the ramdisk's kind. An
+/// entry of that name on the volume is dropped, and said: the secret is the
+/// firmware's to give. An archive that does not pass the format's check is
+/// handed over unchanged, for the kernel to refuse and say why; the secret
+/// is then not added. No copy of the secret is made here but the archive's;
+/// the caller wipes `secret`.
+fn boot_archive(boot: &Boot, read: (u64, u64), secret: &mut [u8; 32]) -> (u64, u64) {
+    use silica_formats::ramdisk;
+    let as_ramdisk = |bytes: &[u8]| {
+        let at = boot.pages(efi::MEM_SILICA_RAMDISK, bytes.len() as u64, "out of memory for the boot archive");
+        // SAFETY: the pages were just allocated, at least `bytes.len()` long.
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
+        (at, bytes.len() as u64)
+    };
+    if read.1 == 0 {
+        return (0, 0);
+    }
+    // SAFETY: `read` is the file just read into loader memory.
+    let disk = unsafe { core::slice::from_raw_parts(read.0 as *const u8, read.1 as usize) };
+    if ramdisk::check(disk, ramdisk::crc32c_update).is_err() {
+        return as_ramdisk(disk);
+    }
+    // The entries, in scratch memory (the loader has no heap): written one
+    // by one before they are read as a slice.
+    let n = ramdisk::entries(disk).count() + 1;
+    let scratch =
+        boot.pages(efi::MEM_LOADER_DATA, (n * core::mem::size_of::<(&str, &[u8])>()) as u64, "out of memory for the boot archive");
+    let list = scratch as *mut (&str, &[u8]);
+    let mut k = 0;
+    for (name, data) in ramdisk::entries(disk) {
+        if name == SECRET_ENTRY {
+            print("WARNING: loader: the boot volume's archive has its own machine.secret, which is not used\r\n");
+            continue;
+        }
+        // SAFETY: `k < n` places, each the size of an entry, allocated above.
+        unsafe { list.add(k).write((name, data)) };
+        k += 1;
+    }
+    // SAFETY: as above.
+    unsafe { list.add(k).write((SECRET_ENTRY, &secret[..])) };
+    k += 1;
+    // SAFETY: the first `k` places were written above.
+    let entries = unsafe { core::slice::from_raw_parts(list, k) };
+    let made = ramdisk::archive_len(entries).map(|len| {
+        let at = boot.pages(efi::MEM_SILICA_RAMDISK, len as u64, "out of memory for the boot archive");
+        // SAFETY: the pages were just allocated, zeroed, `len` bytes or more.
+        let out = unsafe { core::slice::from_raw_parts_mut(at as *mut u8, len) };
+        ramdisk::write(entries, out, ramdisk::crc32c_update).map(|len| (at, len as u64))
+    });
+    silica_formats::blake2s::zero(secret);
+    match made.flatten() {
+        Some(a) => a,
+        None => {
+            print("WARNING: loader: the boot archive has no room for the machine's secret; it is handed over without it\r\n");
+            as_ramdisk(disk)
+        }
+    }
+}
+
 /// The boot seed: every source of randomness there is, hashed together,
 /// with the sources the loader trusts (`ENTROPY_` bits). No single source
 /// decides it: the firmware's protocol and the processor's generator are
@@ -319,6 +457,21 @@ fn unix_seconds(t: &efi::Time) -> u64 {
     s.max(0) as u64
 }
 
+/// The kind a firmware memory descriptor's range has in the region table
+/// the kernel hands memory out by: [`kind_of`] its type, but memory-mapped
+/// I/O the firmware keeps for its runtime services (EFI_MEMORY_RUNTIME: on
+/// a PC its flash, the variable store, the machine's secret in it) is
+/// withheld from every program, as Silica calls no runtime service (QEMU's
+/// q35 with OVMF lists one such range, the 4 MiB of flash below 4 GiB; the
+/// PCI configuration space is not one). How the loader maps a range is
+/// still its type's ([`kind_of`]: device memory, uncached).
+fn region_kind(d: &efi::MemoryDescriptor) -> RegionKind {
+    if matches!(d.ty, efi::MEM_MMIO | efi::MEM_MMIO_PORT) && d.attr & efi::MEMORY_RUNTIME != 0 {
+        return RegionKind::Withheld;
+    }
+    kind_of(d.ty)
+}
+
 /// The region kind for a firmware memory type.
 fn kind_of(ty: u32) -> RegionKind {
     match ty {
@@ -328,6 +481,13 @@ fn kind_of(ty: u32) -> RegionKind {
         efi::MEM_SILICA_RAMDISK => RegionKind::Ramdisk,
         // The crash record: the kernel's, never handed out.
         efi::MEM_SILICA_CRASH => RegionKind::Kernel,
+        // The firmware's runtime services, which nothing calls once Silica
+        // runs (it turns the machine off and resets it through ACPI): kept
+        // from every program like the kernel's own memory. Their data holds
+        // the firmware's copy of its variables, boot-services-only ones
+        // too: the machine's secret (`machine_secret`). Lent as firmware
+        // memory, the device manager could read it there.
+        efi::MEM_RUNTIME_CODE | efi::MEM_RUNTIME_DATA => RegionKind::Kernel,
         efi::MEM_MMIO | efi::MEM_MMIO_PORT | efi::MEM_RESERVED => RegionKind::Firmware,
         // ACPI tables and NVS, runtime services, persistent memory and the
         // like: memory, the firmware's.
@@ -381,7 +541,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         );
     }
     let (kfile, klen) = boot.read(root, "SILICA\\KERNEL.ELF", efi::MEM_LOADER_DATA).unwrap_or_else(|| fail("SILICA\\KERNEL.ELF not found"));
-    let ramdisk = boot.read(root, "SILICA\\RAMDISK.IMG", efi::MEM_SILICA_RAMDISK).unwrap_or((0, 0));
+    let ramdisk = boot.read(root, "SILICA\\RAMDISK.IMG", efi::MEM_LOADER_DATA).unwrap_or((0, 0));
     let t_files = arch::counter();
     // Refused here, once the command line said whether a harness hears the
     // status (the loader is built for plain x86-64 and Armv8.0, so reading
@@ -395,6 +555,13 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
 
     // Entropy and time, while the firmware can still be asked.
     let (seed, entropy_sources) = gather_entropy(&boot);
+    // This machine's secret, from the firmware (made the first time),
+    // given to the service manager in the boot archive in memory alone.
+    // Made to last only from a seed with a trusted source in it.
+    let mut secret = [0u8; 32];
+    machine_secret(rt, &seed, entropy_sources != 0, &mut secret);
+    let ramdisk = boot_archive(&boot, ramdisk, &mut secret);
+    silica_formats::blake2s::zero(&mut secret);
     let t_entropy = arch::counter();
     let mut time = efi::Time::default();
     // SAFETY: runtime services are valid; `time` outlives the call.
@@ -587,7 +754,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, st: *const efi::SystemTable)
         count,
         |i| {
             let d = desc(i);
-            (d.phys, d.pages.checked_mul(PAGE).unwrap_or(u64::MAX), kind_of(d.ty) as u32)
+            (d.phys, d.pages.checked_mul(PAGE).unwrap_or(u64::MAX), region_kind(d) as u32)
         },
         out,
     ) {

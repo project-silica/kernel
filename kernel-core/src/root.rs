@@ -205,6 +205,10 @@ impl<H: Hal> Kernel<H> {
             } else if r.kind == RegionKind::FirmwareMemory as u32 {
                 emit(a, b, KIND_FIRMWARE);
             }
+            // RegionKind::Withheld (the firmware's runtime I/O: its flash,
+            // the machine's secret in it), like the kernel's own memory:
+            // nothing is made of it, and it is no gap to fill with device
+            // memory either.
         }
         if spec.device_top > cursor {
             device(cursor, spec.device_top, &mut emit);
