@@ -1567,12 +1567,18 @@ fn bench_ipc() {
 }
 
 /// A hand-off and its answer between two address spaces on one processor,
-/// as a device's driver and its client make them: each signals the
-/// other's notification and waits on its own in one entry (SignalRecv).
-/// One sample is the round trip, two hand-offs.
+/// as a device's driver and its client make them, each in one entry
+/// (SignalRecv): the client signals the driver's notification and waits
+/// on its own for the completion; the driver, in its loop, signals the
+/// client's and receives on its endpoint while listening on its own
+/// notification (`serve_events`). One sample is the round trip.
 fn bench_notify() {
-    let (mine, theirs) = (new(ObjectType::Notification, 0), new(ObjectType::Notification, 0));
-    let other = foreign_thread(stub(&raw const stub_notify, &raw const stub_notify_end), theirs.0 | mine.0 << 32);
+    let (mine, theirs, ep) = (new(ObjectType::Notification, 0), new(ObjectType::Notification, 0), new(ObjectType::Endpoint, 0));
+    if [mine.0, theirs.0, ep.0].iter().any(|&s| s >= 1 << 20) {
+        println!("ERROR: bench: a slot beyond what the driver stub decodes");
+        exit(false);
+    }
+    let other = foreign_thread(stub(&raw const stub_notify, &raw const stub_notify_end), ep.0 | theirs.0 << 20 | mine.0 << 40);
     for i in 0..SAMPLES + WARMUP {
         let t = rdtsc();
         let r = signal_recv(theirs, mine, Cap::NONE, Wait::Forever);
@@ -1585,10 +1591,11 @@ fn bench_notify() {
             samples()[i - WARMUP] = t;
         }
     }
-    // SAFETY: the other thread and both notifications are used by nothing else.
+    // SAFETY: the other thread, the notifications and the endpoint are used by nothing else.
     let _ = unsafe { cap_delete(other) };
     let _ = unsafe { cap_delete(mine) };
     let _ = unsafe { cap_delete(theirs) };
+    let _ = unsafe { cap_delete(ep) };
     report("notify_roundtrip", SAMPLES, 1);
 }
 

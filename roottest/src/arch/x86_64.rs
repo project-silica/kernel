@@ -232,17 +232,24 @@ core::arch::global_asm!(
     "4: pause",
     "jmp 4b",
     "stub_spin_end:",
-    // A device's side of a hand-off for ever: SignalRecv, signalling the
-    // notification in the upper half of rdi and waiting on the one in the
-    // lower half, as a driver and its client hand each other work.
+    // A driver's loop for ever (`serve_events`): SignalRecv, signalling
+    // its client's notification (bits 40 and up of rdi) and receiving on
+    // its endpoint (bits 0 to 19) while listening on its own notification
+    // (bits 20 to 39).
     "stub_notify:",
     "mov r15, rdi",
-    "5: mov eax, 23",
-    "mov edi, r15d",
+    "5: mov rdi, r15",
+    "shr rdi, 20",
+    "and edi, 0xFFFFF",
+    "shl rdi, 32",
+    "mov rcx, r15",
+    "and ecx, 0xFFFFF",
+    "or rdi, rcx",
     "xor esi, esi",
     "xor edx, edx",
     "mov r10, r15",
-    "shr r10, 32",
+    "shr r10, 40",
+    "mov eax, 23",
     "syscall",
     "jmp 5b",
     "stub_notify_end:",

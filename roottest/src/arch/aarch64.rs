@@ -219,16 +219,20 @@ core::arch::global_asm!(
     "4: yield",
     "b 4b",
     "stub_spin_end:",
-    // A device's side of a hand-off for ever: SignalRecv (23), signalling
-    // the notification in the upper half of x0 and waiting on the one in
-    // the lower half.
+    // A driver's loop for ever (`serve_events`): SignalRecv (23),
+    // signalling its client's notification (bits 40 and up of x0) and
+    // receiving on its endpoint (bits 0 to 19) while listening on its own
+    // notification (bits 20 to 39).
     "stub_notify:",
     "mov x19, x0",
     "5: mov x8, #23",
-    "mov w0, w19",
+    "ubfx x0, x19, #20, #20",
+    "lsl x0, x0, #32",
+    "ubfx x9, x19, #0, #20",
+    "orr x0, x0, x9",
     "mov x1, xzr",
     "mov x2, xzr",
-    "lsr x3, x19, #32",
+    "lsr x3, x19, #40",
     "svc #0",
     "b 5b",
     "stub_notify_end:",
