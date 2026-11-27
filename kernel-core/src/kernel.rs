@@ -612,13 +612,25 @@ impl<H: Hal> Kernel<H> {
             }
             Syscall::CapDelete => {
                 let s = self.cslot(t, a[0])?;
+                // Made again only to finish emptying what it destroyed
+                // (done by now: dispatch finishes the emptying first): the
+                // slot it emptied may hold something else by now, which is
+                // not this call's to delete (the review of
+                // audit-kernel-stalls).
+                if self.thread(t).deleted.replace(0) == s + 1 {
+                    return Ok(Exit::Done);
+                }
                 if !self.revoke(s) {
                     return Ok(Exit::Preempted);
                 }
                 self.delete(s);
                 // Made again until what it destroyed is emptied: the
                 // deleter pays for it, not the next caller.
-                Ok(if self.reap_pending() { Exit::Preempted } else { Exit::Done })
+                if self.reap_pending() {
+                    self.thread(t).deleted.set(s + 1);
+                    return Ok(Exit::Preempted);
+                }
+                Ok(Exit::Done)
             }
             Syscall::CapRevoke => {
                 let s = self.cslot(t, a[0])?;
@@ -719,6 +731,7 @@ impl<H: Hal> Kernel<H> {
                 self.fresh_extended_state(th.obj);
                 // A new program: no Unmap of the last one is gone on with.
                 self.thread(th.obj).sweep_ticket.set(0);
+                self.thread(th.obj).deleted.set(0);
                 let r = &self.thread(th.obj).regs;
                 for c in r.iter() {
                     c.set(0);

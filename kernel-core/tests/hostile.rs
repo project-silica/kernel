@@ -1571,3 +1571,28 @@ fn a_fault_that_does_not_recur_is_sent_when_its_context_has_no_share_left() {
     m.fault(Fault::Exception, 3, 0);
     assert_eq!(m.k.thread_view(x).state, SENDING, "a breakpoint was held back, to be lost when the share came back");
 }
+
+/// A CapDelete made again only to finish emptying what it destroyed does
+/// not look at its slot again: by then another capability may be there
+/// (received, or put there by another thread of the CapSpace), which is
+/// not the call's to delete (the review of audit-kernel-stalls).
+#[test]
+fn a_capdelete_made_again_does_not_delete_what_came_into_its_slot() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Endpoint, 0, FREE, 1);
+    m.retype(ut, T::CapSpace, 12, FREE + 1, 1);
+    for i in 1..2000 {
+        m.ok(S::CapCopy, [FREE + 1, i, FREE, 15, 0, 0]);
+    }
+    let other = m.spawn(ut, FREE + 2);
+    // The CapSpace goes, its emptying stopped beside a waiting processor:
+    // the call will be made again to finish it.
+    assert!(one_entry_beside_a_waiter(&m, S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]));
+    assert!(m.cap(FREE + 1).is_none());
+    // Meanwhile another thread of this CapSpace puts a capability there.
+    assert_eq!(m.sys_as(other, S::CapCopy, [SLOT_CAPSPACE, FREE + 1, FREE, 15, 7, 0]).status, 0);
+    // The CapDelete, made again, finishes without touching it.
+    assert!(!one_entry_as_beside_a_waiter(&m, m.root, S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]));
+    assert!(m.cap(FREE + 1).is_some(), "the CapDelete made again deleted a capability that came into its slot meanwhile");
+}

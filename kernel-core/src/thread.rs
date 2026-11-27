@@ -111,6 +111,10 @@ pub struct Thread {
     /// started on a new program (`ThreadStart`), has none, so it never
     /// goes on with another's.
     pub(crate) sweep_ticket: Cell<u64>,
+    /// The slot (plus one) its `CapDelete` emptied while what that left to
+    /// empty was not done: the call, made again for that, does not look
+    /// at the slot again (where something else may be by then). 0: none.
+    pub(crate) deleted: Cell<u64>,
 }
 impl KObj for Thread {}
 
