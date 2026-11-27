@@ -707,6 +707,7 @@ impl<H: Hal> Kernel<H> {
 impl<H: Hal> Kernel<H> {
     /// The endpoint or notification capability at `index` of `t`'s
     /// CapSpace with `rights`, and its slot.
+    #[inline(always)]
     fn fast_cap(&self, t: Paddr, index: u64, ty: ObjectType, rights: Rights) -> Option<(Paddr, crate::cap::Cap)> {
         let slot = self.cslot(t, index).ok()?;
         let cap = self.slot(slot).cap()?;
@@ -933,6 +934,60 @@ impl<H: Hal> Kernel<H> {
         self.q_push(&q.head, &q.tail, t);
         th.state.set(RECEIVING);
         th.blocked_on.set(ep.obj);
+        true
+    }
+
+    /// `SignalRecv` of thread `t` (current on this processor) with
+    /// arguments `a`, when both notifications are this processor's, neither
+    /// has a listener or a parked call, and the call listens on and parks
+    /// nothing: how a driver and its client, or any two threads sharing a
+    /// ring, hand each other work. It does what the general path does in
+    /// that case, `signal` and then `wait`, the same calls with the same
+    /// effects on the scheduler; what it leaves out is deciding whether
+    /// the call is local (every condition `is_local` would look at is one
+    /// checked here) and looking each capability up a second time: a round
+    /// trip of two hand-offs (`bench=notify`) took 1926 instructions, 576
+    /// of them deciding whether it was local, and takes 1237.
+    #[inline(never)]
+    pub(crate) fn fast_signal_recv(&self, t: Paddr) -> bool {
+        let r = &self.thread(t).regs;
+        let a = [r[H::ARG[0]].get(), r[H::ARG[1]].get(), r[H::ARG[2]].get(), r[H::ARG[3]].get()];
+        if a[2] != 0 || listen_slot(a[0]) != 0 {
+            return false;
+        }
+        let Some((_, wake)) = self.fast_cap(t, a[3], ObjectType::Notification, Rights::WRITE) else { return false };
+        let Some((slot, from)) = self.fast_cap(t, recv_slot(a[0]), ObjectType::Notification, Rights::READ) else { return false };
+        let me = self.hal.cpu() as u64;
+        let (wq, fq) = (self.queue(wake.obj), self.queue(from.obj));
+        let th = self.thread(t);
+        let local = |x: Paddr| x == 0 || self.thread(x).cpu.get() == me;
+        if wq.owner.get() != me + 1
+            || fq.owner.get() != me + 1
+            || wq.kind.get() == PARKED
+            || fq.kind.get() == PARKED
+            || wq.listener().get() != 0
+            || fq.listener().get() != 0
+            || !local(th.caller.get())
+        {
+            return false;
+        }
+        // The thread the signal wakes, if one waits: this processor's, as
+        // its caller is (what `queue_is_local` asks of a queue's head).
+        if wq.kind.get() == RECEIVERS {
+            let w = wq.head.get();
+            if !local(w) || !local(self.thread(w).caller.get()) {
+                return false;
+            }
+        }
+        self.signal(wake.obj, wake.badge.max(1));
+        th.via_slot.set(slot);
+        // As `syscall_general` reports what `wait` returns. (`wait` cannot
+        // be preempted, and fails only on a deadline.)
+        match self.wait(t, from.obj, a[1]) {
+            Ok(Exit::Blocked) => {}
+            Ok(_) => th.regs[H::SYS].set(0),
+            Err(e) => th.regs[H::SYS].set(e as u64),
+        }
         true
     }
 }

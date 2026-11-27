@@ -1847,6 +1847,69 @@ fn a_receive_can_signal_a_notification_first() {
     assert_eq!(m.arg(m.root, 0), 1, "the failed receives took nothing");
 }
 
+/// Hand-offs through notifications (`SignalRecv` both ways, as a driver
+/// and its client make them) give the same results whichever path takes
+/// them: the fast one while both notifications are this processor's and
+/// nothing listens, the general one otherwise. The queues and run queues
+/// stay well formed after each, a peer moved to another processor is still
+/// woken (its notification is that processor's now), and a peer that
+/// listens rather than waits hears the signal as a listener does.
+#[test]
+fn hand_offs_through_notifications_agree_on_every_path() {
+    let (m, _) = two_processors();
+    let (ut, _) = m.big_untyped();
+    let (mine, theirs) = (FREE + 10, FREE + 11);
+    m.retype(ut, T::Notification, 0, mine, 2);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 12, theirs, 2, 0b100, 0]);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 13, mine, 2, 0b10, 0]);
+    let peer = m.spawn(ut, FREE + 14);
+    let (n_mine, n_theirs) = (m.cap(mine).unwrap().obj, m.cap(theirs).unwrap().obj);
+    let check = |m: &Machine| {
+        assert_eq!(m.k.check_runqueues(), Ok(()));
+        assert_eq!(m.k.check_queue(n_mine, true), Ok(()));
+        assert_eq!(m.k.check_queue(n_theirs, true), Ok(()));
+    };
+    // Both wait once, so each notification is processor 0's.
+    assert!(m.sys_as(peer, S::Recv, [theirs, 0, 0, 0, 0, 0]).blocked);
+    for round in 0..4 {
+        // The root wakes the peer and waits; the peer wakes the root and waits.
+        assert!(m.sys(S::SignalRecv, [mine, 0, 0, FREE + 12, 0, 0]).blocked, "round {round}");
+        assert_eq!((m.k.thread_view(peer).state, m.status(peer), m.arg(peer, 0)), (RUNNABLE, 0, 0b100));
+        check(&m);
+        assert!(m.sys_as(peer, S::SignalRecv, [theirs, 0, 0, FREE + 13, 0, 0]).blocked);
+        assert_eq!((m.k.thread_view(m.root).state, m.status(m.root), m.arg(m.root, 0)), (RUNNABLE, 0, 0b10));
+        check(&m);
+    }
+    // A signal already pending is taken at once, after the signal is made.
+    m.ok(S::Send, [FREE + 13, 0, 0, 0, 0, 0]);
+    m.ok(S::SignalRecv, [mine, 0, 0, FREE + 12, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), 0b10);
+    assert_eq!((m.k.thread_view(peer).state, m.arg(peer, 0)), (RUNNABLE, 0b100));
+    // A deadline already past: the signal is made and the wait times out.
+    let past = m.k.hal.now.get().max(2);
+    m.k.hal.now.set(past + 10);
+    assert!(m.sys_as(peer, S::Recv, [theirs, 0, 0, 0, 0, 0]).blocked);
+    assert_eq!(m.err(S::SignalRecv, [mine, past, 0, FREE + 12, 0, 0]), Error::Timeout);
+    assert_eq!((m.k.thread_view(peer).state, m.arg(peer, 0)), (RUNNABLE, 0b100));
+    check(&m);
+    // The peer moves to processor 1 and waits there: `theirs` is that
+    // processor's, and a hand-off from processor 0 still wakes it.
+    m.move_to(FREE + 14, 1);
+    m.on(1);
+    assert!(m.sys_as(peer, S::Recv, [theirs, 0, 0, 0, 0, 0]).blocked);
+    m.on(0);
+    assert!(m.sys_as(m.root, S::SignalRecv, [mine, 0, 0, FREE + 12, 0, 0]).blocked);
+    assert_eq!((m.k.thread_view(peer).state, m.arg(peer, 0)), (RUNNABLE, 0b100));
+    check(&m);
+    // And back: the peer's signal from processor 1 wakes the root here.
+    m.on(1);
+    assert!(m.sys_as(peer, S::SignalRecv, [theirs, 0, 0, FREE + 13, 0, 0]).blocked);
+    m.on(0);
+    m.settle(0);
+    assert_eq!((m.k.thread_view(m.root).state, m.status(m.root), m.arg(m.root, 0)), (RUNNABLE, 0, 0b10));
+    check(&m);
+}
+
 /// What `CapNotice`'s watch shows of slot `i` of the root CapSpace: its
 /// notice's slot index, or for a notice the index of the slot it watches.
 fn watch_of(m: &Machine, i: u64) -> (u64, u64) {

@@ -1482,6 +1482,8 @@ unsafe extern "C" {
     static stub_yield_end: u8;
     static stub_spin: u8;
     static stub_spin_end: u8;
+    static stub_notify: u8;
+    static stub_notify_end: u8;
 }
 
 fn stub(start: *const u8, end: *const u8) -> &'static [u8] {
@@ -1562,6 +1564,32 @@ fn bench_ipc() {
     // SAFETY: the server thread is used by nothing else.
     let _ = unsafe { cap_delete(server) };
     report("ipc_roundtrip", SAMPLES, 1);
+}
+
+/// A hand-off and its answer between two address spaces on one processor,
+/// as a device's driver and its client make them: each signals the
+/// other's notification and waits on its own in one entry (SignalRecv).
+/// One sample is the round trip, two hand-offs.
+fn bench_notify() {
+    let (mine, theirs) = (new(ObjectType::Notification, 0), new(ObjectType::Notification, 0));
+    let other = foreign_thread(stub(&raw const stub_notify, &raw const stub_notify_end), theirs.0 | mine.0 << 32);
+    for i in 0..SAMPLES + WARMUP {
+        let t = rdtsc();
+        let r = signal_recv(theirs, mine, Cap::NONE, Wait::Forever);
+        let t = rdtsc() - t;
+        if r.is_err() {
+            println!("ERROR: bench: the hand-off failed");
+            exit(false);
+        }
+        if i >= WARMUP {
+            samples()[i - WARMUP] = t;
+        }
+    }
+    // SAFETY: the other thread and both notifications are used by nothing else.
+    let _ = unsafe { cap_delete(other) };
+    let _ = unsafe { cap_delete(mine) };
+    let _ = unsafe { cap_delete(theirs) };
+    report("notify_roundtrip", SAMPLES, 1);
 }
 
 /// Two threads in different address spaces yielding to each other, each
@@ -2316,12 +2344,15 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             b"null" => bench_null_syscall,
             b"ipc" => bench_ipc,
             b"ctx" => bench_ctx_switch,
+            b"notify" => bench_notify,
             b"fault" => bench_page_fault,
             b"timer" => bench_timer,
             b"pairs8" => || println!("BENCH ipc_pairs8 {} ops/s", bench_pairs(8, false)),
             b"cross1" => || println!("BENCH ipc_cross_pairs1 {} ops/s", bench_pairs(1, true)),
             _ => {
-                println!("ERROR: roottest: no benchmark of that name (null, ipc, ctx, fault, timer, pairs8, cross1; sched:<seconds>)");
+                println!(
+                    "ERROR: roottest: no benchmark of that name (null, ipc, ctx, notify, fault, timer, pairs8, cross1; sched:<seconds>)"
+                );
                 exit(false)
             }
         };
