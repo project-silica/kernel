@@ -33,6 +33,12 @@ pub enum RegionKind {
     /// memory: tables are read with ordinary loads, unaligned ones too
     /// (on Arm a device mapping faults on those).
     FirmwareMemory = 6,
+    /// Memory-mapped I/O the firmware keeps for its runtime services
+    /// (EFI_MEMORY_RUNTIME): on a PC its flash, where its variables are,
+    /// the machine's secret among them (the loader's `machine_secret`).
+    /// Silica calls no runtime service, so it is handed to no program, as
+    /// device memory or otherwise; mapped, where it is, as device memory.
+    Withheld = 7,
 }
 
 /// One physical memory region. Regions do not overlap and are sorted by base.
@@ -203,6 +209,7 @@ fn restrictiveness(kind: u32) -> u8 {
         k if k == RegionKind::Usable as u32 => 0,
         k if k == RegionKind::Loader as u32 => 1,
         k if k == RegionKind::Kernel as u32 || k == RegionKind::Ramdisk as u32 => 2,
+        k if k == RegionKind::Withheld as u32 => 5,
         k if k == RegionKind::FirmwareMemory as u32 => 3,
         _ => 4,
     }
@@ -299,6 +306,11 @@ mod map {
         // Out of order, neighbours merged, holes left out.
         let map = [(0x3000, 0x1000, U), (0x1000, 0x2000, U), (0x10_000, 0x1000, F)];
         assert_eq!(convert(&map).unwrap(), [(0x1000, 0x3000, U), (0x10_000, 0x1000, F)]);
+        // The firmware's runtime I/O (its flash) over a device range and
+        // over memory: withheld wherever it lies, nothing kinder wins.
+        const W: u32 = RegionKind::Withheld as u32;
+        let map = [(0x0, 0x4000, F), (0x2000, 0x4000, W), (0x5000, 0x2000, U)];
+        assert_eq!(convert(&map).unwrap(), [(0x0, 0x2000, F), (0x2000, 0x4000, W), (0x6000, 0x1000, U)]);
     }
 
     #[test]
@@ -316,6 +328,73 @@ mod map {
         assert!(framebuffer_is_apart(&regions, 0x8000_0000, 0x40_0000));
         assert!(!framebuffer_is_apart(&regions, 0x0FF0_0000, 0x40_0000), "overlaps usable memory");
         assert!(!framebuffer_is_apart(&regions, u64::MAX - 10, 0x40_0000), "wraps");
+    }
+}
+
+/// What the firmware answered for the machine's secret's variable (the
+/// loader's `machine_secret`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretKept {
+    /// Kept exactly as only a loader keeps it: 32 bytes, non-volatile,
+    /// boot-services access alone.
+    Exactly,
+    /// Kept otherwise: another size, or other attributes (runtime access,
+    /// which a running system could have set or read).
+    Otherwise,
+    /// Not kept (`EFI_NOT_FOUND`).
+    Missing,
+    /// Any other answer: the store could not be read now.
+    Unreadable,
+}
+
+/// What the loader does with the machine's secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretPlan {
+    /// Use what is kept.
+    Use,
+    /// Make it from the boot's seed and keep it, in place of what is kept.
+    MakeAndKeep,
+    /// Make one for this boot alone, from the boot's seed, and leave the
+    /// store as it is.
+    ThisBoot,
+}
+
+/// The loader's plan for the machine's secret, from what the firmware
+/// answered and whether a source the loader trusts went into the boot's
+/// seed. Kept exactly: used, whatever this boot's seed. Missing or kept
+/// otherwise: made and kept only from a trusted seed (a seed of timing
+/// jitter alone would make a guessable secret that lasts). Unreadable: this
+/// boot's alone, and the store left as it is (a passing fault must not
+/// change the machine's keys).
+pub fn secret_plan(kept: SecretKept, trusted: bool) -> SecretPlan {
+    match kept {
+        SecretKept::Exactly => SecretPlan::Use,
+        SecretKept::Missing | SecretKept::Otherwise if trusted => SecretPlan::MakeAndKeep,
+        SecretKept::Missing | SecretKept::Otherwise | SecretKept::Unreadable => SecretPlan::ThisBoot,
+    }
+}
+
+#[cfg(test)]
+mod secret {
+    use super::{SecretKept as K, SecretPlan as P, secret_plan};
+
+    /// The plan for every answer, with and without a trusted seed (the
+    /// review of audit-keys: a seed of jitter alone was kept for good, and
+    /// any failed read deleted what was kept).
+    #[test]
+    fn a_secret_lasts_only_from_a_trusted_seed_and_survives_a_failed_read() {
+        for (kept, trusted, want) in [
+            (K::Exactly, true, P::Use),
+            (K::Exactly, false, P::Use),
+            (K::Missing, true, P::MakeAndKeep),
+            (K::Otherwise, true, P::MakeAndKeep),
+            (K::Missing, false, P::ThisBoot),
+            (K::Otherwise, false, P::ThisBoot),
+            (K::Unreadable, true, P::ThisBoot),
+            (K::Unreadable, false, P::ThisBoot),
+        ] {
+            assert_eq!(secret_plan(kept, trusted), want, "{kept:?}, trusted {trusted}");
+        }
     }
 }
 

@@ -7,6 +7,10 @@ use core::ffi::c_void;
 pub type Status = usize;
 /// EFI_SUCCESS.
 pub const SUCCESS: Status = 0;
+/// EFI_BUFFER_TOO_SMALL.
+pub const BUFFER_TOO_SMALL: Status = (1 << (usize::BITS - 1)) | 5;
+/// EFI_NOT_FOUND.
+pub const NOT_FOUND: Status = (1 << (usize::BITS - 1)) | 14;
 /// EFI_HANDLE.
 pub type Handle = *mut c_void;
 
@@ -141,7 +145,8 @@ pub struct MemoryDescriptor {
     virt: u64,
     /// Length in 4 KiB pages.
     pub pages: u64,
-    attr: u64,
+    /// EFI_MEMORY_* attributes ([`MEMORY_RUNTIME`]).
+    pub attr: u64,
 }
 
 /// EFI_LOADED_IMAGE_PROTOCOL, up to DeviceHandle.
@@ -260,3 +265,5 @@ pub const MEM_RESERVED: u32 = 0;
 pub const MEM_MMIO: u32 = 11;
 /// EfiMemoryMappedIOPortSpace: device registers.
 pub const MEM_MMIO_PORT: u32 = 12;
+/// EFI_MEMORY_RUNTIME: the firmware keeps the range for its runtime services.
+pub const MEMORY_RUNTIME: u64 = 1 << 63;
