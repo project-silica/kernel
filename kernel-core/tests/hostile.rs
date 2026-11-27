@@ -1211,3 +1211,58 @@ fn destroying_an_address_space_of_many_mappings_stops_for_a_processor_waiting() 
     m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2050, FREE + 1, 15, 0, 0]);
     assert_eq!(mapped(&m), 1, "only the frame mapped again is mapped");
 }
+
+/// A fault whose fault endpoint another processor owns, or nobody yet,
+/// is sent holding every lock, and faults cost a program nothing to make:
+/// unlike a system call that takes every lock, they were never paid for
+/// (the 2026-11-27 audit: M10). They are now, out of the same share of the
+/// faulting thread's context: a flood of them is held back (the thread
+/// waits, to fault again where it was), and a program beside it carries on.
+#[test]
+fn a_flood_of_faults_that_take_every_lock_is_held_back() {
+    use kernel_core::thread::THROTTLED;
+    use silica_abi::{SCHED_DEFAULT_WEIGHT, SCHED_FAIR};
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.spawn(ut, FREE + 20);
+    m.move_to(FREE + 20, 1);
+    m.settle(1);
+    m.on(0);
+    m.retype(ut, T::SchedContext, 0, FREE, 1);
+    m.ok(S::SchedConfigure, [FREE, SCHED_FAIR, SCHED_DEFAULT_WEIGHT, 0, 0, SLOT_SCHED]);
+    // Nobody receives on the fault endpoint: it is no processor's, so each
+    // fault sent to it takes every lock.
+    m.retype(ut, T::Endpoint, 0, FREE + 1, 1);
+    let threads: Vec<_> = (0..1800u64)
+        .map(|i| {
+            let slot = FREE + 100 + i;
+            let t = m.spawn(ut, slot);
+            m.ok(S::ThreadConfigure, [slot, KEEP, KEEP, FREE + 1, KEEP, 0]);
+            m.ok(S::ThreadControl, [slot, 2, FREE, 0, 0, 0]);
+            // Suspended until its turn: the flood is the faults, not a
+            // run queue of threads to yield through.
+            m.ok(S::ThreadControl, [slot, 0, 0, 0, 0, 0]);
+            t
+        })
+        .collect();
+    // During each fault every reading of the clock is 10 us later than
+    // the last: a fault that takes every lock holds them that long at least.
+    let mut faults = 0;
+    let mut throttled = false;
+    for (i, &t) in threads.iter().enumerate() {
+        m.ok(S::ThreadControl, [FREE + 100 + i as u64, 1, 0, 0, 0, 0]);
+        m.sys_as(t, S::Yield, [0; 6]);
+        while m.k.current() != t {
+            m.sys(S::Yield, [0; 6]);
+        }
+        m.k.hal.now_step.set(10_000);
+        m.fault(Fault::Page, 0xdead_0000, 6);
+        m.k.hal.now_step.set(0);
+        faults += 1;
+        if m.k.thread_view(t).state == THROTTLED {
+            throttled = true;
+            break;
+        }
+    }
+    assert!(throttled, "{faults} faults that took every lock were never held back");
+}

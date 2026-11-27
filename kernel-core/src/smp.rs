@@ -559,7 +559,48 @@ impl<H: Hal> Kernel<H> {
     #[cold]
     #[inline(never)]
     fn throttle(&self, me: &Cpu, sc: &crate::sched::SchedCtx, t: Paddr) -> bool {
-        let now = self.hal.now();
+        self.throttle_as(me, sc, t, true)
+    }
+
+    /// [`Kernel::throttled`] for a fault that is to take every lock (its
+    /// fault endpoint another processor's): a thread whose context has
+    /// used its share waits for it and then faults again where it was, as
+    /// a system call is made again. Faults cost a program nothing to make,
+    /// and each took every lock unthrottled (the 2026-11-27 audit: M10).
+    pub(crate) fn throttled_fault(&self, me: &Cpu, t: Paddr) -> bool {
+        let sc = self.sched(self.thread(t).sc.get());
+        if sc.global_budget.get() > 0 {
+            me.global_from.set(self.hal.now());
+            return false;
+        }
+        self.throttle_as(me, sc, t, false)
+    }
+
+    /// For the timeouts of thread `t`, waiting in a queue another
+    /// processor owns, which are delivered holding every lock (`expire`):
+    /// when its context has used its share of that time, how long until it
+    /// is back (the timeout is delivered then); else `None`, the entry
+    /// about to take every lock timed from `now`, to be charged to it
+    /// ([`Kernel::spent_global`]). Each such timeout took every lock
+    /// unthrottled, as many as a program cared to arrange (the 2026-11-27
+    /// audit: M10).
+    pub(crate) fn share_back_in(&self, me: &Cpu, t: Paddr, now: u64) -> Option<u64> {
+        let s = self.thread(t).sc.get();
+        if s == 0 {
+            return None;
+        }
+        let sc = self.sched(s);
+        if sc.global_budget.get() > 0 {
+            me.global_from.set(now);
+            return None;
+        }
+        self.global_share(me, sc, now)
+    }
+
+    /// The share of time holding every lock left to context `sc`, brought
+    /// up to `now`: `None` when some is left (the global entry about to
+    /// begin is timed from `now`), else how long until it is back.
+    fn global_share(&self, me: &Cpu, sc: &crate::sched::SchedCtx, now: u64) -> Option<u64> {
         let n = self.ncpu() as u128;
         // A context never charged starts with the burst; configuring it
         // again does not refill it.
@@ -573,12 +614,22 @@ impl<H: Hal> Kernel<H> {
         sc.global_budget.set(budget);
         if budget > 0 {
             me.global_from.set(now);
-            return false;
+            return None;
         }
-        // Until the share is back: then the call is made again.
-        let wait = ((-budget) as u128 * 1000 * n / GLOBAL_SHARE as u128) as u64 + 1;
-        let r = &self.thread(t).regs;
-        r[H::IP].set(r[H::IP].get().wrapping_sub(H::SYSCALL_LEN));
+        Some(((-budget) as u128 * 1000 * n / GLOBAL_SHARE as u128) as u64 + 1)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn throttle_as(&self, me: &Cpu, sc: &crate::sched::SchedCtx, t: Paddr, syscall: bool) -> bool {
+        let now = self.hal.now();
+        let Some(wait) = self.global_share(me, sc, now) else { return false };
+        // Until the share is back: then the call is made again (a fault
+        // needs nothing: the thread faults again where it was).
+        if syscall {
+            let r = &self.thread(t).regs;
+            r[H::IP].set(r[H::IP].get().wrapping_sub(H::SYSCALL_LEN));
+        }
         self.block(t, crate::thread::THROTTLED, 0, now.saturating_add(wait));
         true
     }
