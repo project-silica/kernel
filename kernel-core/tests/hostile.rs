@@ -1022,3 +1022,87 @@ fn watching_many_lines_takes_no_watch_from_anyone() {
     m.irq(71);
     assert_eq!(m.err(S::Recv, [FREE, 1, 0, 0, 0, 0]), Error::WouldBlock);
 }
+
+/// One kernel entry of system call `n` as the root task, with processor 1
+/// waiting for a lock throughout (each look for a pending interrupt counts
+/// a turn of its wait): whether it stopped to be made again.
+fn one_entry_beside_a_waiter(m: &Machine, n: S, a: [u64; 6]) -> bool {
+    m.k.hal.contender.set(m.k.lock_wait_turns(1));
+    let r = m.k.regs(m.root);
+    r[TestHal::IP].set(0x40_0002);
+    r[TestHal::SYS].set(n as u64);
+    r[TestHal::BY_SYSCALL].set(1);
+    for (i, v) in a.iter().enumerate() {
+        r[TestHal::ARG[i]].set(*v);
+    }
+    m.k.enter();
+    m.k.syscall();
+    m.k.leave();
+    m.k.hal.contender.set(core::ptr::null());
+    r[TestHal::IP].get() == 0x40_0000
+}
+
+/// How many capabilities derive from the one in slot `s` of the root CapSpace.
+fn children(m: &Machine, s: u64) -> usize {
+    let at = m.k.slot_addr(&m.cs, s).unwrap();
+    let Some(v) = m.k.view(at) else { return 0 };
+    let (mut n, mut next) = (0, v.next);
+    while let Some(c) = (next != 0).then(|| m.k.view(next)).flatten().filter(|c| c.depth > v.depth) {
+        n += 1;
+        next = c.next;
+    }
+    n
+}
+
+/// A capability may have as many descendants as there is memory for slots
+/// (64 bytes each), and deleting it empties them holding every lock. It
+/// stopped only for an interrupt pending on its own processor, which a
+/// processor with no timer armed may never have: one `Delete` held every
+/// other processor for as long as the memory a program had paid for let it
+/// make (the 2026-11-27 audit: H4, N1). It stops for a processor waiting
+/// for a lock too, a bounded number of capabilities after it began, and
+/// is made again until it is done.
+#[test]
+fn a_delete_of_many_children_stops_for_a_processor_waiting() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.retype(ut, T::CapSpace, 14, FREE + 1, 1);
+    let many = if cfg!(miri) { 1200 } else { 10_000 };
+    for i in 1..=many {
+        m.ok(S::CapCopy, [FREE + 1, i, FREE, 15, 0, 0]);
+    }
+    assert_eq!(children(&m, FREE), many as usize);
+    assert!(one_entry_beside_a_waiter(&m, S::CapDelete, [FREE, 0, 0, 0, 0, 0]), "one entry deleted all {many} children");
+    let left = children(&m, FREE);
+    assert!(left > 0 && (many as usize - left) <= 1024, "one entry deleted {} children", many as usize - left);
+    // Made again, it finishes.
+    m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
+    assert!(m.cap(FREE).is_none() && m.cap(FREE + 1).is_some());
+    assert!(m.k.view(m.k.slot_addr(&m.cs, FREE + 1).unwrap()).is_some());
+}
+
+/// The same for a CapSpace being emptied: one of its slots may hold a
+/// capability with as many descendants, which the emptying deleted in one
+/// go whatever was pending.
+#[test]
+fn emptying_a_capspace_stops_inside_one_slot_for_a_processor_waiting() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::Notification, 0, FREE, 1);
+    m.retype(ut, T::CapSpace, 4, FREE + 1, 1);
+    m.retype(ut, T::CapSpace, 14, FREE + 3, 1);
+    m.ok(S::CapCopy, [SLOT_CAPSPACE, FREE + 2, FREE, 15, 0, 0]);
+    let many = if cfg!(miri) { 1200 } else { 10_000 };
+    for i in 1..=many {
+        m.ok(S::CapCopy, [FREE + 3, i, FREE + 2, 15, 0, 0]);
+    }
+    // The parent of them all goes into the small CapSpace, which is deleted.
+    m.ok(S::CapMove, [FREE + 1, 1, FREE + 2, 0, 0, 0]);
+    assert_eq!(children(&m, FREE), many as usize + 1);
+    assert!(one_entry_beside_a_waiter(&m, S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]), "one entry emptied the slot's {many} descendants");
+    let left = children(&m, FREE);
+    assert!(left > 0 && (many as usize + 1 - left) <= 1024, "one entry deleted {} capabilities", many as usize + 1 - left);
+    m.ok(S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]);
+    assert_eq!(children(&m, FREE), 0, "the emptying was finished");
+}

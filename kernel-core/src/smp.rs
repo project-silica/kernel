@@ -254,6 +254,15 @@ pub struct Cpu {
     /// Touched only by this processor, also while it does not hold its own
     /// lock; after `leave` for the same reason.
     pub(crate) wait_since: Cell<u64>,
+    /// Turns this processor has spent waiting for a lock, ever (counted
+    /// only while it waits, so an entry that finds its lock free pays
+    /// nothing). A long operation holding every lock reads the others':
+    /// one that has moved since it last looked is a processor waiting for
+    /// it ([`Kernel::must_pause`]).
+    pub(crate) spins: core::sync::atomic::AtomicU64,
+    /// [`Kernel::must_pause`]'s view of the others' `spins`: the global
+    /// entry it was taken in (`globals`) and their sum then.
+    pub(crate) pause_seen: Cell<(u64, u64)>,
 }
 
 const _: () = assert!(core::mem::size_of::<Cpu>() == 512);
@@ -308,6 +317,8 @@ impl Cpu {
             global_from: Cell::new(0),
             leave: crate::lock::Leave::new(),
             wait_since: Cell::new(0),
+            spins: core::sync::atomic::AtomicU64::new(0),
+            pause_seen: Cell::new((0, 0)),
         }
     }
 
@@ -334,6 +345,14 @@ impl<H: Hal> Kernel<H> {
         let me = self.hal.cpu_state(&self.cpus);
         debug_assert!(core::ptr::eq(me, self.cpus.get(self.hal.cpu())));
         me
+    }
+
+    /// Processor `cpu`'s count of turns spent waiting for a lock: what a
+    /// long operation holding every lock looks at to know that another
+    /// processor waits for it ([`Kernel::must_pause`]). For tests, whose
+    /// processors do not run at once and so count for one that waits.
+    pub fn lock_wait_turns(&self, cpu: usize) -> &core::sync::atomic::AtomicU64 {
+        &self.cpus.get(cpu).spins
     }
 
     /// Processor `i`'s state, for an architecture to record beside the
@@ -419,6 +438,8 @@ impl<H: Hal> Kernel<H> {
     #[inline(always)]
     fn lock_wait_turn(&self, me: &Cpu, l: &Lock, began: bool) {
         self.answer_leave(me);
+        // Only this processor writes it: no locked instruction.
+        me.spins.store(me.spins.load(core::sync::atomic::Ordering::Relaxed).wrapping_add(1), core::sync::atomic::Ordering::Relaxed);
         let now = self.hal.now();
         if began {
             me.wait_since.set(now);
@@ -468,6 +489,30 @@ impl<H: Hal> Kernel<H> {
     /// Leave the kernel on this processor.
     pub fn leave(&self) {
         self.me().lock.unlock();
+    }
+
+    /// Whether a long operation holding every lock (emptying, revoking,
+    /// unmapping) should stop here and be made again: an interrupt is
+    /// pending on this processor, or another processor has been waiting for
+    /// a lock since this entry last looked (its `spins` moved). Before, only
+    /// the interrupt was asked, and a processor that had none (one with no
+    /// timer armed: nothing else interrupts it) held every lock until the
+    /// whole operation was done, for as long as the memory a program had
+    /// paid for let it make that (the 2026-11-27 audit: H4, N1). Asked every
+    /// so many steps; the first time in a global entry it only takes note.
+    pub(crate) fn must_pause(&self) -> bool {
+        if self.hal.irq_pending() {
+            return true;
+        }
+        if self.ncpu() == 1 || !self.global.get() {
+            return false;
+        }
+        let me = self.me();
+        let sum = self.others().fold(0u64, |s, (_, c)| s.wrapping_add(c.spins.load(core::sync::atomic::Ordering::Relaxed)));
+        let (entry, seen) = me.pause_seen.get();
+        let now = self.globals.get();
+        me.pause_seen.set((now, sum));
+        entry == now && seen != sum
     }
 
     /// From holding this processor's lock to holding every processor's.
