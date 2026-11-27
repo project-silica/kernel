@@ -284,7 +284,7 @@ impl<H: Hal> Kernel<H> {
             }
         } else {
             self.hal.tlb_flush(a + PAGE, vaddr, size);
-            self.shoot_down(a + PAGE);
+            self.shoot_later(a + PAGE);
         }
         let (p, n) = (slot.mprev.get(), slot.mnext.get());
         if p != 0 {
@@ -501,6 +501,10 @@ impl<H: Hal> Kernel<H> {
     /// its watch: into waiting for its lock), and answers there; this waits
     /// for every answer. Elsewhere the shoot-down is enough.
     fn evict(&self, root: Paddr) {
+        // This covers anything left to tell of that root (`shoot_later`).
+        if self.me().shoot.get() == root {
+            self.me().shoot.set(0);
+        }
         if !H::KERNEL_IN_ROOT || self.ncpu() == 1 {
             self.shoot_down(root);
             return;
@@ -521,6 +525,36 @@ impl<H: Hal> Kernel<H> {
                 self.hal.wait_left(i, &cpu.leave);
                 cpu.forget_root();
             }
+        }
+    }
+
+    /// A mapping of address space `root` was removed in this global entry
+    /// (every lock held): the other processors are told when the entry lets
+    /// go of the locks ([`Kernel::shoot_pending`], from `go_local`), once
+    /// for every mapping it removed in that space. Told at each mapping,
+    /// an unmap of many frames brought every processor running in the
+    /// space into the kernel, its translations dropped, once a frame, as
+    /// often as a program cared to ask (the 2026-11-27 audit: N3). Nothing
+    /// can come of the delay: the caller is still in its call, and nobody
+    /// else runs kernel code before the locks go. A second space's removal
+    /// tells the first's at once.
+    /// (With one processor nothing is told: `shoot_down` returns at once.)
+    #[inline(always)]
+    fn shoot_later(&self, root: Paddr) {
+        debug_assert!(self.global.get() || self.ncpu() == 1, "a mapping removed without every lock");
+        let was = self.me().shoot.replace(root);
+        if was != 0 && was != root {
+            self.shoot_down(was);
+        }
+    }
+
+    /// Tell the other processors of what this global entry unmapped
+    /// ([`Kernel::shoot_later`]). Called holding every lock.
+    #[inline(always)]
+    pub(crate) fn shoot_pending(&self) {
+        let r = self.me().shoot.replace(0);
+        if r != 0 {
+            self.shoot_down(r);
         }
     }
 

@@ -1106,3 +1106,34 @@ fn emptying_a_capspace_stops_inside_one_slot_for_a_processor_waiting() {
     m.ok(S::CapDelete, [FREE + 1, 0, 0, 0, 0, 0]);
     assert_eq!(children(&m, FREE), 0, "the emptying was finished");
 }
+
+/// An unmap of many frames tells each other processor once that the
+/// address space's mappings changed, not once a frame: told at each frame,
+/// every processor running in the space was brought into the kernel and
+/// dropped its translations, once a frame, as often as a program asked
+/// (the 2026-11-27 audit: N3). Here the other processor has the space not
+/// loaded, so it forgets what it cached: once.
+#[test]
+fn an_unmap_of_many_frames_tells_each_processor_once() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 16, FREE, 1);
+    let frames = 64u64;
+    m.retype(ut, T::Frame, 12, FREE + 1, frames);
+    for i in 0..frames {
+        m.ok(S::Map, [FREE, FREE + 1 + i, 0x10_0000 + i * 0x1000, 3, 0, 0]);
+    }
+    let before = m.k.hal.forgets.get();
+    m.ok(S::Unmap, [FREE, 0x10_0000, frames * 0x1000, 0, 0, 0]);
+    assert_eq!(m.arg(m.root, 0), frames, "every frame was unmapped");
+    let told = m.k.hal.forgets.get() - before;
+    assert!(told <= 1, "the other processor was told {told} times for one unmap of {frames} frames");
+    // Deleting many mapped frames at once, likewise.
+    for i in 0..frames {
+        m.ok(S::Map, [FREE, FREE + 1 + i, 0x10_0000 + i * 0x1000, 3, 0, 0]);
+    }
+    let before = m.k.hal.forgets.get();
+    m.ok(S::CapDelete, [FREE, 0, 0, 0, 0, 0]);
+    let told = m.k.hal.forgets.get() - before;
+    assert!(told <= 2, "the other processor was told {told} times when the address space went");
+}

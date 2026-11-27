@@ -263,6 +263,10 @@ pub struct Cpu {
     /// [`Kernel::must_pause`]'s view of the others' `spins`: the global
     /// entry it was taken in (`globals`) and their sum then.
     pub(crate) pause_seen: Cell<(u64, u64)>,
+    /// An address space whose mappings this global entry removed: the
+    /// other processors are told once, when it lets go of every lock
+    /// ([`Kernel::go_local`]), not once a mapping (0: none).
+    pub(crate) shoot: Cell<Paddr>,
 }
 
 const _: () = assert!(core::mem::size_of::<Cpu>() == 512);
@@ -319,6 +323,7 @@ impl Cpu {
             wait_since: Cell::new(0),
             spins: core::sync::atomic::AtomicU64::new(0),
             pause_seen: Cell::new((0, 0)),
+            shoot: Cell::new(0),
         }
     }
 
@@ -647,6 +652,9 @@ impl<H: Hal> Kernel<H> {
 
     /// Back to holding only this processor's lock.
     pub(crate) fn go_local(&self) {
+        // What this entry unmapped, told to the others before they can
+        // run on it again.
+        self.shoot_pending();
         let cpu = self.hal.cpu();
         self.global.set(false);
         crate::lock::go_local(cpu, self.cpus.iter(self.ncpu()).map(|c| &c.lock));
