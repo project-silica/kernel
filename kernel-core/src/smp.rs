@@ -267,6 +267,10 @@ pub struct Cpu {
     /// other processors are told once, when it lets go of every lock
     /// ([`Kernel::go_local`]), not once a mapping (0: none).
     pub(crate) shoot: Cell<Paddr>,
+    /// A capability to an address space went in this global entry: every
+    /// other processor looks again at what it should have loaded, told
+    /// once when the entry lets go of every lock.
+    pub(crate) reload: Cell<bool>,
 }
 
 const _: () = assert!(core::mem::size_of::<Cpu>() == 512);
@@ -324,6 +328,7 @@ impl Cpu {
             spins: core::sync::atomic::AtomicU64::new(0),
             pause_seen: Cell::new((0, 0)),
             shoot: Cell::new(0),
+            reload: Cell::new(false),
         }
     }
 

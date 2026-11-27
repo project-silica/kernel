@@ -1300,3 +1300,23 @@ fn inspect_shows_identities_not_physical_addresses() {
     m.ok(S::Inspect, [FREE + 4, 0, 0, 0, 0, 0]);
     assert_eq!(m.arg(m.root, 4), e, "what it waits on, by identity");
 }
+
+/// Deleting a capability to an address space made every other processor
+/// look again at what it should have loaded, through a kick it waited
+/// for, once a capability: deleting many such capabilities kicked every
+/// processor as often (the 2026-11-27 audit, beside N3). It is told once,
+/// when the entry lets go of every lock.
+#[test]
+fn deleting_many_address_space_capabilities_kicks_each_processor_once() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 16, FREE, 1);
+    m.retype(ut, T::CapSpace, 10, FREE + 1, 1);
+    for i in 1..=500 {
+        m.ok(S::CapCopy, [FREE + 1, i, FREE, 15, 0, 0]);
+    }
+    let before = m.k.hal.kicks.borrow().len();
+    m.ok(S::CapRevoke, [FREE, 0, 0, 0, 0, 0]);
+    let kicks = m.k.hal.kicks.borrow()[before..].iter().filter(|k| k.0 == 1).count();
+    assert!(kicks <= 1, "processor 1 was kicked {kicks} times for one revoke of 500 copies");
+}

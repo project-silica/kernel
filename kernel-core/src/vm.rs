@@ -650,9 +650,26 @@ impl<H: Hal> Kernel<H> {
     /// ([`Kernel::shoot_later`]). Called holding every lock.
     #[inline(always)]
     pub(crate) fn shoot_pending(&self) {
-        let r = self.me().shoot.replace(0);
+        let me = self.me();
+        let r = me.shoot.replace(0);
         if r != 0 {
             self.shoot_down(r);
+        }
+        if me.reload.replace(false) {
+            self.reload_others();
+        }
+    }
+
+    /// Capabilities to address spaces went (`clear_slot`): each other
+    /// processor looks again at what it should have loaded.
+    #[cold]
+    #[inline(never)]
+    fn reload_others(&self) {
+        if self.ncpu() > 1 {
+            for (i, cpu) in self.others() {
+                cpu.dirty.set(true);
+                self.hal.kick(i, true);
+            }
         }
     }
 

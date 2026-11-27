@@ -216,14 +216,11 @@ impl<H: Hal> Kernel<H> {
         }
         if cap.ty == ObjectType::AddressSpace && cap.flags & FLAG_IO == 0 {
             // It may be a running thread's own, on any processor: each
-            // looks again at what it should have loaded.
+            // looks again at what it should have loaded, told once when
+            // this entry lets go of every lock (`shoot_pending`), not once
+            // a capability (deleting many kicked every processor as often).
             self.me().dirty.set(true);
-            if self.ncpu() > 1 {
-                for (i, cpu) in self.others() {
-                    cpu.dirty.set(true);
-                    self.hal.kick(i, true);
-                }
-            }
+            self.me().reload.set(true);
         }
         let last = !self.same_obj(slot.prev.get(), &cap) && !self.same_obj(slot.next.get(), &cap);
         let (p, n) = (slot.prev.get(), slot.next.get());
