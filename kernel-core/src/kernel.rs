@@ -912,6 +912,7 @@ impl<H: Hal> Kernel<H> {
                     let yes = c.ty == ObjectType::AddressSpace && c.flags & crate::cap::FLAG_ISOLATED != 0;
                     if yes { silica_abi::INSPECT_ISOLATED } else { 0 }
                 };
+                let derived = |s: Paddr| if self.has_children(s) { silica_abi::INSPECT_DERIVED } else { 0 };
                 let out = match cap.ty {
                     ObjectType::CapSpace if a[2] == 1 => {
                         // The thread in that slot of the CapSpace.
@@ -931,7 +932,7 @@ impl<H: Hal> Kernel<H> {
                                 v.cap.bits as u64,
                                 v.cap.obj,
                                 v.cap.badge,
-                                v.depth as u64 | isolated(&v.cap),
+                                v.depth as u64 | isolated(&v.cap) | derived(s),
                             ],
                             None => [0; 6],
                         }
