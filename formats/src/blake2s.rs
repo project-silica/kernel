@@ -100,8 +100,9 @@ impl Drop for Blake2s {
     }
 }
 
-/// Overwrite `b` with zeros in a way the optimizer keeps.
-fn zero(b: &mut [u8]) {
+/// Overwrite `b` with zeros in a way the optimizer keeps: a secret's copy
+/// wiped (the loader's of the machine's secret too).
+pub fn zero(b: &mut [u8]) {
     b.fill(0);
     core::hint::black_box(b);
 }
