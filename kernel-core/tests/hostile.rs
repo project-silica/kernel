@@ -1360,3 +1360,101 @@ fn a_table_given_back_is_not_reused_before_the_others_are_told() {
     assert!(m.k.translate(asp, 0x6000_0000).is_none());
     assert_eq!(m.k.translate(asp, 0x7000_0123), Some(m.cap(FREE + 3).unwrap().obj + 0x123));
 }
+
+/// One kernel entry of system call `n` as thread `t` (others yield until it
+/// runs), processor 1 waiting for a lock throughout: whether it stopped.
+fn one_entry_as_beside_a_waiter(m: &Machine, t: u64, n: S, a: [u64; 6]) -> bool {
+    while m.k.current() != t {
+        let c = m.k.current();
+        m.k.regs(c)[TestHal::SYS].set(S::Yield as u64);
+        m.k.enter();
+        m.k.syscall();
+        m.k.schedule();
+        m.k.leave();
+    }
+    m.k.hal.contender.set(m.k.lock_wait_turns(1));
+    let r = m.k.regs(t);
+    r[TestHal::IP].set(0x40_0002);
+    r[TestHal::SYS].set(n as u64);
+    r[TestHal::BY_SYSCALL].set(1);
+    for (i, v) in a.iter().enumerate() {
+        r[TestHal::ARG[i]].set(*v);
+    }
+    m.k.enter();
+    m.k.syscall();
+    m.k.leave();
+    m.k.hal.contender.set(core::ptr::null());
+    r[TestHal::IP].get() == 0x40_0000
+}
+
+/// Two holders of one address space unmapping ranges of it at once, each
+/// stopping beside a processor waiting, both finish, each with its whole
+/// count, and a frame's holder moving its capability meanwhile loses
+/// neither place. With one place kept a space, taken by whoever called
+/// last, each started the other over: with more mappings in neither range
+/// at the head of the list than one entry gets through, neither ever got
+/// past them (the review of audit-kernel-stalls).
+#[test]
+fn two_holders_unmapping_ranges_of_one_space_both_finish() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 20, FREE, 1);
+    let (a_n, b_n, c_n) = if cfg!(miri) { (100u64, 100u64, 600u64) } else { (300, 300, 600) };
+    let total = a_n + b_n + c_n;
+    for k in (0..total).step_by(250) {
+        m.retype(ut, T::Frame, 12, FREE + 1 + k, 250.min(total - k));
+    }
+    let at = |i: u64| 0x10_0000 + i * 0x1000;
+    // A's range first, then B's, then the rest last (the head of the list).
+    for i in 0..total {
+        m.ok(S::Map, [FREE, FREE + 1 + i, at(i), 3, 0, 0]);
+    }
+    let a_range = [FREE, at(0), a_n * 0x1000, 0, 0, 0];
+    let b_range = [FREE, at(a_n), b_n * 0x1000, 0, 0, 0];
+    let a = m.spawn(ut, FREE + 1990);
+    let b = m.spawn(ut, FREE + 1991);
+    let (mut a_done, mut b_done) = (None, None);
+    for _ in 0..200 {
+        if a_done.is_none() && !one_entry_as_beside_a_waiter(&m, a, S::Unmap, a_range) {
+            a_done = Some(m.arg(a, 0));
+        }
+        if b_done.is_none() && !one_entry_as_beside_a_waiter(&m, b, S::Unmap, b_range) {
+            b_done = Some(m.arg(b, 0));
+        }
+    }
+    assert_eq!((a_done, b_done), (Some(a_n), Some(b_n)), "the two unmaps, alternating, did not both finish with their counts");
+}
+
+/// The same for an unmap whose place a frame's holder moves: the head's
+/// frames' capabilities are moved between its entries.
+#[test]
+fn an_unmap_of_a_range_finishes_while_frames_are_moved() {
+    let m = Machine::with_cpus(64, 2);
+    let (ut, _) = m.big_untyped();
+    m.retype(ut, T::AddressSpace, 20, FREE, 1);
+    let (a_n, b_n, c_n) = if cfg!(miri) { (100u64, 100u64, 600u64) } else { (300, 300, 600) };
+    let total = a_n + b_n + c_n;
+    for k in (0..total).step_by(250) {
+        m.retype(ut, T::Frame, 12, FREE + 1 + k, 250.min(total - k));
+    }
+    let at = |i: u64| 0x10_0000 + i * 0x1000;
+    for i in 0..total {
+        m.ok(S::Map, [FREE, FREE + 1 + i, at(i), 3, 0, 0]);
+    }
+    let a_range = [FREE, at(0), a_n * 0x1000, 0, 0, 0];
+    let a = m.spawn(ut, FREE + 1990);
+    let mut a_done = None;
+    for round in 0..200u64 {
+        if !one_entry_as_beside_a_waiter(&m, a, S::Unmap, a_range) {
+            a_done = Some(m.arg(a, 0));
+            break;
+        }
+        for i in a_n + b_n..total {
+            let (from, to) = if round % 2 == 0 { (FREE + 1 + i, FREE + 1 + i + 700) } else { (FREE + 1 + i + 700, FREE + 1 + i) };
+            if to < 4096 {
+                m.ok(S::CapMove, [SLOT_CAPSPACE, to, from, 0, 0, 0]);
+            }
+        }
+    }
+    assert_eq!(a_done, Some(a_n), "an unmap whose place a frame's holder moved meanwhile did not finish with its count");
+}

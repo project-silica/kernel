@@ -491,11 +491,11 @@ impl<H: Hal> Kernel<H> {
             self.slot(mp).mnext.set(dst);
         }
         if s.cap().is_some_and(|c| c.ty == ObjectType::Frame) && s.badge.get() & MAPPED != 0 {
-            // An unmap of a range that stopped at this slot starts over
-            // (`unmap_range`): it is no longer where it was.
+            // An unmap of a range that stopped at this mapping goes on
+            // from it in its new slot (`unmap_range`).
             let h = self.aspace(s.aux.get());
-            if h.sweep_at.get() == src {
-                h.sweep_at.set(0);
+            if h.nsweeps.get() != 0 {
+                self.sweeps_moved(h, src, dst);
             }
             if mp != 0 {
                 self.slot(mp).mnext.set(dst);

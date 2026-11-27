@@ -106,6 +106,11 @@ pub struct Thread {
     /// (`Syscall::Console`), written out whole with the last piece.
     pub(crate) line: [Cell<u64>; LINE_WORDS],
     pub(crate) line_len: Cell<u64>,
+    /// The ticket of its Unmap of a range that stopped part way, kept in
+    /// that address space (`vm::Sweep`; 0: none). A thread made anew, or
+    /// started on a new program (`ThreadStart`), has none, so it never
+    /// goes on with another's.
+    pub(crate) sweep_ticket: Cell<u64>,
 }
 impl KObj for Thread {}
 

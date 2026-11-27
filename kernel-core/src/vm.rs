@@ -47,17 +47,33 @@ pub struct AsHeader {
     /// again meanwhile (`map_locked` lets go of it there).
     pub(crate) dead: Cell<u64>,
     pub(crate) reap_next: Cell<Paddr>,
-    /// An unmap of a range that stopped part way (`unmap_range`): the
-    /// thread making it, the range, the mapping it goes on from and how
-    /// many it has unmapped. Valid while that slot is still mapped here
-    /// (`unmap_slot` forgets it when it unmaps that slot).
-    pub(crate) sweep_by: Cell<Paddr>,
-    pub(crate) sweep_start: Cell<u64>,
-    pub(crate) sweep_end: Cell<u64>,
-    pub(crate) sweep_at: Cell<Paddr>,
-    pub(crate) sweep_n: Cell<u64>,
+    /// The unmaps of a range that stopped part way (`unmap_range`), one a
+    /// thread, and how many are in use.
+    pub(crate) sweeps: [Sweep; SWEEPS],
+    pub(crate) nsweeps: Cell<u64>,
 }
 impl KObj for AsHeader {}
+
+/// Unmaps of a range stopped part way kept at once in one address space:
+/// a seventeenth, made beside sixteen others stopped in the same space,
+/// takes the oldest one's place (that call starts over), so only so many
+/// holders of the space's write right at once can hold one another back.
+pub(crate) const SWEEPS: usize = 16;
+
+/// An unmap of a range that stopped part way (`unmap_range`): the ticket
+/// of the thread making it (`Thread::sweep_ticket`; 0: unused), its range,
+/// the mapping it goes on from (0: none left) and how many it unmapped.
+/// Nobody else's unmapping or moving a frame loses it: an unmap of the
+/// mapping it goes on from moves it to the next one (`unmap_slot`), and a
+/// move of that frame's capability takes it along (`move_slot`).
+#[repr(C)]
+pub(crate) struct Sweep {
+    pub(crate) ticket: Cell<u64>,
+    pub(crate) start: Cell<u64>,
+    pub(crate) end: Cell<u64>,
+    pub(crate) at: Cell<Paddr>,
+    pub(crate) n: Cell<u64>,
+}
 // The page's upper half is the architecture's (processors' identifiers, the
 // IOMMU's domain).
 const _: () = assert!(core::mem::size_of::<AsHeader>() <= 2048);
@@ -279,11 +295,10 @@ impl<H: Hal> Kernel<H> {
         }
         let (a, vaddr) = (slot.aux.get(), slot.badge.get() & !(PAGE - 1));
         let h = self.aspace(a);
-        // An unmap of a range that stopped here goes on from the head
-        // (`unmap_range`): this slot is no longer where it was, and its
-        // memory may be something else by the time the call is made again.
-        if h.sweep_at.get() == fs {
-            h.sweep_at.set(0);
+        // An unmap of a range that stopped here goes on from the next
+        // mapping (`unmap_range`): this one is going.
+        if h.nsweeps.get() != 0 {
+            self.sweeps_moved(h, fs, slot.mnext.get());
         }
         let io = h.io.get() != 0;
         let (level, step) = self.leaf(cap.bits, io);
@@ -378,22 +393,35 @@ impl<H: Hal> Kernel<H> {
     /// For thread `t`, holding every lock: a space may have as many
     /// mappings as there is memory for frames, so every [`REAP_STEP`]
     /// mappings looked at it asks whether to stop ([`Kernel::must_pause`])
-    /// and returns `None`, to be made again; where it was is kept in the
-    /// space (`sweep_*`), and the call made again by the same thread for
-    /// the same range goes on from there. (One pass over every mapping
+    /// and returns `None`, to be made again (one pass over every mapping
     /// held the machine as long as the space lasted: the 2026-11-27 audit,
-    /// H4.) A mapping made meanwhile ahead of where it is may be left: it
-    /// came after the call.
+    /// H4). Where it was and how many it unmapped are kept in the space
+    /// under the thread's ticket ([`Sweep`]), and the call made again by
+    /// that thread for that range goes on from there with its count. Each
+    /// thread's is its own: another holder's unmap, or a frame's holder
+    /// unmapping or moving it, does not lose it (the review of
+    /// audit-kernel-stalls: a single kept place, taken by whoever called
+    /// last, had two holders start each other over for ever). A mapping
+    /// made meanwhile ahead of where it is may be left: it came after the
+    /// call.
     pub(crate) fn unmap_range(&self, t: Paddr, a: Paddr, start: u64, end: u64) -> Option<u64> {
         let h = self.aspace(a);
-        let at = h.sweep_at.get();
-        let resume = h.sweep_by.get() == t
-            && (h.sweep_start.get(), h.sweep_end.get()) == (start, end)
-            && at != 0
-            && self.slot(at).badge.get() & MAPPED != 0
-            && self.slot(at).aux.get() == a;
-        let (mut s, mut n) = if resume { (at, h.sweep_n.get()) } else { (h.maps.get(), 0) };
-        h.sweep_by.set(0);
+        let th = self.thread(t);
+        let ticket = th.sweep_ticket.replace(0);
+        let mut from = None;
+        if ticket != 0 && h.nsweeps.get() != 0 {
+            for w in &h.sweeps {
+                if w.ticket.get() == ticket {
+                    if (w.start.get(), w.end.get()) == (start, end) {
+                        from = Some((w.at.get(), w.n.get()));
+                    }
+                    w.ticket.set(0);
+                    h.nsweeps.set(h.nsweeps.get() - 1);
+                    break;
+                }
+            }
+        }
+        let (mut s, mut n) = from.unwrap_or((h.maps.get(), 0));
         let mut steps = 0u64;
         while s != 0 {
             let slot = self.slot(s);
@@ -407,15 +435,45 @@ impl<H: Hal> Kernel<H> {
             s = next;
             steps += 1;
             if s != 0 && steps.is_multiple_of(REAP_STEP) && self.must_pause() {
-                h.sweep_by.set(t);
-                h.sweep_start.set(start);
-                h.sweep_end.set(end);
-                h.sweep_at.set(s);
-                h.sweep_n.set(n);
+                self.keep_sweep(h, th, start, end, s, n);
                 return None;
             }
         }
         Some(n)
+    }
+
+    /// Keep where thread `th`'s unmap of `start` to `end` stopped: at the
+    /// mapping in slot `at`, `n` unmapped so far. In a free place of the
+    /// space's, else the oldest one's (that call starts over).
+    fn keep_sweep(&self, h: &AsHeader, th: &crate::thread::Thread, start: u64, end: u64, at: Paddr, n: u64) {
+        let ticket = self.sweep_tickets.get() + 1;
+        self.sweep_tickets.set(ticket);
+        let w = match h.sweeps.iter().find(|w| w.ticket.get() == 0) {
+            Some(w) => {
+                h.nsweeps.set(h.nsweeps.get() + 1);
+                w
+            }
+            None => h.sweeps.iter().min_by_key(|w| w.ticket.get()).unwrap_or(&h.sweeps[0]),
+        };
+        w.ticket.set(ticket);
+        w.start.set(start);
+        w.end.set(end);
+        w.at.set(at);
+        w.n.set(n);
+        th.sweep_ticket.set(ticket);
+    }
+
+    /// The mapping in slot `from` goes (it is unmapped: `to` is the next
+    /// one, or 0) or moves (to slot `to`): an unmap of a range that stopped
+    /// at it goes on from `to`.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn sweeps_moved(&self, h: &AsHeader, from: Paddr, to: Paddr) {
+        for w in &h.sweeps {
+            if w.ticket.get() != 0 && w.at.get() == from {
+                w.at.set(to);
+            }
+        }
     }
 
     /// A table page for address space `a`: one given back, else a new one

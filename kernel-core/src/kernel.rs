@@ -39,6 +39,9 @@ pub struct Kernel<H: Hal> {
     pub(crate) globals: Cell<u64>,
     /// The key of the identities `Inspect` shows (`ident.rs`), set at boot.
     pub(crate) ident_key: [Cell<u64>; 2],
+    /// The last ticket given to an Unmap of a range that stopped part way
+    /// (`vm::Sweep`): every one different, so none is taken for another.
+    pub(crate) sweep_tickets: Cell<u64>,
     /// Objects waiting to be emptied (only used holding every lock).
     pub(crate) reap: Cell<u64>,
     /// The CapSpace being emptied, part done (0: none; `cap::drain_reap`).
@@ -71,6 +74,7 @@ impl<H: Hal> Kernel<H> {
             structure: crate::lock::Lock::new(),
             globals: Cell::new(0),
             ident_key: [Cell::new(0), Cell::new(0)],
+            sweep_tickets: Cell::new(0),
             reap: Cell::new(0),
             reaping: Cell::new(0),
             irqs: [const { (Cell::new(0), Cell::new(0)) }; silica_abi::IRQ_LINES as usize],
@@ -713,6 +717,8 @@ impl<H: Hal> Kernel<H> {
                 }
                 self.cancel(th.obj, false);
                 self.fresh_extended_state(th.obj);
+                // A new program: no Unmap of the last one is gone on with.
+                self.thread(th.obj).sweep_ticket.set(0);
                 let r = &self.thread(th.obj).regs;
                 for c in r.iter() {
                     c.set(0);
