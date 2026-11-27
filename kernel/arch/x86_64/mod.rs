@@ -313,15 +313,16 @@ impl Hal for X86 {
     fn switch_thread(&self, phys: &Phys, from: Paddr, to: Paddr, root: Paddr) {
         let kind = self.xsave_kind.get();
         let to_regs = kernel().regs(to);
-        // Canonical, so the writes below cannot fault: a frame's FS and GS
-        // bases are only ever what this function read from the processor
-        // (RDFSBASE and RDMSR give canonical values; user mode cannot set
-        // others, WRFSBASE faulting on them) or the zero ThreadStart
-        // writes. No system call or message writes them. Checking them
-        // here cost every switch eight instructions for a case that
-        // cannot arise.
+        // The writes below cannot fault: a frame's FS and GS bases are only
+        // ever what this function read from the processor or the zero
+        // ThreadStart writes, and no system call or message writes them.
+        // The processor reads back only values its own writes accept
+        // (user mode's WRFSBASE faults on any other, by the same rule of
+        // what is canonical, 48 or 57 bits, that the kernel's WRFSBASE and
+        // WRMSR apply). Making them 48-bit canonical here cost every switch
+        // eight instructions for a case that cannot arise, and on a
+        // processor with 5-level paging zeroed bases user mode had set.
         let (fs, gs) = (to_regs[REG_FS_BASE].get(), to_regs[REG_GS_BASE].get());
-        debug_assert!(canonical(fs) && canonical(gs));
         // Extended state. A thread that entered the kernel by a system call
         // has no vector or x87 data to keep: the ABI says a system call
         // clobbers them, as a function call does. Only its control words are
@@ -949,12 +950,6 @@ const WAKE_ADVANCE_MAX_NS: u64 = 50_000;
 /// MXCSR and the x87 control word as the processor's initial state has them.
 const MXCSR_DEFAULT: u32 = 0x1F80;
 const FCW_DEFAULT: u32 = 0x037F;
-
-/// A user FS or GS base the processor accepts (it faults on a non-canonical one).
-/// Whether `v` is a canonical address (48-bit).
-fn canonical(v: u64) -> bool {
-    v < 1 << 47 || v >= !0 << 47
-}
 
 /// An interrupt from the local APIC or a device. `locked`: it interrupted
 /// user code and this processor holds its lock; otherwise it interrupted
