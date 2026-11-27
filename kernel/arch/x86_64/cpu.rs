@@ -142,7 +142,7 @@ static CPUS: [AtomicPtr<Tables>; MAX_CPUS] = [const { AtomicPtr::new(core::ptr::
 
 /// The boot processor's kernel stack; its lowest page is unmapped as a guard.
 pub static KSTACK: Racy2 = Racy2(UnsafeCell::new(Stack([0; STACK_SIZE + 4096])));
-static ISTACK: Racy2 = Racy2(UnsafeCell::new(Stack([0; STACK_SIZE + 4096])));
+static ISTACKS: [Racy2; 3] = [const { Racy2(UnsafeCell::new(Stack([0; STACK_SIZE + 4096]))) }; 3];
 
 pub struct Racy2(UnsafeCell<Stack>);
 // SAFETY: stacks are only used by the processor as stacks.
@@ -245,9 +245,10 @@ pub fn boot_tables() -> *mut Tables {
     BOOT_TABLES.0.get()
 }
 
-/// The boot processor's stacks: (kernel lowest, kernel top, interrupt-stack top).
-pub fn boot_stacks() -> (u64, u64, u64) {
-    (KSTACK.base() + 4096, KSTACK.top(), ISTACK.top())
+/// The boot processor's stacks: (kernel lowest, kernel top, the NMI,
+/// double-fault and machine-check stacks' tops).
+pub fn boot_stacks() -> (u64, u64, [u64; 3]) {
+    (KSTACK.base() + 4096, KSTACK.top(), [ISTACKS[0].top(), ISTACKS[1].top(), ISTACKS[2].top()])
 }
 
 /// Fill the interrupt descriptor table every processor shares. Boot processor, once.
@@ -258,16 +259,24 @@ pub unsafe fn init_idt() {
     let stubs = &raw const trap_stubs as u64;
     for v in 0..256u64 {
         let h = stubs + v * 16;
-        // NMI, double fault and machine check run on their own stack.
-        let ist = if matches!(v, 2 | 8 | 18) { 1 } else { 0 };
+        // NMI, double fault and machine check each run on a stack of its
+        // own (TSS IST 1 to 3): sharing one, a machine check taken while an
+        // NMI's frame was still on it (or the reverse) wrote over that frame
+        // (the review of nmi-exit).
+        let ist = match v {
+            2 => 1,
+            8 => 2,
+            18 => 3,
+            _ => 0,
+        };
         // SAFETY: guaranteed by the caller.
         unsafe { (*IDT.0.get())[v as usize] = [(h & 0xFFFF) | 0x08 << 16 | ist << 32 | 0x8E << 40 | (h >> 16 & 0xFFFF) << 48, h >> 32] };
     }
 }
 
 /// Make `t` this processor's tables: load them and set up `syscall`.
-/// `stack` is (lowest address, top) of its kernel stack, `ist` the top of
-/// its stack for NMI, double fault and machine check.
+/// `stack` is (lowest address, top) of its kernel stack, `ists` the tops of
+/// its stacks for NMI, double fault and machine check, in that order.
 ///
 /// # Safety
 /// Once per processor, early, with interrupts off; `t` and the stacks must
@@ -275,7 +284,7 @@ pub unsafe fn init_idt() {
 /// Out of line: it sets the GS base, which `Hal::cpu_slot` and `Hal::cpu`
 /// read as constant (`nomem`), so no read of either may be moved into it.
 #[inline(never)]
-pub unsafe fn init(t: *mut Tables, index: usize, apic_id: u32, stack: (u64, u64), ist: u64) {
+pub unsafe fn init(t: *mut Tables, index: usize, apic_id: u32, stack: (u64, u64), ists: [u64; 3]) {
     // SAFETY: exclusive access to this processor's tables during its boot;
     // the descriptors built here describe memory that lives for ever.
     unsafe {
@@ -283,14 +292,16 @@ pub unsafe fn init(t: *mut Tables, index: usize, apic_id: u32, stack: (u64, u64)
         (*t).gdt[5] = 0x0000_8900_0000_0067 | (tss & 0xFF_FFFF) << 16 | (tss >> 24 & 0xFF) << 56;
         (*t).gdt[6] = tss >> 32;
         (*t).tss.rsp0 = stack.1;
-        // The NMI, double-fault and machine-check stack starts 16-byte
-        // aligned (the processor aligns it so, and the frame must be where
-        // `paranoid_common` looks), and the word above it holds this
-        // processor's PerCpu address: how that entry tells whose GS base is
-        // loaded, wherever it interrupted.
-        let ist = (ist - 16) & !15;
-        *(ist as *mut u64).add(1) = &raw const (*t).percpu as u64;
-        (*t).tss.ist[0] = ist;
+        // Each of the NMI, double-fault and machine-check stacks starts
+        // 16-byte aligned (the processor aligns it so, and the frame must be
+        // where `paranoid_common` looks), and the word above it holds this
+        // processor's PerCpu address: how that entry tells whose GS base
+        // is loaded, wherever it interrupted.
+        for (i, top) in ists.into_iter().enumerate() {
+            let ist = (top - 16) & !15;
+            *(ist as *mut u64).add(1) = &raw const (*t).percpu as u64;
+            (*t).tss.ist[i] = ist;
+        }
         (*t).percpu.kstack = stack.1;
         (*t).percpu.stack = stack;
         (*t).percpu.this = &raw const (*t).percpu as u64;

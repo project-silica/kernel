@@ -21,9 +21,11 @@ use kernel_core::smp::MAX_CPUS;
 
 const PAGE: u64 = 4096;
 const CHUNK: u64 = 2 << 20;
-/// Pages per processor: guard, kernel stack, guard, interrupt stack, tables.
+/// Pages per processor: guard, kernel stack, guard, the NMI, double-fault
+/// and machine-check stacks (`IST_PAGES` each, in that order), tables.
 const KSTACK_PAGES: u64 = 7;
-const ISTACK_PAGES: u64 = 2;
+const IST_PAGES: u64 = 2;
+const ISTACK_PAGES: u64 = 3 * IST_PAGES;
 const SLOT_PAGES: u64 = 1 + KSTACK_PAGES + 1 + ISTACK_PAGES + 1;
 
 /// What `ap_entry` looks up by APIC identifier. Field offsets are used by the assembly.
@@ -138,7 +140,7 @@ extern "C" fn ap_main(slot: usize) -> ! {
     // SAFETY: the slot was filled for this processor before it was started.
     let slot = unsafe { (*SLOTS.0.get())[slot - 1] };
     // SAFETY: this processor's own tables and stacks, on its first and only pass here.
-    unsafe { cpu::init(slot.tables as *mut Tables, index, slot.apic_id as u32, (slot.stack_base, slot.stack_top), slot.ist_top) };
+    unsafe { cpu::init(slot.tables as *mut Tables, index, slot.apic_id as u32, (slot.stack_base, slot.stack_top), ists(slot.ist_top)) };
     ap_on_cpu(index)
 }
 
@@ -382,3 +384,9 @@ fn tsc_agrees() -> bool {
 }
 /// Processors whose counters could not be verified before the deadline.
 static TSC_REJECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// The tops of a processor's NMI, double-fault and machine-check stacks,
+/// from the top of the last (`ApSlot::ist_top`, where its tables start).
+fn ists(top: u64) -> [u64; 3] {
+    [top - 2 * IST_PAGES * PAGE, top - IST_PAGES * PAGE, top]
+}
