@@ -139,6 +139,13 @@ extern "C" fn ap_main(slot: usize) -> ! {
     let slot = unsafe { (*SLOTS.0.get())[slot - 1] };
     // SAFETY: this processor's own tables and stacks, on its first and only pass here.
     unsafe { cpu::init(slot.tables as *mut Tables, index, slot.apic_id as u32, (slot.stack_base, slot.stack_top), slot.ist_top) };
+    ap_on_cpu(index)
+}
+
+/// The rest of [`ap_main`], once the GS base is set: out of line, as
+/// `kmain_on_cpu` is.
+#[inline(never)]
+fn ap_on_cpu(index: usize) -> ! {
     super::init_processor(false);
     cpu::percpu().online.store(true, Ordering::Release);
     let k = super::kernel();

@@ -551,7 +551,7 @@ static KERNEL: Global = Global(Kernel::new(
     Arm { count0: Cell::new(0), ns_per_tick: Cell::new(0), ticks_per_ns: Cell::new(0), empty_root: Cell::new(0), asid_max: Cell::new(255) },
     // SAFETY: the loader maps all RAM at PHYS_MAP_BASE and the kernel only
     // uses addresses from the boot regions through it.
-    unsafe { Phys::new(PHYS_MAP_BASE as *mut u8) },
+    unsafe { Phys::direct_map() },
 ));
 
 /// The kernel.

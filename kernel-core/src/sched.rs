@@ -254,6 +254,32 @@ impl<H: Hal> Kernel<H> {
         crate::order::push_last(&shares, s);
     }
 
+    /// Fair thread `t`, running on `cpu`, yields while its context is the
+    /// only one with threads waiting there and no deadline thread waits:
+    /// it goes behind every thread of its context and the first of them
+    /// runs, which this returns. 0 when that is not the case; then
+    /// [`Kernel::requeue_yielded`] and [`Kernel::pick`] decide.
+    ///
+    /// The same order as queuing `t` last and taking the first, done the
+    /// other way round: the first is taken from the n waiting and `t` put
+    /// after the n - 1 left, which with one waiting touches no tree at all
+    /// (a thread yielding to one other, on every such switch).
+    #[inline(always)]
+    pub(crate) fn yield_within(&self, cpu: &Cpu, t: Paddr) -> Paddr {
+        let th = self.thread(t);
+        let s = th.sc.get();
+        if cpu.dl_head.get() != 0 || cpu.fq_first.get() != s || cpu.fq_last.get() != s {
+            return 0;
+        }
+        let sh = &self.sched(s).share;
+        // In the processor's tree, so it has threads waiting: behind the last.
+        th.vr.set(th.vr.get().max(self.thread(sh.last.get()).vr.get()));
+        let members = Members(self, sh);
+        let next = crate::order::pop(&members);
+        crate::order::push_last(&members, t);
+        next
+    }
+
     /// The first thread of the least-run context waiting (0: none).
     pub(crate) fn fair_first(&self, cpu: &Cpu) -> Paddr {
         match cpu.fq_first.get() {

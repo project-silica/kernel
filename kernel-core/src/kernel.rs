@@ -411,6 +411,12 @@ impl<H: Hal> Kernel<H> {
     /// above must not pay for this one's registers and stack.
     #[inline(never)]
     fn syscall_general(&self, s: Syscall, t: Paddr) {
+        // A hand-off through notifications first (`fast_signal_recv`):
+        // tried here, not beside the IPC fast paths in `syscall`, which
+        // any further arm there made the compiler lay out worse.
+        if s == Syscall::SignalRecv && self.fast_signal_recv(t) {
+            return;
+        }
         let me = self.me();
         let r = &self.thread(t).regs;
         let g = |i: usize| r[H::ARG[i]].get();

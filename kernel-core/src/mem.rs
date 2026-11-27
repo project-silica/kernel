@@ -16,20 +16,50 @@ pub type Paddr = u64;
 
 /// The window through which the kernel sees physical memory: physical
 /// address `p` is at `base + p`.
+///
+/// In the kernel the base is the constant [`crate::boot::PHYS_MAP_BASE`],
+/// where every loader maps all of memory: then an object's address is its
+/// physical address plus an immediate. Held in the kernel's static, the
+/// base was loaded again after every store (any `Cell` might have changed
+/// it, for all the compiler could tell): 15 times in a context switch.
+/// Tests, the exhaustive check and the proofs run on a host and give a
+/// buffer of their own.
 pub struct Phys {
+    #[cfg(not(target_os = "none"))]
     base: *mut u8,
 }
 
 impl Phys {
+    /// The kernel's window: all of memory at [`crate::boot::PHYS_MAP_BASE`].
+    ///
+    /// # Safety
+    /// For every physical address `p` the kernel is given in a boot region,
+    /// `PHYS_MAP_BASE + p` must be valid for reads and writes for as long
+    /// as this value lives, and nothing else may use that memory.
+    #[cfg(target_os = "none")]
+    pub const unsafe fn direct_map() -> Phys {
+        Phys {}
+    }
+
     /// # Safety
     /// For every physical address `p` the kernel is given in a boot region,
     /// `base + p` must be valid for reads and writes for as long as this
     /// value lives, and nothing else may use that memory.
+    #[cfg(not(target_os = "none"))]
     pub const unsafe fn new(base: *mut u8) -> Phys {
         Phys { base }
     }
 
     /// The address of physical byte `p`.
+    #[cfg(target_os = "none")]
+    #[inline(always)]
+    pub fn ptr(&self, p: Paddr) -> *mut u8 {
+        (crate::boot::PHYS_MAP_BASE as usize).wrapping_add(p as usize) as *mut u8
+    }
+
+    /// The address of physical byte `p`.
+    #[cfg(not(target_os = "none"))]
+    #[inline(always)]
     pub fn ptr(&self, p: Paddr) -> *mut u8 {
         self.base.wrapping_add(p as usize)
     }

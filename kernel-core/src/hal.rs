@@ -164,6 +164,15 @@ pub trait Hal {
     fn cpu_slot(&self) -> usize {
         crate::smp::cpu_slot(self.cpu())
     }
+    /// This processor's state in `cpus`, the kernel's table: by default its
+    /// entry at [`Hal::cpu_slot`]. An architecture that keeps the entry's
+    /// address beside its index ([`crate::kernel::Kernel::cpu_state_of`],
+    /// recorded when the processor starts) returns it with one load, where
+    /// the slot costs a mask, a shift and the table's address as well, on
+    /// every lookup of the processor's state.
+    fn cpu_state<'a>(&self, cpus: &'a crate::smp::CpuTable) -> &'a crate::smp::Cpu {
+        cpus.at_slot(self.cpu_slot())
+    }
     /// Interrupt processor `cpu` so that it enters the kernel. With `wait`,
     /// return only when it is no longer running user code: it is in the
     /// kernel, has saved its thread's registers, and will take its lock

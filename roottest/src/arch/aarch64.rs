@@ -195,7 +195,7 @@ pub fn timed_yield(v: u64) -> u64 {
 // no data. x0 holds the thread's argument.
 core::arch::global_asm!(
     ".section .text.stubs, \"ax\"",
-    ".global stub_echo, stub_echo_end, stub_yield, stub_yield_end, stub_spin, stub_spin_end",
+    ".global stub_echo, stub_echo_end, stub_yield, stub_yield_end, stub_spin, stub_spin_end, stub_notify, stub_notify_end",
     // An echo server on the endpoint in x0: ReplyRecv (3) for ever. The
     // reply is the request, because the message registers are left as received.
     "stub_echo:",
@@ -219,4 +219,21 @@ core::arch::global_asm!(
     "4: yield",
     "b 4b",
     "stub_spin_end:",
+    // A driver's loop for ever (`serve_events`): SignalRecv (23),
+    // signalling its client's notification (bits 40 and up of x0) and
+    // receiving on its endpoint (bits 0 to 19) while listening on its own
+    // notification (bits 20 to 39).
+    "stub_notify:",
+    "mov x19, x0",
+    "5: mov x8, #23",
+    "ubfx x0, x19, #20, #20",
+    "lsl x0, x0, #32",
+    "ubfx x9, x19, #0, #20",
+    "orr x0, x0, x9",
+    "mov x1, xzr",
+    "mov x2, xzr",
+    "lsr x3, x19, #40",
+    "svc #0",
+    "b 5b",
+    "stub_notify_end:",
 );
